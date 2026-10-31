@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 底栏四项：文案与 kit 的 nav_* 对齐（kit 的 BottomBarMiuix 直接引用这四个 id） -->
+    <string name="nav_status">状态</string>
+    <string name="nav_memory">记忆</string>
+    <string name="nav_bot">Bot</string>
+    <string name="nav_settings">设置</string>
+
+    <!-- 主题设置页：id 与 kit res/values/strings.xml 完全一致，值按本工程改成中文
+         （kit 原值是英文，ColorPaletteScreenMiuix 直接引用这些 id，源码不用动） -->
+    <string name="app_name" translatable="false">AndbnA</string>
+    <string name="settings_theme">主题设置</string>
+    <string name="settings_theme_mode_system">跟随系统</string>
+    <string name="settings_theme_mode_light">浅色</string>
+    <string name="settings_theme_mode_dark">深色</string>
+    <string name="settings_monet">莫奈取色</string>
+    <string name="settings_key_color">主题色</string>
+    <string name="settings_key_color_default">默认</string>
+    <string name="settings_color_style">调色风格</string>
+    <string name="settings_color_spec">配色规范</string>
+    <string name="color_red">红色</string>
+    <string name="color_pink">粉色</string>
+    <string name="color_purple">紫色</string>
+    <string name="color_deep_purple">深紫</string>
+    <string name="color_indigo">靛蓝</string>
+    <string name="color_blue">蓝色</string>
+    <string name="color_cyan">青色</string>
+    <string name="color_teal">蓝绿</string>
+    <string name="color_green">绿色</string>
+    <string name="color_yellow">黄色</string>
+    <string name="color_amber">琥珀</string>
+    <string name="color_orange">橙色</string>
+    <string name="color_brown">棕色</string>
+    <string name="color_blue_grey">蓝灰</string>
+    <string name="color_sakura">樱花</string>
+    <string name="settings_enable_blur">模糊</string>
+    <string name="settings_enable_blur_summary">顶栏与底栏使用模糊效果</string>
+    <string name="settings_floating_bottom_bar">悬浮底栏</string>
+    <string name="settings_floating_bottom_bar_summary">苹果风格的悬浮胶囊底栏</string>
+    <string name="settings_enable_glass">液态玻璃</string>
+    <string name="settings_enable_glass_summary">悬浮底栏背后的玻璃层</string>
+    <string name="settings_enable_predictive_back">预测性返回</string>
+    <string name="settings_enable_predictive_back_summary">支持系统预测性返回手势</string>
+    <string name="settings_page_scale">页面缩放</string>
+    <string name="settings_page_scale_summary">调整全局显示比例</string>
+</resources>

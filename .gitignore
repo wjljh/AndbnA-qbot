@@ -1,0 +1,20 @@
+# 构建产物
+build/
+*/build/
+.gradle/
+.idea/
+local.properties
+*.apk
+*.aab
+*.iml
+
+# 签名与密钥（绝不入库）
+signing/*.jks
+signing/*.keystore
+keystore.properties
+
+# 截图与临时
+shots/
+*/shots/
+*.log
+.DS_Store

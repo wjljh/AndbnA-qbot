@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <!-- miuix-blur 的 aar 声明 minSdk 33；kit 的做法也是 overrideLibrary，
+         真正走毛玻璃的分支在 BottomBarMiuix 里已经用 SDK>=33 门住了 -->
+    <uses-sdk tools:overrideLibrary="top.yukonga.miuix.kmp.blur" />
+
+    <!-- Shizuku：客户端必须声明该权限，ShizukuProvider 才会下发 binder -->
+    <uses-permission android:name="moe.shizuku.manager.permission.API_V23" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- 纯 APK 模式：把 bot 挂在前台服务上，避免被系统回收后丢消息 -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- 让系统在本 App 窗口上隐藏第三方 overlay（MIUI 的 securitycenter 浮窗就是左侧那条竖线） -->
+    <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS" />
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+    <queries>
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+    <application
+        android:name=".AndbnAApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:label="AndbnA"
+        android:supportsRtl="true"
+        android:usesCleartextTraffic="true"
+        android:theme="@style/Theme.AndbnA">
+        <!-- importantForAutofill=noExcludeDescendants：整窗关掉自动填充/密码保存，
+             密钥只进 SecureStore（Keystore 加密），不进系统的密码保险箱 -->
+        <!-- excludeFromRecents：切到后台后不在「最近任务」里留卡片，
+             副作用是 App 也不再出现在最近任务列表里，回来只能点桌面图标 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:importantForAutofill="noExcludeDescendants"
+            android:configChanges="orientation|screenSize|uiMode|keyboardHidden">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <service
+            android:name=".local.BotService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- 开机自启：系统发起，不受 non-exported 限制，且不需要 root -->
+        <receiver
+            android:name=".local.BootReceiver"
+            android:exported="true"
+            android:enabled="true">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+            </intent-filter>
+        </receiver>
+
+        <!-- Shizuku：ADB 模式靠它拿 shell 权限（需另装 Shizuku App） -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+
+        <!-- UserService 不在这里声明：它是 IUserService.Stub（Binder），由 Shizuku 在 shell
+             进程里反射实例化，不是 Android Service；声明 <service> 会让系统误以为要启动它 -->
+    </application>
+
+</manifest>
