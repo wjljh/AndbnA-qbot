@@ -163,21 +163,24 @@ def set_reply_judge(judge, prob):
 
 
 def _llm_conf(base_dir):
-    """{key, api, model, vision_model}。
+    """{key, api, model, vision_model, reasoning_effort}。
 
-    api / model / vision_model 都可能来自落盘的 llm.json；key 只在内存里（BotHost 推过来的）。
-    vision_model 空串 = 识图沿用主模型（不复制 model，调用时再回退）。
+    api / model / vision_model / reasoning_effort 都可能来自落盘的 llm.json；key 只在内存里
+    （BotHost 推过来的）。vision_model 空串 = 识图沿用主模型（不复制 model，调用时再回退）。
+    reasoning_effort 空串 = 请求体里不带这个字段（用平台默认），见 _req_body。
     """
     c = _load_json(os.path.join(base_dir, "llm.json"), {}) or {}
     key = str(_llm.get("key") or c.get("key") or "").strip()
     api = str(_llm.get("api") or c.get("api") or "").strip()
     model = str(_llm.get("model") or c.get("model") or "").strip() or "deepseek-chat"
     vision_model = str(_llm.get("vision_model") or c.get("vision_model") or "").strip()
+    effort = str(c.get("reasoning_effort") or "").strip()
     if not api or not key:
         return None
     if not api.endswith("/chat/completions"):
         api = api.rstrip("/") + "/chat/completions"
-    return {"key": key, "api": api, "model": model, "vision_model": vision_model}
+    return {"key": key, "api": api, "model": model, "vision_model": vision_model,
+            "reasoning_effort": effort}
 
 
 def _extract_text(msg):
@@ -202,13 +205,38 @@ def _extract_text(msg):
     return lines[-1][:400] if lines else ""
 
 
+def _req_body(conf, model, messages, max_tokens, temperature):
+    """拼 chat/completions 请求体：思考强度**只在非空时**加进去。
+
+    留空 = 不发送该字段（按平台默认跑）。各平台取值不同（DeepSeek 官方 off/low/high/max，
+    百炼 default/low/medium/high/xhigh/max，部分模型只认 default），所以这里既不枚举也不校验，
+    填什么就发什么 —— 校验归「验证思考强度」按钮，由平台自己回答。
+    """
+    body = {
+        "model": model, "messages": messages,
+        "max_tokens": max_tokens, "temperature": temperature,
+    }
+    effort = str(conf.get("reasoning_effort") or "").strip()
+    if effort:
+        body["reasoning_effort"] = effort
+    return body
+
+
+def _log_body(body):
+    """请求体只记字段名 + 思考强度：识图那条带 base64 图片，整包不能进日志。"""
+    fields = ",".join(body.keys())
+    if "reasoning_effort" in body:
+        log("请求体字段：%s（reasoning_effort=%s）" % (fields, body["reasoning_effort"]))
+    else:
+        log("请求体字段：%s（未设置思考强度，不带 reasoning_effort）" % fields)
+
+
 def _call_llm_sync(conf, messages, max_tokens=400, temperature=0.9):
     import json
     import urllib.request
-    body = json.dumps({
-        "model": conf["model"], "messages": messages,
-        "max_tokens": max_tokens, "temperature": temperature,
-    }).encode("utf-8")
+    body_obj = _req_body(conf, conf["model"], messages, max_tokens, temperature)
+    _log_body(body_obj)
+    body = json.dumps(body_obj).encode("utf-8")
     req = urllib.request.Request(conf["api"], data=body, method="POST", headers={
         "Content-Type": "application/json",
         "Authorization": "Bearer " + conf["key"],
@@ -365,12 +393,9 @@ def _describe_image(conf, data_url, appid="", name="图片", nbytes=0):
         {"type": "text", "text": _VISION_HINT},
         {"type": "image_url", "image_url": {"url": data_url}},
     ]
-    body = json.dumps({
-        "model": model,
-        "messages": [{"role": "user", "content": content}],
-        "max_tokens": 300,
-        "temperature": 0.3,
-    }).encode("utf-8")
+    body_obj = _req_body(conf, model, [{"role": "user", "content": content}], 300, 0.3)
+    _log_body(body_obj)
+    body = json.dumps(body_obj).encode("utf-8")
     req = urllib.request.Request(conf["api"], data=body, method="POST", headers={
         "Content-Type": "application/json",
         "Authorization": "Bearer " + conf["key"],
@@ -417,6 +442,77 @@ def _describe_image(conf, data_url, appid="", name="图片", nbytes=0):
                 % (model, desc[:60]), appid)
             return ""
     return desc
+
+
+def verify_reasoning_effort(api, key, model, effort, base_dir=""):
+    """「验证思考强度」：用当前配置发一次最小请求（hi / max_tokens=8），返回结论 JSON。
+
+    三态：
+      ok          HTTP 200 → 「支持：HTTP 200（返回含 reasoning_content：是/否）」
+      unsupported HTTP 4xx → 「不支持：HTTP 400 · <响应体前 120 字>」
+      fail        其余（5xx / 超时 / 网络）→ 「失败：<原因>」
+    请求体走 [_req_body]，和真实调用同一处拼：验的就是真会发出去的那个包。
+    留空 = 不带该字段（等于平台默认行为），这里照样发，结论由平台回答。
+    完整请求体与响应写日志（前缀「思考强度验证：」），界面只显示一行结论。
+    """
+    import json as _json
+    import urllib.error
+    import urllib.request
+
+    global _log_path
+    if not _log_path and base_dir:
+        _log_path = os.path.join(str(base_dir), "local_bot.log")
+
+    def _out(state, line, detail=""):
+        log("思考强度验证：%s" % line)
+        return _json.dumps({"state": state, "line": line, "detail": detail}, ensure_ascii=False)
+
+    api = str(api or "").strip()
+    key = str(key or "").strip()
+    model = str(model or "").strip() or "deepseek-chat"
+    effort = str(effort or "").strip()
+    if not api or not key:
+        return _out("fail", "失败：接口地址或 API Key 没填")
+    if not api.endswith("/chat/completions"):
+        api = api.rstrip("/") + "/chat/completions"
+
+    body_obj = _req_body({"reasoning_effort": effort}, model,
+                         [{"role": "user", "content": "hi"}], 8, 0.0)
+    body = _json.dumps(body_obj, ensure_ascii=False)
+    log("思考强度验证：POST %s 请求体 %s" % (api, body))
+    req = urllib.request.Request(api, data=body.encode("utf-8"), method="POST", headers={
+        "Content-Type": "application/json",
+        "Authorization": "Bearer " + key,
+    })
+    code = 0
+    raw = ""
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            code = int(getattr(r, "status", 200) or 200)
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        code = int(getattr(e, "code", 0) or 0)
+        try:
+            raw = e.read().decode("utf-8", "replace")
+        except Exception:
+            raw = repr(e)
+    except Exception as e:
+        reason = getattr(e, "reason", None)
+        why = ("%s：%s" % (type(e).__name__, reason)) if reason is not None else str(e)
+        return _out("fail", "失败：%s" % (why or type(e).__name__), body)
+
+    log("思考强度验证：HTTP %d 响应 %s" % (code, raw.replace(chr(10), " ")[:2000]))
+    head = raw.replace(chr(10), " ").strip()[:120] or "服务端没给原因"
+    detail = "请求体：%s\n\nHTTP %d\n响应：%s" % (body, code, raw.strip()[:3000])
+    if code == 200:
+        try:
+            has = "reasoning_content" in _json.dumps(_json.loads(raw), ensure_ascii=False)
+        except Exception:
+            has = "reasoning_content" in raw
+        return _out("ok", "支持：HTTP 200（返回含 reasoning_content：%s）" % ("是" if has else "否"), detail)
+    if 400 <= code < 500:
+        return _out("unsupported", "不支持：HTTP %d · %s" % (code, head), detail)
+    return _out("fail", "失败：HTTP %d · %s" % (code, head), detail)
 
 
 async def _vision_suffix(appid, conf, images):

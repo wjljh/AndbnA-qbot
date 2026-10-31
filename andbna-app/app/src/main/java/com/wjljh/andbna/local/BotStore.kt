@@ -185,6 +185,18 @@ object BotStore {
             sp(this).edit().putString("llm_vision_model", v.trim()).apply()
         }
 
+    /**
+     * 思考强度（可选）：空串 = 请求体里不带 reasoning_effort（按平台默认跑）。
+     *
+     * 各家取值不一样（DeepSeek 官方 off/low/high/max，百炼 default/low/medium/high/xhigh/max，
+     * 部分模型只认 default），所以这里不枚举、不校验，存什么就发什么。
+     */
+    var Context.llmReasoningEffort: String
+        get() = sp(this).getString("llm_reasoning_effort", "").orEmpty()
+        set(v) {
+            sp(this).edit().putString("llm_reasoning_effort", v.trim()).apply()
+        }
+
     /** 回复判定：llm=模型判断要不要插话，random=按闲聊概率掷骰子 */
     var Context.replyJudge: String
         get() = sp(this).getString("reply_judge", "llm").orEmpty().ifBlank { "llm" }
@@ -212,6 +224,8 @@ object BotStore {
             .put("model", ctx.llmModel.ifBlank { "deepseek-chat" })
             // 识图模型：空串就是「沿用主模型」，Python 侧按空回退（这里不复制主模型）
             .put("vision_model", ctx.llmVisionModel)
+            // 思考强度：空串也写（Python 侧按空 = 请求体不带该字段）
+            .put("reasoning_effort", ctx.llmReasoningEffort)
         try {
             val f = File(ctx.filesDir, "localbot/llm.json")
             f.parentFile?.mkdirs()

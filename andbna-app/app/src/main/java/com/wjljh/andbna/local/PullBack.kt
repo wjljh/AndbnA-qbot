@@ -237,6 +237,12 @@ object PullBack {
     private fun tickLocked(ctx: Context) {
         val mode = ModeStore.get(ctx) ?: ModeStore.initial(ctx)
 
+        // 离开 ADB 模式：显式把 Shizuku 的 UserService 解绑掉。
+        // 不解绑的话那个「包名:shell」的 app_process 没人叫它退，几小时后就成了 PPID=1 的孤儿
+        if (lastMode == RunMode.ADB && mode != RunMode.ADB) {
+            ShizukuShell.unbind("切出 ADB 模式（" + mode.label + "）")
+        }
+
         // 设置里关掉了：一次都不 spawn；已经占着岗的脚本收掉（写 off，脚本看到就 exit）
         if (!autoEnabled(ctx)) {
             lastMode = mode
@@ -255,27 +261,34 @@ object PullBack {
                 // 只看 bound 会被死 binder 骗（Shizuku 被 SIGKILL 时 binderDied 未必回调）
                 if (!channelReady()) {
                     if (ShizukuShell.bound) ShizukuShell.invalidate("Shizuku 的 binder 已失联")
-                    // 进程刚被拉回来时 binder 还没递进来：先主动要一次、再绑一次
+                    // **按需绑定**：这里不 bind。绑一次就是 Shizuku 起一个 `<包名>:shell` 的
+                    // app_process（125MB），而本进程一死 Shizuku 不回收它 —— 那就是现场的孤儿。
+                    // 真正要用 shell 的地方（spawn/stop/白名单/relaunch）会走 ensureForUse 按需绑，
+                    // 只看「有没有整机 CPU」这种采样永远不 bind。
                     if (!ShizukuShell.running()) ShizukuShell.state(ctx)
-                    if (ShizukuShell.running() && ShizukuShell.hasPermission()) {
-                        ShizukuShell.bind(ctx.packageName)
-                        runCatching { Thread.sleep(1200L) }
-                    }
                 }
                 if (!channelReady()) {
                     unboundTicks++
                     if (unboundTicks == 1) {
                         log(
-                            "Shizuku 通道未就绪（running=" + ShizukuShell.running() +
+                            "Shizuku 通道未绑定（running=" + ShizukuShell.running() +
                                 "，已授权=" + ShizukuShell.hasPermission() + "：" +
-                                ShizukuShell.lastError.ifBlank { "无" } + "），暂不启用",
+                                ShizukuShell.lastError.ifBlank { "无" } + "）—— 按需绑定，等真要用 shell 再绑",
                         )
                     }
-                    if (alive(ctx) && unboundTicks >= 3) {
-                        stop(ctx, "Shizuku 通道断开（bound=false）")
-                        unboundTicks = 0
+                    // 只有 Shizuku 真不可用（没跑 / 没授权）才算「通道断开」；单纯「还没按需绑定」
+                    // 不能去收脚本 —— 否则每次启动都变成「bind 一次 + 杀掉看门狗」的抖动
+                    val broken = !(ShizukuShell.running() && ShizukuShell.hasPermission())
+                    if (broken) {
+                        if (alive(ctx) && unboundTicks >= 3) {
+                            stop(ctx, "Shizuku 通道断开（bound=false）")
+                            unboundTicks = 0
+                        }
+                        return
                     }
-                    return
+                    // Shizuku 在跑且已授权，只是**还没按需绑定**：照常走 start()。
+                    // 脚本还活着（心跳新鲜）→ 什么都不做、一个 bind 都不发；
+                    // 脚本真没了 → spawnOnce 里的 ensureForUse 才按需绑一次（这才是「真要用 shell」）
                 }
                 unboundTicks = 0
                 start(ctx, RunMode.ADB)
@@ -355,7 +368,13 @@ object PullBack {
             // 目录可能是上一次运行留下的、当前 App 写不进去：让通道按自己的身份重建一次再写
             val fix = "rm -rf " + d.absolutePath + " && mkdir -p " + d.absolutePath +
                 " && chmod 0777 " + d.absolutePath
-            if (mode == RunMode.ADB) ShizukuShell.exec(fix) else RootHost.sh(fix)
+            if (mode == RunMode.ADB) {
+                // 真要把目录重建掉 = 真要用 shell：这时才按需绑定
+                ShizukuShell.ensureForUse(ctx)
+                ShizukuShell.exec(fix)
+            } else {
+                RootHost.sh(fix)
+            }
             d.mkdirs()
             if (!runCatching { script.writeText(text) }.isSuccess) {
                 log("看门狗启动失败：脚本写不进去（" + d.absolutePath + "）")
@@ -363,11 +382,11 @@ object PullBack {
             }
         }
         runCatching { File(d, OFF).delete() }
-        var ok = spawnOnce(mode, d, script)
+        var ok = spawnOnce(ctx, mode, d, script)
         if (!ok) {
             log("看门狗启动失败：pid 不存在，重试一次")
             runCatching { Thread.sleep(1000L) }
-            ok = spawnOnce(mode, d, script)
+            ok = spawnOnce(ctx, mode, d, script)
         }
         if (!ok) {
             log("看门狗启动失败：pid 不存在（重试后仍不存在，" + d.absolutePath + "）")
@@ -388,7 +407,7 @@ object PullBack {
      *
      * 启动后 3 秒内用 kill -0 确认它真活着，不行返回 false（调用方记日志并重试一次）。
      */
-    private fun spawnOnce(mode: RunMode, d: File, script: File): Boolean {
+    private fun spawnOnce(ctx: Context, mode: RunMode, d: File, script: File): Boolean {
         val D = "\$"
         // 起新脚本前按 pid 文件收掉残留的旧进程（不用 pkill -f：模式串会命中包装它的 sh -c）
         val cmd = "cd " + d.absolutePath + " && rm -f " + OFF + "; P=" + D + "(cat " +
@@ -397,7 +416,13 @@ object PullBack {
             "nohup setsid sh " + script.absolutePath + " </dev/null >>" +
             File(d, RUNLOG).absolutePath + " 2>&1 & echo spawned"
         runCatching {
-            val out = if (mode == RunMode.ADB) ShizukuShell.exec(cmd) else RootHost.sh(cmd).out
+            // 起看门狗是「真要用 shell」的场景：ADB 通道到这里才按需绑定（启动时不绑）
+            val out = if (mode == RunMode.ADB) {
+                ShizukuShell.ensureForUse(ctx)
+                ShizukuShell.exec(cmd)
+            } else {
+                RootHost.sh(cmd).out
+            }
             if (!out.contains("spawned")) log("看门狗启动失败：" + out.trim())
         }
         // 脚本自己写 pid；3 秒内用 kill -0 验活（state/hb 会被上一份脚本的残留骗过去）
@@ -480,6 +505,10 @@ object PullBack {
         if (!st.alive) return false
         val pid = pidOf(d)
         if (pid.isBlank()) return false
+        // ADB 通道是按需绑定的：没绑定的时候 kill -0 得先 bind，而「只为确认还活着」不值得
+        // 一个新进程（每次进程重启会多留一个 :shell 孤儿）。这种情况退一步只认心跳文件：
+        // 心跳 2 个周期内刷过、state 还是 running，就当它活着；真异常会有别的路径去处理。
+        if (st.channel != "root" && !ShizukuShell.bound) return true
         return kill0(pid, st.channel)
     }
 

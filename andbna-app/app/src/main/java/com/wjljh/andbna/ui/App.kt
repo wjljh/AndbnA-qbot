@@ -446,8 +446,7 @@ private fun MainTabs(
                             visible = cur == 0,
                             bottomInset = pageInset,
                             onOpenDetail = onOpenDetail,
-                            onOpenMode = onOpenMode,
-                            // App 持有的 mode 状态：模式胶囊与「运行模式」行都读它，改完立刻一致
+                            // App 持有的 mode 状态：hero 胶囊与「资源占用」卡都读它，改完立刻一致
                             mode = mode,
                         )
                         1 -> LocalTextsContent(

@@ -2,6 +2,7 @@ package com.wjljh.andbna.ui
 
 import android.Manifest
 import android.os.Build
+import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
@@ -22,7 +23,6 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Security
 import androidx.compose.material.icons.filled.Smartphone
 import androidx.compose.material.icons.filled.Tag
-import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.rounded.CheckCircleOutline
 import androidx.compose.material.icons.rounded.ErrorOutline
 import androidx.compose.runtime.Composable
@@ -30,6 +30,7 @@ import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.runtime.mutableLongStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
@@ -99,11 +100,11 @@ fun StatusPage(
     visible: Boolean,
     bottomInset: Dp = 0.dp,
     onOpenDetail: () -> Unit = {},
-    onOpenMode: () -> Unit = {},
     /** 当前模式由 App 统一持有（改完立刻重组）；不传就退回 ModeStore 的落盘值 */
     mode: RunMode? = null,
 ) {
-    LocalStatusContent(visible, bottomInset, onOpenDetail, onOpenMode, mode)
+    // 模式入口只剩 hero（点卡片进「运行控制」页），信息卡里那行「运行模式」已删
+    LocalStatusContent(visible, bottomInset, onOpenDetail, mode)
 }
 
 // ── 本机托管（普通 / ADB / root）────────────────────────────────────────────
@@ -113,7 +114,6 @@ private fun LocalStatusContent(
     visible: Boolean,
     bottomInset: Dp,
     onOpenDetail: () -> Unit,
-    onOpenMode: () -> Unit,
     mode: RunMode?,
 ) {
     val ctx = LocalContext.current
@@ -132,8 +132,14 @@ private fun LocalStatusContent(
         )
     }
     var botCount by remember { mutableIntStateOf(0) }
+    // hero 副标题显示运行时长：第一次判定为 running 的时刻（毫秒）
+    var runSince by remember { mutableLongStateOf(0L) }
+    // 用户刚点「启动/停止」时先给即时反馈，别等下一轮轮询（否则体感很慢）
+    var pending by remember { mutableStateOf("") }
     var memCount by remember { mutableIntStateOf(-1) }
-    var probeText by remember { mutableStateOf("") }
+    // 自检只留一行结论（完整依赖清单进日志），30 秒后自动收起
+    var probeLine by remember { mutableStateOf("") }
+    var probeOk by remember { mutableStateOf(true) }
     // 「自动拉回」那行：三态文案由 PullBack 自己的状态文件算出来（读文件，别在主线程）
     var pullText by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
@@ -157,6 +163,8 @@ private fun LocalStatusContent(
         if (hasEnabled && !BotHost.isRunning()) {
             BotHost.init(ctx)
             BotService.start(ctx)
+            // 自动拉起时也给即时反馈，别让用户以为没启动
+            pending = "启动中"
         }
     }
 
@@ -170,7 +178,13 @@ private fun LocalStatusContent(
             }
             botCount = withContext(Dispatchers.IO) { BotStore.load(ctx).count { it.enabled } }
             pullText = withContext(Dispatchers.IO) { PullBack.statusText(ctx, curMode) }
-            delay(3000)
+            // 启动阶段更快：还没跑起来时 1 秒一次，跑起来后 3 秒一次，省电
+            val up = status.contains("已上线") || status.contains("连接中")
+            if (up && runSince == 0L) runSince = System.currentTimeMillis()
+            if (up && pending.isNotBlank()) pending = ""
+            if (!up && runSince != 0L && !BotHost.isRunning()) runSince = 0L
+            val starting = !up && BotHost.isRunning()
+            delay(if (up) 3000L else if (starting) 800L else 1000L)
         }
     }
 
@@ -189,6 +203,12 @@ private fun LocalStatusContent(
         }
     }
 
+    LaunchedEffect(probeLine) {
+        if (probeLine.isBlank()) return@LaunchedEffect
+        delay(30000)
+        probeLine = ""
+    }
+
     val running = status.contains("已上线") || status.contains("连接中")
     val hasError = status.contains("失败") || status.contains("异常")
     val tone = when {
@@ -196,8 +216,19 @@ private fun LocalStatusContent(
         hasError -> StatusTone.Error
         else -> StatusTone.Idle
     }
-    val heroTitle = if (running) "运行中" else "未运行"
-    val heroSubtitle = if (running) "已上线 · " + botCount + " 个 bot" else status.ifBlank { "—" }
+    val heroTitle = when {
+        running -> "运行中"
+        pending.isNotBlank() -> pending
+        BotHost.isRunning() -> "启动中"
+        else -> "未运行"
+    }
+    val heroSubtitle = when {
+        running && runSince > 0L -> "已运行 " + uptimeText(runSince)
+        pending == "启动中" -> "正在拉起 Python 与 " + botCount + " 个 bot…"
+        running -> "已运行"
+        BotHost.isRunning() -> "正在连接…"
+        else -> status.ifBlank { "点这里开始" }
+    }
     // 胶囊只看 bot 是否真的在线：已上线 / 连接中才写模式名，否则一律「未启动」。
     // 「已拉起前台服务」这类中间态由下面的提示条表达，不塞进胶囊。
     val heroMode = if (running) modeShort(curMode) else "未启动"
@@ -237,24 +268,18 @@ private fun LocalStatusContent(
             }
         }
 
+        // 资源占用卡：root / ADB 两种模式显示（普通模式没有额外保活权限、也不该多耗），
+        // 位置固定排在「运行模式」那张卡上面
+        if (curMode != RunMode.NORMAL) item(key = "resource") {
+            ResourceUsageCard(visible = visible)
+        }
+
         item(key = "info") {
             PanelGroupCard {
-                // 点这一行进模式选择页（设置页那行「运行模式」已删，这里是 Route.ModePick 的入口）
-                PanelInfoRow(
-                    icon = Icons.Filled.Tune,
-                    title = "运行模式",
-                    value = modeText(curMode),
-                    onClick = onOpenMode,
-                )
                 PanelInfoRow(
                     icon = Icons.Filled.Refresh,
                     title = "自动拉回",
                     value = pullText.ifBlank { "检测中…" },
-                )
-                PanelInfoRow(
-                    icon = Icons.Filled.Smartphone,
-                    title = "启用 bot",
-                    value = botCount.toString() + " 个",
                 )
                 PanelInfoRow(
                     icon = Icons.Filled.Folder,
@@ -285,9 +310,13 @@ private fun LocalStatusContent(
                                 PullBack.setUserStopped(ctx, false)
                                 msgOk = true
                                 msg = "已拉起前台服务（" + botCount + " 个 bot）"
+                                pending = "启动中"
                                 scope.launch {
-                                    delay(1500)
-                                    status = BotHost.stateText()
+                                    listOf(400L, 1200L, 2500L).forEach { wait ->
+                                        delay(wait)
+                                        status = BotHost.stateText()
+                                    }
+                                    pending = ""
                                 }
                             }
                         },
@@ -312,7 +341,12 @@ private fun LocalStatusContent(
                         onClick = {
                             busy = true
                             scope.launch {
-                                probeText = withContext(Dispatchers.Default) { BotHost.probe() }
+                                val raw = withContext(Dispatchers.Default) { BotHost.probe() }
+                                // 完整依赖清单只进日志，界面只留一行结论
+                                Log.i("AndbnA", "自检：" + raw)
+                                val summary = probeSummary(raw)
+                                probeOk = summary.first
+                                probeLine = summary.second
                                 busy = false
                             }
                         },
@@ -320,11 +354,8 @@ private fun LocalStatusContent(
                         enabled = !busy,
                     )
                 }
-                PanelAnimatedNotice(visible = busy || probeText.isNotBlank()) {
-                    Column {
-                        if (busy) PanelNotice("自检中…")
-                        if (probeText.isNotBlank()) MonoText(probeText)
-                    }
+                PanelAnimatedNotice(visible = busy || probeLine.isNotBlank()) {
+                    if (busy) PanelNotice("自检中…") else PanelNotice(probeLine, isError = !probeOk)
                 }
             }
         }
@@ -418,6 +449,47 @@ private fun MonoText(text: String) {
 }
 
 private fun countText(n: Int): String = if (n < 0) "—" else n.toString()
+
+/**
+ * 把 Python 自检的多行依赖清单压成一行结论；完整清单只写日志（前缀「自检：」）。
+ *
+ * 原文形如：
+ *   python   3.13.16
+ *   platform android
+ *   aiohttp  3.11.18
+ *   botpy    ok
+ * 失败的那一行末尾是「✗ 原因」；Python 没起来时 bot_runner 直接返回「Python 没起来」。
+ */
+private fun probeSummary(raw: String): Pair<Boolean, String> {
+    val lines = raw.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
+    if (lines.isEmpty()) return false to "自检失败：没有输出"
+
+    val bad = lines.firstOrNull { it.contains("✗") }
+    if (bad != null) {
+        val name = bad.substringBefore(' ').trim()
+        val why = bad.substringAfter("✗", "").trim()
+        return false to "自检失败：" +
+            (if (name.isBlank()) "依赖导入出错" else name + " 导入失败") +
+            (if (why.isBlank()) "" else "（" + why + "）")
+    }
+    if (raw.startsWith("Python 没起来") || raw.startsWith("自检失败")) {
+        return false to "自检失败：" + lines.first().removePrefix("自检失败：").take(40)
+    }
+
+    fun value(name: String): String? = lines.firstOrNull { it.startsWith(name) }
+        ?.removePrefix(name)?.trim()?.takeIf { it.isNotEmpty() }
+
+    val py = value("python")
+    val botpy = value("botpy")
+    val parts = ArrayList<String>()
+    if (py != null) parts += "python " + py
+    parts += when {
+        botpy == null -> "botpy 未见"
+        botpy == "ok" -> "botpy 正常"
+        else -> "botpy " + botpy
+    }
+    return true to "自检通过：" + parts.joinToString(" · ")
+}
 
 /** 运行模式的显示用语（业务层 label 是「root 模式」，这里统一成「×× 托管」）。 */
 internal fun modeText(mode: RunMode): String = when (mode) {
@@ -626,5 +698,16 @@ private fun AdbCard() {
             modifier = Modifier.padding(top = PanelTokens.InfoValueGap),
         )
         PanelAnimatedNotice(visible = msg.isNotBlank()) { MonoText(msg) }
+    }
+}
+
+/** hero 副标题用的运行时长文案：<1 分钟 / N 分钟 / N 小时 M 分 / N 天 M 小时 */
+private fun uptimeText(sinceMs: Long): String {
+    val min = ((System.currentTimeMillis() - sinceMs) / 60000L).coerceAtLeast(0L)
+    return when {
+        min < 1L -> "不到 1 分钟"
+        min < 60L -> min.toString() + " 分钟"
+        min < 1440L -> (min / 60L).toString() + " 小时"
+        else -> (min / 1440L).toString() + " 天"
     }
 }

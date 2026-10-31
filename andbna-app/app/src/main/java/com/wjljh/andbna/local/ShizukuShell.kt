@@ -127,6 +127,44 @@ object ShizukuShell {
     @Volatile
     private var remote: IUserService? = null
 
+    /** 当前这条 binding。args 必须原样留着：Shizuku 解绑时要求参数与 bind 时完全一致 */
+    private class Binding(
+        val args: rikka.shizuku.Shizuku.UserServiceArgs,
+        val conn: android.content.ServiceConnection,
+    )
+
+    @Volatile
+    private var binding: Binding? = null
+
+    /**
+     * binding 正在建立中。bindUserService 是**异步**的，回调回来之前 remote 还是 null，
+     * 这段窗口里再 bind 一次就会多起一个 `<包名>:shell` 的 app_process（几十 MB 一个）。
+     */
+    @Volatile
+    private var bindingInFlight = false
+
+    /** App 级 Context（AndbnAApp.onCreate 注入）：bind 的硬门要按当前模式判断，而 bind(pkg) 拿不到 ctx */
+    @Volatile
+    var appCtx: Context? = null
+
+    /** 用户主动授权的窗口：只有在这个窗口里才允许 root 模式下 bind（「切到 ADB 模式」的流程要用） */
+    @Volatile
+    private var userIntentUntil = 0L
+
+    /** 当前是不是 root 模式（拿不到 ctx 就当不是，避免误挡） */
+    private fun rootModeNow(): Boolean {
+        val c = appCtx ?: return false
+        return ModeStore.get(c) == RunMode.ROOT
+    }
+
+    /** bind / unbind 共用同一份参数：进程名后缀、version 对不上就解绑不掉，进程留着变孤儿 */
+    private fun argsFor(pkg: String, debuggable: Boolean): rikka.shizuku.Shizuku.UserServiceArgs =
+        rikka.shizuku.Shizuku.UserServiceArgs(ComponentName(pkg, UserService::class.java.name))
+            .daemon(false)
+            .processNameSuffix("shell")
+            .debuggable(debuggable)
+            .version(1)
+
     @Volatile
     var lastError: String = ""
         private set
@@ -406,6 +444,9 @@ object ShizukuShell {
      */
     fun ensureAuthorized(ctx: Context, onResult: (ShizukuResult) -> Unit) {
         val pkg = ctx.packageName
+        // 这是「用户主动授权」入口（ADB 卡 / 切换模式）：给它开一个 120s 的 bind 窗口，
+        // 只有这里能绕过 root 模式的硬门
+        userIntentUntil = System.currentTimeMillis() + 120_000L
         waitForBinder(ctx) { connected ->
         if (!connected) {
             if (lastError.isBlank()) {
@@ -514,35 +555,106 @@ object ShizukuShell {
         }
     }
 
+    /**
+     * 绑定 UserService，**幂等**：已绑定 / 正在绑定中一律不再 bind。
+     *
+     * 以前只看 `remote == null`，而 bindUserService 是异步的 —— 回调回来之前 remote 一直是 null，
+     * 这段窗口里每调一次就多起一个 `<包名>:shell` 的 app_process（每个几十 MB）；
+     * 绑定方一死它们就变成 PPID=1 的孤儿。现场那 11 个 :shell 就是这么攒出来的。
+     */
     fun bind(pkg: String, debuggable: Boolean = true) {
-        if (remote != null) return
-        try {
-            val args = rikka.shizuku.Shizuku.UserServiceArgs(
-                ComponentName(pkg, UserService::class.java.name)
-            )
-                .daemon(false)
-                .processNameSuffix("shell")
-                .debuggable(debuggable)
-                .version(1)
-            rikka.shizuku.Shizuku.bindUserService(
-                args,
-                object : android.content.ServiceConnection {
-                    override fun onServiceConnected(name: ComponentName?, service: android.os.IBinder?) {
-                        remote = try {
-                            service?.let { IUserService.Stub.asInterface(it) }
-                        } catch (e: Throwable) {
-                            lastError = "转接 binder 失败：${e.message}"
-                            null
-                        }
-                    }
-
-                    override fun onServiceDisconnected(name: ComponentName?) {
-                        remote = null
-                    }
-                })
-        } catch (e: Throwable) {
-            lastError = "绑定 UserService 失败：${e.message}"
+        // 硬门（不看调用方）：root 模式下不许 bind。root 的白名单 / 拉回全走 su，Shizuku 在这儿没用，
+        // 绑一次就白起一个「包名:shell」的 app_process（framework + 我们的 APK，几十上百 MB），
+        // 客户端一死就变 PPID=1 的孤儿。唯一例外：用户正主动走「切到 ADB 模式」的授权窗口。
+        if (rootModeNow() && System.currentTimeMillis() > userIntentUntil) {
+            Log.i(TAG, "root 模式不绑 Shizuku：bind 被硬门拦下（pkg=" + pkg + "）")
+            return
         }
+        if (remote != null || bindingInFlight) return
+        val args = argsFor(pkg, debuggable)
+        val conn = object : android.content.ServiceConnection {
+            override fun onServiceConnected(name: ComponentName?, service: android.os.IBinder?) {
+                bindingInFlight = false
+                remote = try {
+                    service?.let { IUserService.Stub.asInterface(it) }
+                } catch (e: Throwable) {
+                    lastError = "转接 binder 失败：${e.message}"
+                    null
+                }
+            }
+
+            override fun onServiceDisconnected(name: ComponentName?) {
+                bindingInFlight = false
+                remote = null
+            }
+        }
+        binding = Binding(args, conn)
+        bindingInFlight = true
+        try {
+            rikka.shizuku.Shizuku.bindUserService(args, conn)
+            Log.i(TAG, "bindUserService：开始绑定（pkg=" + pkg + "，processNameSuffix=shell）")
+        } catch (e: Throwable) {
+            bindingInFlight = false
+            binding = null
+            lastError = "绑定 UserService 失败：${e.message}"
+            Log.w(TAG, "bindUserService 失败：" + e.message)
+        }
+    }
+
+    /** 主动解绑（参数与 bind 一致）；失败也要留日志 —— 解不掉就等于放生一个 :shell */
+    fun unbind(reason: String): Boolean {
+        val b = binding
+        binding = null
+        bindingInFlight = false
+        remote = null
+        if (b == null) return false
+        return try {
+            // remove=true 会把 UserService 从 Shizuku 注册中移除，之后再也 bind 不上，必须 false。
+            // （实测：remove=true 之后「切到 ADB 模式」直接失败并回滚成 root。）
+            // 代价是 Shizuku 13.7 不会立刻退掉那个 app_process（ppid=1 的 :shell 会再活一会儿），
+            // 这一段由 ShellJanitor 兜底（300s 阈值 + 2 分钟扫描）—— 这也是它必须留着的原因。
+            rikka.shizuku.Shizuku.unbindUserService(b.args, b.conn, false)
+            Log.i(TAG, "已解绑 UserService（" + reason + "）")
+            true
+        } catch (e: Throwable) {
+            Log.w(TAG, "解绑 UserService 失败（" + reason + "）：" + e.message)
+            false
+        }
+    }
+
+    /**
+     * 自动绑定入口（监督线程那种每 20s 一次的地方用）：**root 模式一次都不 bind**。
+     *
+     * root 模式的白名单 / 拉回全走 su，Shizuku 在这儿没有任何用处，绑一次就白起一个 :shell 进程。
+     * 只有用户主动在 ADB 卡上点授权（[ensureAuthorized] / [bind]）才会真去捆。
+     */
+    fun bindAuto(ctx: Context, debuggable: Boolean = true): Boolean {
+        if (ModeStore.get(ctx) == RunMode.ROOT) {
+            Log.i(TAG, "root 模式不绑 Shizuku：跳过自动绑定（不产生 :shell 进程）")
+            return false
+        }
+        bind(ctx.packageName, debuggable)
+        return true
+    }
+
+    /**
+     * **真要用 shell 了**才按需绑定：拿不到就返回 false（调用方按「通道不可用」处理）。
+     * 只有实际要跑命令的地方（spawn/stop/白名单/relaunch）才调它 —— 启动、切模式、看整机 CPU
+     * 这类路径一次都不 bind，免得每重启一次进程就多留一个 :shell 孤儿。
+     */
+    fun ensureForUse(ctx: Context, waitMs: Long = 3000L): Boolean {
+        if (bound && running()) return true
+        if (!(running() && hasPermission())) {
+            lastError = "Shizuku 不可用（running=" + running() + "，已授权=" + hasPermission() + "）"
+            return false
+        }
+        bindAuto(ctx)
+        val deadline = System.currentTimeMillis() + waitMs
+        while (System.currentTimeMillis() < deadline) {
+            if (bound) return true
+            runCatching { Thread.sleep(120L) }
+        }
+        return bound
     }
 
     fun exec(cmd: String): String {
@@ -569,9 +681,11 @@ object ShizukuShell {
      */
     fun invalidate(reason: String) {
         if (remote != null) {
-            remote = null
+            // 只置空 remote 的话 Shizuku 那边的进程没人叫它退，最后攒成 PPID=1 的 :shell 孤儿：
+            // 所以先显式解绑（解绑失败也记日志），再允许下一次重新绑定
+            unbind("通道作废：" + reason)
             lastError = reason
-            Log.w(TAG, "通道作废（" + reason + "）：remote 置空，等下一次重新绑定")
+            Log.w(TAG, "通道作废（" + reason + "）：已解绑并置空，等下一次重新绑定")
         }
     }
 

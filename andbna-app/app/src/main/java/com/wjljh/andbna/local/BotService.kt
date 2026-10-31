@@ -84,6 +84,10 @@ class BotService : Service() {
     override fun onDestroy() {
         alive = false
         BotHost.stopAll()
+        // 顺手把 Shizuku 的 UserService 解绑：只靠 binder 断开去回收并不可靠（实测 Shizuku 13.7
+        // 在客户端进程消失后会把 `<包名>:shell` 的 app_process 留成 PPID=1 的孤儿），
+        // 这里有 onDestroy 就有机会显式退掉；force-stop 之类叫不到 onDestroy 的情况交给 ShellJanitor 兜底
+        runCatching { ShizukuShell.unbind("前台服务销毁") }
         super.onDestroy()
     }
 
@@ -212,6 +216,31 @@ object BotHost {
             lastError = "启动异常：${e.message}"
             lastError
         }
+    }
+
+    /**
+     * 「验证思考强度」：用当前配置发一次最小请求（hi / max_tokens=8），拿平台的原话回来。
+     *
+     * 走 bot_runner.verify_reasoning_effort —— 请求体和真实调用同一处拼（_req_body），
+     * 所以验的就是真会发出去的那个包（留空 = 不带该字段）。返回 state / line / detail 的 JSON 串。
+     */
+    fun verifyReasoning(
+        context: Context,
+        api: String,
+        key: String,
+        model: String,
+        effort: String,
+    ): String = try {
+        ensure()?.callAttr(
+            "verify_reasoning_effort", api, key, model, effort, dataDir(context).absolutePath,
+        )?.toString() ?: org.json.JSONObject()
+            .put("state", "fail").put("line", "失败：Python 未就绪").put("detail", "").toString()
+    } catch (e: Throwable) {
+        org.json.JSONObject()
+            .put("state", "fail")
+            .put("line", "失败：" + (e.message ?: e.javaClass.simpleName))
+            .put("detail", "")
+            .toString()
     }
 
     // ── 本机记忆（供「内容」页读）──
