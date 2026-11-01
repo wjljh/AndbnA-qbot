@@ -13,6 +13,28 @@
 - 三种运行模式：普通 / ADB(Shizuku) / root；统一的「自动拉回」看门狗（进程外脚本，被杀可自动拉起）
 - 首次使用引导（含 Shizuku / root / 电池白名单真检测）
 
+## 申请一个 QQ 机器人（拿 AppID / AppSecret）
+
+本 App 托管的是 **QQ 官方机器人**，所以先在 QQ 开放平台注册一个：
+
+| 用途 | 地址 |
+|---|---|
+| 申请 / 管理机器人（创建后拿 **AppID**、**AppSecret**） | https://q.qq.com/ |
+| 官方开发者文档（接口、事件、沙箱与上线流程） | https://bot.q.qq.com/wiki/ |
+
+流程简述：
+
+1. 打开 https://q.qq.com/ ，用 QQ 登录，选择「机器人」→ 创建；
+2. 创建后进入机器人详情，记下 **AppID** 与 **AppSecret**（AppSecret 只显示一次，注意保存）；
+3. 在「开发设置」里配置好沙箱 / 正式环境的权限与事件订阅（本 App 走 WebSocket 网关，需要开启群聊与私聊相关事件）；
+4. 把 AppID / AppSecret 填进本 App 的「Bot」→「添加」，保存后即可上线；
+5. 首次上线先在沙箱里 @ 一下机器人测试，确认权限与事件都通了，再申请发布。
+
+> 注意：AppSecret 在本 App 里是用 Android Keystore（AES-256/GCM）加密后落盘的，不会以明文写入；但它等于机器人的密码，**不要外传、不要提交进仓库**。
+
+参考：官方文档里「开发准备 → 启动接入」一节讲了 AppID/AppSecret 与 token 的获取方式：
+https://bot.q.qq.com/wiki/develop/api-v2/dev-prepare/getting-started.html
+
 ## 运行模式：普通 / ADB(Shizuku) / root
 
 三种模式下 **bot 的运行内核完全相同**（Python 跑在 App 进程里，Chaquopy），差别只在「保活权限」：能不能把 App 加进电池白名单、被系统杀掉之后能不能自己回来。
