@@ -18,3 +18,6 @@ shots/
 */shots/
 *.log
 .DS_Store
+
+# 内部交付文档（思路记录/产物清单），不进公开仓库
+delivery/
