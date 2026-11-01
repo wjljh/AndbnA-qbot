@@ -37,6 +37,8 @@ class BotService : Service() {
         alive = true
         // 渠道按落盘状态备好（顺带清掉旧版本遗留的「不显示」渠道）
         RunNotification.ensureChannels(this)
+        // 记录服务本次启动的墙钟时间：hero 的「已运行」用它算，跨页面/进程重启都不丢
+        com.wjljh.andbna.ui.Prefs.put(this, "svc_started_at", System.currentTimeMillis().toString())
         // 前台服务起来就保证「自动拉回」的监督在跑（ADB/root 满足条件时无需用户点任何开关）
         PullBack.supervise(this)
     }

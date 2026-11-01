@@ -134,6 +134,10 @@ private fun LocalStatusContent(
     var botCount by remember { mutableIntStateOf(0) }
     // hero 副标题显示运行时长：第一次判定为 running 的时刻（毫秒）
     var runSince by remember { mutableLongStateOf(0L) }
+    // 服务启动时间（落盘）：来自 BotService.onCreate，跨 Compose 重组/切页/进程重启都不丢
+    var svcSince by remember { mutableLongStateOf(0L) }
+    // 每轮轮询都变的自增 tick：给「运行时长」这类依赖墙钟的文案制造重组（值不变时 Compose 不会重组）
+    var tick by remember { mutableLongStateOf(0L) }
     // 用户刚点「启动/停止」时先给即时反馈，别等下一轮轮询（否则体感很慢）
     var pending by remember { mutableStateOf("") }
     var memCount by remember { mutableIntStateOf(-1) }
@@ -178,6 +182,8 @@ private fun LocalStatusContent(
             }
             botCount = withContext(Dispatchers.IO) { BotStore.load(ctx).count { it.enabled } }
             pullText = withContext(Dispatchers.IO) { PullBack.statusText(ctx, curMode) }
+            svcSince = withContext(Dispatchers.IO) { Prefs.get(ctx, "svc_started_at").toLongOrNull() ?: 0L }
+            tick = System.currentTimeMillis()
             // 启动阶段更快：还没跑起来时 1 秒一次，跑起来后 3 秒一次，省电
             val up = status.contains("已上线") || status.contains("连接中")
             if (up && runSince == 0L) runSince = System.currentTimeMillis()
@@ -222,12 +228,19 @@ private fun LocalStatusContent(
         BotHost.isRunning() -> "启动中"
         else -> "未运行"
     }
-    val heroSubtitle = when {
+    // 兜底来源：本进程启动时长（SystemClock.elapsedRealtime - Process.getStartElapsedRealtime）
+    // 服务与应用同进程，二者同起点；这样即使 prefs 读不到也会随轮询正常走字
+    val procSince = System.currentTimeMillis() -
+        (android.os.SystemClock.elapsedRealtime() - android.os.Process.getStartElapsedRealtime())
+    val heroSubtitle = tick.let { _ -> when {
+        running && svcSince > 0L -> "已运行 " + uptimeText(svcSince)
+        running && procSince > 0L -> "已运行 " + uptimeText(procSince)
         running && runSince > 0L -> "已运行 " + uptimeText(runSince)
         pending == "启动中" -> "正在拉起 Python 与 " + botCount + " 个 bot…"
         running -> "已运行"
         BotHost.isRunning() -> "正在连接…"
         else -> status.ifBlank { "点这里开始" }
+        }
     }
     // 胶囊只看 bot 是否真的在线：已上线 / 连接中才写模式名，否则一律「未启动」。
     // 「已拉起前台服务」这类中间态由下面的提示条表达，不塞进胶囊。
