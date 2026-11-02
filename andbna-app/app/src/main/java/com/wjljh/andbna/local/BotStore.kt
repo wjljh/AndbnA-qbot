@@ -199,15 +199,24 @@ object BotStore {
             sp(this).edit().putString("llm_summary_model", v.trim()).apply()
         }
 
+    /** 搜索结果转述用的模型：留空 = 沿用主模型（#搜 / #读 人设化加工时才用一次）。 */
+    var Context.llmSearchModel: String
+        get() = sp(this).getString("llm_search_model", "").orEmpty()
+        set(v) {
+            sp(this).edit().putString("llm_search_model", v.trim()).apply()
+        }
+
     /**
-     * 上下文窗口（token）：压缩阈值 = 这个值的 75%。默认 64000。
+     * 上下文窗口（token）：压缩阈值 = 这个值的 75%。默认 131072（128K）。
      *
-     * 存字符串是为了让输入框原样保存；Python 侧读不到 / 解析失败都按 64000 处理。
+     * 这是**估算阈值基数**，不是硬上限：真正发出去的只有 system + 摘要 + 最近 12 条。
+     * 存字符串是为了让输入框原样保存；Python 侧读不到 / 解析失败都按 131072 处理。
+     * 老配置里已经存着的值（例如 64000、用户自己试过的 600）一律不动。
      */
     var Context.llmContextWindow: String
-        get() = sp(this).getString("llm_context_window", "64000").orEmpty().ifBlank { "64000" }
+        get() = sp(this).getString("llm_context_window", "131072").orEmpty().ifBlank { "131072" }
         set(v) {
-            sp(this).edit().putString("llm_context_window", v.trim().ifBlank { "64000" }).apply()
+            sp(this).edit().putString("llm_context_window", v.trim().ifBlank { "131072" }).apply()
         }
 
     /** 联网搜索（DeepSeek 官方 Search / Fetch）：默认开。关掉后 #搜/#读 与自动搜索都不发请求。 */
@@ -216,6 +225,66 @@ object BotStore {
         get() = sp(this).getString("web_search_enabled", "1").orEmpty().trim() != "0"
         set(v) {
             sp(this).edit().putString("web_search_enabled", if (v) "1" else "0").apply()
+        }
+
+    /**
+     * 搜索结果人设化加工（默认开）：#搜 / #读 交给模型按人格**合成一段自然回答**
+     * （至多带一条洗过跟踪参数的链接）。关掉 = 原始列表贴法（标题｜摘要 + 链接逐条贴），
+     * 只用于调试 / 对比。
+     */
+    var Context.searchPersonaStyle: Boolean
+        get() = sp(this).getString("search_persona_style", "1").orEmpty().trim() != "0"
+        set(v) {
+            sp(this).edit().putString("search_persona_style", if (v) "1" else "0").apply()
+        }
+
+    /**
+     * 搜索后端（默认 deepseek）：deepseek / searxng / custom / off。
+     *
+     * 后端可换，上层只认统一结构 [{title,url,summary}]：中转站与第三方模型通常没有
+     * DeepSeek 那套 /v1/tools 接口，那就改用自建 SearXNG 或自定义 JSON 接口。
+     */
+    var Context.searchProvider: String
+        get() = sp(this).getString("search_provider", "deepseek").orEmpty()
+            .ifBlank { "deepseek" }
+        set(v) {
+            sp(this).edit().putString("search_provider", v.trim().ifBlank { "deepseek" }).apply()
+        }
+
+    /** 搜索后端地址：searxng 填实例根地址，custom 填带 {query} 占位（或不带、自动加 ?q=）的地址。 */
+    var Context.searchBase: String
+        get() = sp(this).getString("search_base", "").orEmpty()
+        set(v) {
+            sp(this).edit().putString("search_base", v.trim()).apply()
+        }
+
+    /** 搜索鉴权：none / bearer（用主模型 Key）/ header:Name=Value。 */
+    var Context.searchAuth: String
+        get() = sp(this).getString("search_auth", "").orEmpty()
+        set(v) {
+            sp(this).edit().putString("search_auth", v.trim()).apply()
+        }
+
+    /** 自定义后端的结果字段路径：默认 results[].title,url,summary。 */
+    var Context.searchFields: String
+        get() = sp(this).getString("search_fields", "results[].title,url,summary").orEmpty()
+            .ifBlank { "results[].title,url,summary" }
+        set(v) {
+            sp(this).edit()
+                .putString("search_fields", v.trim().ifBlank { "results[].title,url,summary" }).apply()
+        }
+
+    /**
+     * 让模型自己判断「要不要先上网查」（默认开）。
+     *
+     * 开：普通聊天里模型不确定或需要最新信息时，自己输出一行 <search>关键词</search>，
+     * 程序搜完再让它按资料回答（一条消息最多一次搜索 + 一次额外模型调用）。
+     * 关：退回老逻辑 —— 只有 #搜 / #读 和「最近/新闻/价格」这类触发词才会联网。
+     */
+    var Context.searchAutoDecide: Boolean
+        get() = sp(this).getString("search_auto_decide", "1").orEmpty().trim() != "0"
+        set(v) {
+            sp(this).edit().putString("search_auto_decide", if (v) "1" else "0").apply()
         }
 
     /**
@@ -255,15 +324,23 @@ object BotStore {
         val o = JSONObject()
             .put("api", ctx.llmApi)
             .put("model", ctx.llmModel.ifBlank { "deepseek-chat" })
-            // 三个槽位模型：空串就是「沿用主模型」，Python 侧按空回退（这里不复制主模型）
+            // 四个槽位模型：空串就是「沿用主模型」，Python 侧按空回退（这里不复制主模型）
             .put("vision_model", ctx.llmVisionModel)
             .put("judge_model", ctx.llmJudgeModel)
             .put("summary_model", ctx.llmSummaryModel)
+            .put("search_model", ctx.llmSearchModel)
             // 思考强度：空串也写（Python 侧按空 = 请求体不带该字段）
             .put("reasoning_effort", ctx.llmReasoningEffort)
-            // 上下文压缩阈值基数（token）与联网开关
-            .put("context_window", ctx.llmContextWindow.toIntOrNull() ?: 64000)
+            // 上下文压缩阈值基数（token，默认 131072）与两个联网开关
+            .put("context_window", ctx.llmContextWindow.toIntOrNull() ?: 131072)
             .put("web_search_enabled", ctx.webSearchEnabled)
+            .put("search_persona_style", ctx.searchPersonaStyle)
+            .put("search_auto_decide", ctx.searchAutoDecide)
+            // 搜索后端：换后端不影响上层（统一 [{title,url,summary}]）
+            .put("search_provider", ctx.searchProvider)
+            .put("search_base", ctx.searchBase)
+            .put("search_auth", ctx.searchAuth)
+            .put("search_fields", ctx.searchFields)
         try {
             val f = File(ctx.filesDir, "localbot/llm.json")
             f.parentFile?.mkdirs()

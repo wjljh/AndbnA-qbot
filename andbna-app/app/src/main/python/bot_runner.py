@@ -137,13 +137,19 @@ def _remember(botdir, key, role, text, uid=""):
 
 # Kotlin 侧启动前推过来的模型配置（含明文 Key）。Key 不落盘：llm.json 里只有地址、模型名和识图模型。
 _llm = {"key": "", "api": "", "model": "", "vision_model": "",
-        "judge_model": "", "summary_model": ""}
+        "judge_model": "", "summary_model": "", "search_model": ""}
+
+# 上下文窗口的默认值（token）。128K 是现在主流模型的入门档；用户可在模型配置页改。
+# 注意：这是**估算阈值基数**（压缩阈值 = 它的 75%），不是硬上限 —— 真正发出去的只有
+# system + 摘要 + 最近 12 条原文（见 _build_messages）。
+_DEFAULT_WINDOW = 131072
 
 
-def set_llm(key, api, model, vision_model="", judge_model="", summary_model=""):
+def set_llm(key, api, model, vision_model="", judge_model="", summary_model="",
+            search_model=""):
     """由 BotHost.startAll 在 start_all 之前调用，把 Key 放进本进程内存。
 
-    四个槽位的模型名都可以留空：留空 = 该槽位沿用主模型（槽位取值见 _conf_for）。
+    五个槽位的模型名都可以留空：留空 = 该槽位沿用主模型（槽位取值见 _conf_for）。
     """
     _llm["key"] = str(key or "").strip()
     _llm["api"] = str(api or "").strip()
@@ -151,6 +157,7 @@ def set_llm(key, api, model, vision_model="", judge_model="", summary_model=""):
     _llm["vision_model"] = str(vision_model or "").strip()
     _llm["judge_model"] = str(judge_model or "").strip()
     _llm["summary_model"] = str(summary_model or "").strip()
+    _llm["search_model"] = str(search_model or "").strip()
     return "OK"
 
 
@@ -168,11 +175,11 @@ def set_reply_judge(judge, prob):
 def _llm_conf(base_dir):
     """{key, api, model, vision_model, judge_model, summary_model, reasoning_effort, ...}。
 
-    api / model / 三个槽位模型 / reasoning_effort 都可能来自落盘的 llm.json；key 只在内存里
+    api / model / 四个槽位模型 / reasoning_effort 都可能来自落盘的 llm.json；key 只在内存里
     （BotHost 推过来的）。槽位模型空串 = 沿用主模型（不复制 model，调用时由 _conf_for 回退）。
     reasoning_effort 空串 = 请求体里不带这个字段（用平台默认），见 _req_body。
-    另带两个上下文相关开关：context_window（压缩阈值基数，默认 64000）与
-    web_search_enabled（联网，默认开）。
+    另带几个开关：context_window（压缩阈值基数，默认 131072）、web_search_enabled（联网，
+    默认开）与 search_persona_style（#搜/#读 结果用人设口吻转述，默认开）。
     """
     c = _load_json(os.path.join(base_dir, "llm.json"), {}) or {}
     key = str(_llm.get("key") or c.get("key") or "").strip()
@@ -181,34 +188,50 @@ def _llm_conf(base_dir):
     vision_model = str(_llm.get("vision_model") or c.get("vision_model") or "").strip()
     judge_model = str(_llm.get("judge_model") or c.get("judge_model") or "").strip()
     summary_model = str(_llm.get("summary_model") or c.get("summary_model") or "").strip()
+    search_model = str(_llm.get("search_model") or c.get("search_model") or "").strip()
     effort = str(c.get("reasoning_effort") or "").strip()
     try:
-        window = int(c.get("context_window") or 64000)
+        window = int(c.get("context_window") or _DEFAULT_WINDOW)
     except Exception:
-        window = 64000
+        window = _DEFAULT_WINDOW
     if window <= 0:
-        window = 64000
+        window = _DEFAULT_WINDOW
     web_on = c.get("web_search_enabled")
     web_on = True if web_on is None else bool(web_on)
+    style_on = c.get("search_persona_style")
+    style_on = True if style_on is None else bool(style_on)
+    auto_decide = c.get("search_auto_decide")
+    auto_decide = True if auto_decide is None else bool(auto_decide)
+    provider = str(c.get("search_provider") or "").strip().lower()
+    if provider not in ("deepseek", "searxng", "custom", "off"):
+        provider = "deepseek"        # 旧配置没这个键 → 仍按 DeepSeek 官方
+    s_base = str(c.get("search_base") or "").strip()
+    s_auth = str(c.get("search_auth") or "").strip() or (
+        "bearer" if provider == "deepseek" else "none")
+    s_fields = str(c.get("search_fields") or "").strip() or "results[].title,url,summary"
     if not api or not key:
         return None
     if not api.endswith("/chat/completions"):
         api = api.rstrip("/") + "/chat/completions"
     return {"key": key, "api": api, "model": model, "vision_model": vision_model,
             "judge_model": judge_model, "summary_model": summary_model,
+            "search_model": search_model,
             "reasoning_effort": effort, "context_window": window,
-            "web_search_enabled": web_on}
+            "web_search_enabled": web_on, "search_persona_style": style_on,
+            "search_auto_decide": auto_decide,
+            "search_provider": provider, "search_base": s_base,
+            "search_auth": s_auth, "search_fields": s_fields}
 
 
-# 槽位 → 取值字段：reply 就是主模型本身，其余三个留空即回落主模型。
+# 槽位 → 取值字段：reply 就是主模型本身，其余四个留空即回落主模型。
 _SLOTS = {"reply": "", "judge": "judge_model", "vision": "vision_model",
-          "summary": "summary_model"}
+          "summary": "summary_model", "search": "search_model"}
 
 
 def _conf_for(kind, base_dir=""):
     """按槽位取一份配置：conf["model"] 已经是该槽位**实际会用**的模型名。
 
-    kind ∈ reply/judge/vision/summary（未知或空串 = reply）。槽位模型留空就回落主模型，
+    kind ∈ reply/judge/vision/summary/search（未知或空串 = reply）。槽位模型留空就回落主模型，
     所以调用方只看 conf["model"] 即可，别自己去挑 vision_model 那一类字段。
     配置不全（缺 api/key）返回 None —— 与 _llm_conf 同一口径。
     """
@@ -1276,6 +1299,10 @@ def _words_rules(botdir, key=""):
 # ② 为什么不省：历史不会因为压缩而变短，只按 ① 判断的话越过阈值之后**每来一条消息
 # 都会再发一次摘要请求**，而每次只并进 1~2 行 —— 那是持续烧钱。② 让摘要请求次数变成
 # O(log 历史) 而不是 O(消息数)。
+# ③ 采纳闸：摘要生成后**先算账**，压缩后（system + 新摘要 + 最近 12 条）必须
+#    小于压缩前（system + 旧摘要 + 全部历史）的 90% 才落盘。历史很短时摘要会把
+#    上下文撑大（实测 5805 → 5847 tokens），那种压缩纯属白花钱，直接放弃；放弃也记
+#    一次 last_try，同一 key 10 分钟内不再重试。
 # 压缩一次之后**本次回复**不再重复压（_maybe_compress 在 _reply 里只被调用一次）。
 # 压缩产出的摘要落盘在 <botdir>/summary/<key>.json = {summary, covered, updated_at}，
 # 于是 _build_messages 变成：system +（此前对话摘要：…）+ 最近 12 条原文。
@@ -1284,6 +1311,12 @@ _SUMMARY_KEEP = 12          # 压缩后仍保留的最近原文条数（_build_m
 _SUMMARY_MAX_CHARS = 600    # 摘要字数上限
 _CTX_RATIO = 0.75           # 阈值：窗口的 75%
 _RESUME_RATIO = 0.15        # 两次压缩之间，新内容至少要占窗口的 15%
+_ACCEPT_RATIO = 0.9         # 采纳闸：压缩后必须 < 压缩前的 90%，否则这次白花钱，放弃
+_RETRY_GAP = 600            # 放弃后同一 key 的重试间隔（秒）：10 分钟内不再花第二次钱
+
+# 最近一次尝试压缩的时间：{(botdir, key): ts}。只在内存里 —— 放弃时不写盘，
+# 所以 summary 文件与 state 都不会因为一次无效压缩而变脏，重启进程后这张表自然清空。
+_compress_try = {}
 
 
 def _est_tokens(text):
@@ -1300,13 +1333,13 @@ def _est_tokens(text):
 
 
 def _ctx_window(base_dir=""):
-    """context_window：落盘在 llm.json，默认 64000（单位 token）。"""
+    """context_window：落盘在 llm.json，默认 131072（单位 token，估算阈值基数）。"""
     c = _load_json(os.path.join(base_dir or _base_dir, "llm.json"), {}) or {}
     try:
-        w = int(c.get("context_window") or 64000)
+        w = int(c.get("context_window") or _DEFAULT_WINDOW)
     except Exception:
-        w = 64000
-    return w if w > 0 else 64000
+        w = _DEFAULT_WINDOW
+    return w if w > 0 else _DEFAULT_WINDOW
 
 
 def _summary_path(botdir, key):
@@ -1342,6 +1375,12 @@ async def _maybe_compress(botdir, key, appid=""):
     if not botdir or not key:
         return False
     try:
+        # 上次尝试（含「压了没变小所以放弃」）在 10 分钟内：不再花第二次摘要请求
+        last = _compress_try.get((botdir, key)) or 0
+        if last and time.time() - last < _RETRY_GAP:
+            log("上下文压缩跳过：key=%s 上次尝试在 %d 秒前（%d 分钟内不再重试）→ 本次按原逻辑发最近 %d 条"
+                % (key, int(time.time() - last), _RETRY_GAP // 60, _SUMMARY_KEEP), appid)
+            return False
         rows = _memory(botdir).get(key) or []
         window = _ctx_window()
         threshold = int(window * _CTX_RATIO)
@@ -1400,6 +1439,25 @@ async def _maybe_compress(botdir, key, appid=""):
             log("上下文压缩失败：摘要模型 %s 没返回内容（按原逻辑继续）" % sconf["model"], appid)
             return False
         new_sum = new_sum[:_SUMMARY_MAX_CHARS]
+        # 采纳闸：压完必须真的变小才落盘 —— 摘要把上下文撑大（历史短 / 模型话多）
+        # 时这次压缩纯属白花钱，宁可不压。比较的是「发出去的那份」：
+        #   压缩前 = system + 旧摘要 + 全部历史（不压就会这样发）
+        #   压缩后 = system + 新摘要 + 最近 12 条原文
+        before = _est_tokens(sys_text)
+        if old_sum:
+            before += _est_tokens("（此前对话摘要：%s）" % old_sum)
+        before += _est_tokens(_rows_text(rows))
+        keep = rows[-_SUMMARY_KEEP:]
+        after = (_est_tokens(sys_text)
+                 + _est_tokens("（此前对话摘要：%s）" % new_sum)
+                 + _est_tokens(_rows_text(keep)))
+        if after >= int(before * _ACCEPT_RATIO):
+            # 放弃才记 last_try：采纳的那次由「成本闸 ②」自然节流，不必封 10 分钟
+            _compress_try[(botdir, key)] = time.time()
+            log("上下文压缩无效：压缩后 %d tokens >= 压缩前 %d tokens 的 %d%%，本次放弃"
+                "（不落盘摘要、不写 state，%d 分钟内不再重试）"
+                % (after, before, int(_ACCEPT_RATIO * 100), _RETRY_GAP // 60), appid)
+            return False
         path = _summary_path(botdir, key)
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -1409,10 +1467,6 @@ async def _maybe_compress(botdir, key, appid=""):
                                  "updated_at": int(time.time())}):
             log("上下文压缩失败：摘要写盘失败（按原逻辑继续）", appid)
             return False
-        keep = rows[-_SUMMARY_KEEP:]
-        after = (_est_tokens(sys_text)
-                 + _est_tokens("（此前对话摘要：%s）" % new_sum)
-                 + _est_tokens(_rows_text(keep)))
         log("上下文压缩：key=%s 原 %d 条/约 %d tokens（阈值 %d）→ 摘要 + 最近 %d 条"
             "（约 %d tokens｜摘要模型 %s｜%.1fs）"
             % (key, n, est, threshold, len(keep), after, sconf["model"], time.time() - t0),
@@ -1433,13 +1487,17 @@ def _system_prompt(botdir, key):
     return sys
 
 
-def _build_messages(botdir, key, who, text, first=False):
+def _build_messages(botdir, key, who, text, first=False, search_hint=False):
     """system →（有摘要时）此前对话摘要 → 最近 12 条原文 → 这一条。
 
     first 参数只为兼容老调用点保留：首句不再注入问候语（问候改成时段随机主动私聊）。
+    search_hint=True 时在 system 末尾补一段「要不要上网查」的规则（模型自判搜索用）。
     摘要由 _maybe_compress 在 _reply 里写盘，这里只读：读不到就还是纯最近 12 条。
     """
-    msgs = [{"role": "system", "content": _system_prompt(botdir, key)}]
+    sys_text = _system_prompt(botdir, key)
+    if search_hint:
+        sys_text = sys_text + _WEB_HINT_RULE
+    msgs = [{"role": "system", "content": sys_text}]
     sm = _summary_of(botdir, key)
     summary = str(sm.get("summary") or "").strip()
     if summary:
@@ -1515,7 +1573,53 @@ _WEB_TIMEOUT = 15
 _WEB_COUNT = 5              # 问接口要几条
 _WEB_REPLY_MAX = 3          # 回复 / 拼上下文最多用几条
 _WEB_SUMMARY_CHARS = 300    # 自动搜索拼进上下文时每条摘要的截断
-_WEB_FETCH_CHARS = 500      # #读 回复的前 500 字
+_WEB_FETCH_CHARS = 500      # #读 关掉人设化加工时回的前 500 字
+_WEB_STYLE_PERSONA = 800    # 转述时喂给模型的人格上限
+_WEB_STYLE_MAXTOK = 500     # 合成回答的 max_tokens（1~4 句，不用很长）
+_WEB_ANSWER_CHARS = 300      # 合成回答的字数上限（1~4 句中文口语）
+_SRCH_MAX = 5                # 一条消息最多搜几次（多轮追问；成本护栏的硬上限）
+_HITS_SHOW_MAX = 12          # 拼给模型看的资料条数上限（去重后取最近的）
+_FETCH_STYLE_CHARS = 3000   # #读 交给模型的正文上限
+_FETCH_OUT_CHARS = 300      # #读 摘要的字数上限
+
+# 链接里的跟踪参数：一律剥掉。fpid/fid/var/spm/from/utm_* 这类参数只用来埋点，
+# 贴给用户看既脏又长（用户真机反馈的那条链接就是 ?fpid=…&fid=default&var=B）。
+_TRACK_EXACT = {
+    "fpid", "fid", "var", "spm", "from", "fromid", "from_source", "source", "ref",
+    "referrer", "ref_src", "share", "share_token", "sharer", "scene", "chksm",
+    "clickid", "s", "si", "feature", "trk", "trk_info", "vr", "topsubjectid",
+    "for", "wfr", "gk", "vd_source", "gclid", "fbclid", "_f", "isappinstalled",
+}
+_TRACK_PREFIX = ("utm_", "spm", "from", "fpid", "fid", "var", "ref_", "share", "scene")
+
+
+def _is_track(name):
+    """这个 query 参数是不是纯埋点参数（大小写不敏感，前缀也算）。"""
+    n = str(name or "").strip().lower()
+    if not n:
+        return False
+    return n in _TRACK_EXACT or n.startswith(_TRACK_PREFIX)
+
+
+def _strip_tracking(url):
+    """洗链接：去掉 fpid/fid/var/spm/from/utm_* 之类的跟踪参数，别的参数原样留着。
+
+    剥完没有参数了就连问号一起去掉；解析失败就原样返回（宁可脏，不能丢链接）。
+    """
+    u = str(url or "").strip()
+    if not u or "?" not in u:
+        return u
+    try:
+        from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode, quote
+        p = urlsplit(u)
+        pairs = parse_qsl(p.query, keep_blank_values=True)
+        q = [(k, v) for k, v in pairs if not _is_track(k)]
+        if len(q) == len(pairs):
+            return u          # 没有跟踪参数：原样返回，别顺手改掉别人链接的编码
+        return urlunsplit((p.scheme, p.netloc, p.path,
+                           urlencode(q, quote_via=quote, safe="/:,"), p.fragment))
+    except Exception:
+        return u
 
 
 def _web_base(conf):
@@ -1531,7 +1635,12 @@ def _web_url(conf, path):
     return base + path if base.endswith("/v1") else base + "/v1" + path
 
 
-def _web_post(conf, path, body, appid="", tag=""):
+def _plog(conf, msg, appid=""):
+    """联网日志统一带后端前缀：联网(deepseek)：… / 联网(searxng)：… / 联网(custom)：…"""
+    log("联网(%s)：%s" % (_search_provider(conf), msg), appid)
+
+
+def _web_post(conf, path, body, appid="", tag="", provider="deepseek"):
     """POST 一个联网端点 → (ok, 响应 dict 或错误说明)。日志写清状态码与耗时（不写 Key）。"""
     import json
     import urllib.error
@@ -1556,59 +1665,221 @@ def _web_post(conf, path, body, appid="", tag=""):
             detail = e.read().decode("utf-8", "replace")[:200]
         except Exception:
             detail = repr(e)
-        log("联网：%s HTTP %d（%.1fs）%s"
-            % (tag, code, time.time() - t0, detail.replace(chr(10), " ")[:160]), appid)
+        log("联网(%s)：%s HTTP %d（%.1fs）%s"
+            % (provider, tag, code, time.time() - t0,
+               detail.replace(chr(10), " ")[:160]), appid)
         return False, "HTTP %d" % code
     except Exception as e:
-        log("联网：%s 失败 %r（%.1fs）" % (tag, e, time.time() - t0), appid)
+        log("联网(%s)：%s 失败 %r（%.1fs）" % (provider, tag, e, time.time() - t0), appid)
         return False, "网络错误"
-    log("联网：%s HTTP %d（%.1fs）" % (tag, code, time.time() - t0), appid)
+    log("联网(%s)：%s HTTP %d（%.1fs）" % (provider, tag, code, time.time() - t0), appid)
     try:
         d = json.loads(raw or "{}")
     except Exception:
-        log("联网：%s 响应不是 JSON（前 120 字）：%s" % (tag, raw[:120]), appid)
+        log("联网(%s)：%s 响应不是 JSON（前 120 字）：%s" % (provider, tag, raw[:120]), appid)
         return False, "响应格式错误"
     return (True, d) if isinstance(d, dict) else (False, "响应格式错误")
 
 
-def web_search(query, conf, appid="", count=_WEB_COUNT):
-    """Search API → [{"title","url","summary"}]；失败或无结果返回 []。"""
-    q = str(query or "").strip()[:200]
-    if not q or not conf:
-        return []
-    ok, d = _web_post(conf, "/tools/search",
-                      {"query": q, "count": count, "need_content": True},
-                      appid, "search「%s」" % q[:24])
-    if not ok:
-        return []
+# ── 搜索后端（deepseek / searxng / custom / off）────────────────
+#
+# 用户不一定用 DeepSeek：中转站、第三方模型都没有 /v1/tools/*，所以搜索做成可切换后端，
+# 但上层（人设化合成 / 多轮循环 / 链接清洗）只认统一结构 [{"title","url","summary"}]。
+#   deepseek：POST {api 去掉 /chat/completions}/v1/tools/search 与 /v1/tools/fetch，
+#             Bearer 用主模型 Key（原有实现）
+#   searxng ：GET {search_base}/search?q=…&format=json → results[].title/url/content
+#   custom  ：GET search_base（含 {query} 占位就替换，否则自动加 ?q=），
+#             鉴权 search_auth（none / bearer / header:Name=Value），
+#             结果字段 search_fields（默认 results[].title,url,summary）
+#   off     ：完全不联网
+_SEARCH_PROVIDERS = ("deepseek", "searxng", "custom", "off")
+_DEFAULT_FIELDS = "results[].title,url,summary"
+
+
+def _search_provider(conf):
+    """后端名：缺省/写错都按 deepseek（旧配置没这几个键也能照常跑）。"""
+    p = str((conf or {}).get("search_provider") or "").strip().lower()
+    return p if p in _SEARCH_PROVIDERS else "deepseek"
+
+
+def _search_headers(conf):
+    """按 search_auth 拼请求头（绝不把 Key 写进日志）。"""
+    auth = str((conf or {}).get("search_auth") or "").strip()
+    low = auth.lower()
+    h = {"Accept": "application/json", "User-Agent": "AndbnA-bot/1.0"}
+    if low in ("", "none"):
+        return h
+    if low == "bearer":
+        h["Authorization"] = "Bearer " + str(conf.get("key") or "")
+        return h
+    if low.startswith("header:") and "=" in auth:
+        k, v = auth[len("header:"):].split("=", 1)
+        if k.strip():
+            h[k.strip()] = v.strip()
+    return h
+
+
+def _http_get_json(url, headers, appid="", tag="", provider="deepseek"):
+    """GET 一个 JSON 地址 → (ok, dict/list)。日志带后端前缀。"""
+    import json
+    import urllib.error
+    import urllib.request
+
+    t0 = time.time()
+    req = urllib.request.Request(url, method="GET", headers=headers)
+    try:
+        with urllib.request.urlopen(req, timeout=_WEB_TIMEOUT) as r:
+            code = int(getattr(r, "status", 200) or 200)
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        code = int(getattr(e, "code", 0) or 0)
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            detail = repr(e)
+        log("联网(%s)：%s HTTP %d（%.1fs）%s"
+            % (provider, tag, code, time.time() - t0, detail.replace(chr(10), " ")[:160]),
+            appid)
+        return False, "HTTP %d" % code
+    except Exception as e:
+        log("联网(%s)：%s 失败 %r（%.1fs）" % (provider, tag, e, time.time() - t0), appid)
+        return False, "网络错误"
+    log("联网(%s)：%s HTTP %d（%.1fs）" % (provider, tag, code, time.time() - t0), appid)
+    try:
+        d = json.loads(raw or "{}")
+    except Exception:
+        log("联网(%s)：%s 响应不是 JSON（前 120 字）：%s" % (provider, tag, raw[:120]), appid)
+        return False, "响应格式错误"
+    return True, d
+
+
+def _norm_hits(items):
+    """任意后端的条目 → 统一结构；title/url/summary 的别名都认一点。"""
     out = []
-    for it in (d.get("results") or []):
+    for it in (items or []):
         if not isinstance(it, dict):
             continue
-        title = str(it.get("title") or "").strip()
-        url = str(it.get("url") or "").strip()
-        summary = " ".join(str(it.get("summary") or it.get("content") or "").split())
+        title = str(it.get("title") or it.get("name") or it.get("headline") or "").strip()
+        url = str(it.get("url") or it.get("link") or it.get("href") or "").strip()
+        summary = " ".join(str(it.get("summary") or it.get("content") or it.get("snippet")
+                               or it.get("desc") or it.get("description") or "").split())
         if not (title or url):
             continue
         out.append({"title": title, "url": url, "summary": summary})
-    log("联网：search「%s」→ 命中 %d 条" % (q[:24], len(out)), appid)
     return out
 
 
+def _parse_fields(spec, data):
+    """按 search_fields 取数组：'results[].title,url,summary' / 'data[].title,link,desc'。"""
+    spec = str(spec or "").strip() or _DEFAULT_FIELDS
+    if "[]" not in spec:
+        spec = _DEFAULT_FIELDS
+    base, fields = spec.split("[]", 1)
+    names = [f.strip().lstrip(".") for f in fields.split(",") if f.strip()]
+    names = names or ["title", "url", "summary"]
+    node = data
+    for key in [p for p in base.replace("[", ".").replace("]", "").split(".") if p]:
+        node = node.get(key) if isinstance(node, dict) else None
+    if node is None and isinstance(data, list):
+        node = data
+    rows = []
+    for it in (node or []):
+        if not isinstance(it, dict):
+            continue
+        row = {}
+        for i, n in enumerate(names):
+            row[n] = it.get(n)
+            if i == 0:
+                row.setdefault("title", it.get(n))
+            elif i == 1:
+                row.setdefault("url", it.get(n))
+            elif i == 2:
+                row.setdefault("summary", it.get(n))
+        row.setdefault("title", it.get(names[0]) if names else "")
+        row.setdefault("url", it.get(names[1]) if len(names) > 1 else "")
+        rows.append(row)
+    return rows
+
+
+def web_search(query, conf, appid="", count=_WEB_COUNT, meta=None, source="", round_no=0):
+    """搜索 → [{"title","url","summary"}]；失败或无结果返回 []。
+
+    meta（可选 dict）回填 meta["ok"]：True = 接口通了（哪怕是 0 条结果），
+    False = 网络/HTTP 出错或后端关闭。调用方靠它区分「没搜到」与「搜挂了」。
+    后端由 llm.json 的 search_provider 决定，上层只认统一结构。
+    """
+    import urllib.parse
+    q = str(query or "").strip()[:200]
+    if meta is not None:
+        meta["ok"] = False
+    if not q or not conf:
+        return []
+    provider = _search_provider(conf)
+    if provider == "off":
+        log("联网(off)：搜索后端已关闭，不发请求", appid)
+        return []
+    t0 = time.time()
+    base = str(conf.get("search_base") or "").strip().rstrip("/")
+    if provider == "searxng":
+        if not base:
+            log("联网(searxng)：没填搜索地址（search_base），无法搜索", appid)
+            return []
+        url = base + "/search?q=" + urllib.parse.quote(q) + "&format=json"
+        ok, d = _http_get_json(url, _search_headers(conf), appid,
+                               "search「%s」" % q[:24], provider)
+        rows = _norm_hits((d.get("results") if isinstance(d, dict) else d) or []) if ok else []
+    elif provider == "custom":
+        if not base:
+            log("联网(custom)：没填搜索地址（search_base），无法搜索", appid)
+            return []
+        if "{query}" in base:
+            url = base.replace("{query}", urllib.parse.quote(q))
+        else:
+            url = base + ("&" if "?" in base else "?") + "q=" + urllib.parse.quote(q)
+        ok, d = _http_get_json(url, _search_headers(conf), appid,
+                               "search「%s」" % q[:24], provider)
+        rows = _norm_hits(_parse_fields(conf.get("search_fields"), d)) if ok else []
+    else:
+        ok, d = _web_post(conf, "/tools/search",
+                          {"query": q, "count": count, "need_content": True},
+                          appid, "search「%s」" % q[:24], "deepseek")
+        rows = _norm_hits(d.get("results") or []) if ok else []
+    if not ok:
+        log("联网(%s)：搜索失败（后端 %s），按没结果处理" % (provider, provider), appid)
+        return []
+    if meta is not None:
+        meta["ok"] = True
+    log("联网(%s)：%s%s「%s」→ 命中 %d 条（%.1fs）"
+        % (provider, _WEB_SRC.get(source, "搜索"),
+           ("（第 %d 轮）" % round_no) if round_no else "",
+           q[:24], len(rows), time.time() - t0), appid)
+    return rows
+
+
 def web_fetch(url, conf, appid=""):
-    """Fetch API → 正文 Markdown；失败返回空串。"""
+    """抓正文（只有 DeepSeek 官方后端支持）→ Markdown；其它后端/失败返回空串。"""
     u = str(url or "").strip()
     if not u or not conf:
         return ""
-    ok, d = _web_post(conf, "/tools/fetch", {"url": u}, appid, "fetch %s" % u[:24])
+    provider = _search_provider(conf)
+    if provider == "off":
+        log("联网(off)：搜索后端已关闭，不抓取", appid)
+        return ""
+    if provider != "deepseek":
+        log("联网(%s)：这个后端不支持抓正文（#读 需要 DeepSeek 官方 Search/Fetch）"
+            % provider, appid)
+        return ""
+    ok, d = _web_post(conf, "/tools/fetch", {"url": u}, appid, "fetch %s" % u[:24], provider)
     if not ok:
         return ""
     content = str(d.get("content") or "").strip()
-    log("联网：fetch %s → %d 字" % (u[:40], len(content)), appid)
+    log("联网(%s)：fetch %s → %d 字" % (provider, u[:40], len(content)), appid)
     return content
 
 
-# 指令：私聊/群里发「#搜 关键词」「#读 网址」。这两条不走模型（只做排版）。
+# 指令：私聊/群里发「#搜 关键词」「#读 网址」。
+# 默认（search_persona_style=1）先让模型按人格用中文口语转述，再贴洗过跟踪参数的链接；
+# 关掉这个开关就退回老做法：原始标题/摘要直贴，不走模型（用来对比）。
 _WEB_SEARCH_CMDS = ("#搜", "＃搜")
 _WEB_FETCH_CMDS = ("#读", "＃读")
 
@@ -1625,38 +1896,352 @@ def _web_cmd_of(text):
     return "", ""
 
 
+def _raw_one_liner(h):
+    """一条命中的原始一行（标题｜首句摘要），原始贴法与转述失败垫底都用它。"""
+    one = h.get("summary") or ""
+    one = re.split(r"(?<=[。！？.!?])\s*", one)[0][:60] if one else ""
+    head = h.get("title") or "(无标题)"
+    return head + (("｜" + one) if one else "")
+
+
 def _search_reply_text(hits):
-    """指令 #搜 的回复：标题 + 一句摘要 + 链接，最多 3 条。
+    """指令 #搜 的原始贴法（关掉 search_persona_style 时就是它）：标题 + 一句摘要 + 链接。
 
     编号必须按**结果条**数走（每条结果占两行：标题行 + 链接行），
     用行数当前缀会得到 1./3./5. 这种错位编号。
+    链接原样贴（老行为一字不改），便于与「人设化加工」那一版对比。
     """
     lines = []
     for i, h in enumerate(hits[:_WEB_REPLY_MAX], 1):
-        one = h.get("summary") or ""
-        one = re.split(r"(?<=[。！？.!?])\s*", one)[0][:60] if one else ""
-        head = h.get("title") or "(无标题)"
-        lines.append("%d. %s" % (i, head) + (("｜" + one) if one else ""))
+        lines.append("%d. %s" % (i, _raw_one_liner(h)))
         if h.get("url"):
             lines.append(h["url"])
     return chr(10).join(lines)
 
 
 def _fetch_reply_text(content):
-    """指令 #读 的回复：前 500 字（连续空行压成一行空行，免得占满整屏）。"""
+    """指令 #读 的原始贴法：前 500 字（连续空行压成一行空行，免得占满整屏）。"""
     s = re.sub(r"\n{3,}", chr(10) * 2, str(content or "")).strip()
     if not s:
         return ""
     return s[:_WEB_FETCH_CHARS] + ("…（后略）" if len(s) > _WEB_FETCH_CHARS else "")
 
 
-async def _local_web_cmd(appid, message, text, key="", group_openid=""):
-    """联网指令：#搜 / #读。返回 True = 这条已经回了；False = 交给正常链路。
+# ── 人设化加工（B）──────────────────────────────────────────
+#
+# 用户真机反馈两轮：
+#   ① 搜索结果原样贴出去：英文标题 + 埋点链接 + 一条韩文新闻，没有人格/语言加工；
+#   ② 改成「1./2./3. 列表 + 每条一个链接」之后仍然不像聊天 —— 他要的是
+#      「能上网搜到相关自己不知道的内容后正常回答」。
+# 所以默认链路（search_persona_style=1）是**合成式**：
+#   #搜 → ≤5 条结果喂给模型 → 一段 1~4 句中文口语直接回答问题，末尾至多留 1 条
+#         最相关的干净链接；没搜到就老实说没搜到，不许编
+#   #读 → 正文前 3000 字 → 1~3 句自然要点（≤300 字）+ 原链接
+# 关掉开关（=0）= 原始列表贴法：标题｜摘要 + 链接逐条贴，只用于调试/对比。
+# 模型调用失败就退回原始列表贴法（不向用户报错），日志写清走的是哪条路。
+# 链接一律先洗掉 fpid/fid/var/spm/from/utm_* 之类跟踪参数再贴。
+#
+# 为什么「只留一条链接」也顺带修掉了一个真机 bug：上一版按「第几条」把模型的转述
+# 与 hits 下标配对，模型少讲/串了顺序时会得到「标题说韩联社、链接却是 api-docs」的
+# 错配（用户截图就是这个）。现在模型只回答一段话，并单独选一个序号 → 链接与内容
+# 天然对齐。
 
-    失败（4xx/5xx/超时/无结果）不报错给用户，直接返回 False 让模型按纯文本回。
+_NUM_PREFIX_RE = re.compile(r"^\s*(?:\d{1,2}\s*[.、)]|[-*·•#＃])\s*")
+# 模型偶尔把三条挤成一行（「1. … 2. … 3. …」）：先在序号前补换行，再逐行处理
+_NUM_INLINE_RE = re.compile(r"(?<=\S)[ \t　]+(\d{1,2})\s*[.、)]\s*")
+_URL_RE = re.compile(r"https?://\S+")
+
+
+def _style_persona(botdir):
+    """转述用的人格：没人格就给一句中性口吻（不让人格空着把提示词拼坏）。"""
+    return (_persona(botdir) or "你是一个说话自然、语气亲切的中文聊天机器人。")[:_WEB_STYLE_PERSONA]
+
+
+def _style_answer(text, limit=_WEB_ANSWER_CHARS):
+    """合成式回答的清洗：去编号/清单/小标题/Markdown、去链接、压成一段口语。
+
+    模型偶尔还是会把资料列成 1./2./3.，群聊里那既不像角色也不像聊天 —— 这里只做
+    减法：删掉行首编号与符号，把多行并成一段，超长在标点处截断。
+    """
+    text = _NUM_INLINE_RE.sub(lambda m: " " + m.group(1) + ". ", str(text or ""))
+    keep = []
+    for raw in text.splitlines():
+        s = _NUM_PREFIX_RE.sub("", str(raw or "")).strip()
+        s = s.lstrip("#＃> 　").strip()
+        if s:
+            keep.append(s)
+    s = _clean_reply(" ".join(keep), limit)
+    return _URL_RE.sub("", s).strip()
+
+
+# 末尾那一行「链接：N」：N 是模型挑的最相关结果序号，0 = 不挑。
+# 模型不一定换行（实测会缩在最后一句后面），所以按「最后一次出现」定位，不要求行首。
+_ANSWER_LINK_RE = re.compile(r"(?:【|\[)?\s*链接\s*(?:】|\])?\s*[:：]\s*(\d{1,2})")
+
+
+def _split_answer(raw):
+    """模型的回答 → (正文, 链接序号)。序号取不到就按 0 处理（不硬塞一个可能错的链接）。"""
+    text = str(raw or "")
+    idx = 0
+    hits = list(_ANSWER_LINK_RE.finditer(text))
+    if hits:
+        m = hits[-1]
+        try:
+            idx = int(m.group(1))
+        except Exception:
+            idx = 0
+        text = text[:m.start()]
+    return _style_answer(text), idx
+
+
+def _hits_text(hits):
+    """命中 → 拼给模型看的编号资料（序号是全局的，链接就用这个序号选）。"""
+    out = []
+    for i, h in enumerate(hits[-_HITS_SHOW_MAX:], 1):
+        one = " ".join(str(h.get("summary") or "").split())[:_WEB_SUMMARY_CHARS]
+        out.append("%d. %s" % (i, str(h.get("title") or "(无标题)")[:120]))
+        if one:
+            out.append("   资料：%s" % one)
+    return chr(10).join(out)
+
+
+def _hits_block(hits):
+    """自判路径拼进上下文的资料段（带全局编号，模型用编号选链接）。"""
+    return ("以下是刚查到的资料（累计 %d 条，序号只是给我自己看的）：" % len(_shown_hits(hits))
+            + chr(10) + _hits_text(hits))
+
+
+def _shown_hits(hits):
+    """模型看到的那批命中（与 _hits_text 的编号一一对应）。"""
+    return list(hits[-_HITS_SHOW_MAX:])
+
+
+def _search_more_rule(left):
+    """还能不能再查：left > 0 允许继续要资料，left == 0 收尾。"""
+    if left > 0:
+        return ("- 如果这些资料还不够回答，只输出一行 <search>新的关键词</search> 继续查"
+                "（还能查 %d 次）；够了就直接回答。" % left)
+    return ("- 最后一次搜索已经用完了，不要再输出 <search>。按现有资料用自己的话回答；"
+            "资料不够就老实说不清楚/没查到，可以一句话带过查到的线索，别编造。")
+
+
+def _search_answer_prompt(botdir, hits, query, left=_SRCH_MAX):
+    """#搜 / 自判的合成提示词：直接回答用户那句话，最多留一条最相关的链接。"""
+    return (
+        "你是下面这个人格。刚才有人问你：%s\n\n"
+        "【人格】\n%s\n\n"
+        "【查到的资料】（序号只是给我自己看的，别写进回答）\n%s\n\n"
+        "【要求】\n"
+        "- 用你自己的话直接回答那个问题，1~4 句中文口语，像刚翻完资料回朋友消息\n"
+        "- 不要列清单、不要出现「1./2./3.」这类编号、不要小标题、不要「摘要如下」\n"
+        "- 不要在句子里贴链接、不要念资料标题；英文、韩文内容用中文讲\n"
+        "- 资料没提到的别编；拿不准就说拿不准，或者直接说没查到\n"
+        "- 如果资料跟问题根本对不上，就说没搜到靠谱的，不要硬凑\n"
+        "%s\n"
+        "- 回答完另起一行，只写「链接：N」—— N 是你引用最多、最相关的资料序号；"
+        "都不相关就写「链接：0」\n"
+    ) % (str(query or "")[:120], _style_persona(botdir), _hits_text(hits),
+         _search_more_rule(left))
+
+
+async def _search_answer_styled(appid, botdir, hits, query, conf, left=_SRCH_MAX):
+    """合成一句人设化回答（+ 至多一条干净链接）。返回 (文字, 模型是否还想要资料, query)。
+
+    文字为空 = 这次没成（调用失败/没内容），调用方自己决定退回哪条路。
+    """
+    if not conf:
+        return "", False, ""
+    sconf = _conf_for("search") or conf
+    t0 = time.time()
+    try:
+        raw = await asyncio.to_thread(
+            _call_llm_sync, sconf,
+            [{"role": "user", "content": _search_answer_prompt(botdir, hits, query, left)}],
+            _WEB_STYLE_MAXTOK, 0.8,
+        )
+    except Exception as e:
+        log("联网：合成回答失败 %r（模型 %s）" % (e, sconf["model"]), appid)
+        return "", False, ""
+    want = _WEB_MARK_RE.search(raw or "")
+    if want:
+        return "", True, (want.group(1) or "").strip()[:120]
+    answer, idx = _split_answer(raw)
+    if not answer:
+        log("联网：合成回答没返回内容（模型 %s）" % sconf["model"], appid)
+        return "", False, ""
+    url = ""
+    shown = _shown_hits(hits)
+    if 1 <= idx <= len(shown):
+        url = _strip_tracking(shown[idx - 1].get("url") or "")
+    log("联网：已合成一句回答（%d 字｜模型 %s｜%.1fs｜引用第 %d 条%s）"
+        % (len(answer), sconf["model"], time.time() - t0, idx,
+           "：" + url[:40] if url else "（没选链接）"), appid)
+    return answer + (chr(10) + url if url else ""), False, ""
+
+
+# 兜底文案：模型没给出「不清楚」时用它（人格拿不到时也要能回一句人话）
+_NO_RESULT_FALLBACK = "这个我是真不清楚诶，等我查明白再说吧。"
+
+
+async def _no_result_reply(appid, botdir, query, conf, rounds=1, hits=None):
+    """查了 N 轮还是没有结果：用该 bot 的人格语气说「不清楚」，一句带过查到的线索。
+
+    返回 "" = 模型没给出可用的话（调用方用 _NO_RESULT_FALLBACK）。
+    """
+    if not conf:
+        return ""
+    sconf = _conf_for("search") or conf
+    clues = ""
+    for h in (hits or [])[-2:]:
+        t = " ".join(str(h.get("title") or "").split())[:60]
+        if t:
+            clues += "- " + t + chr(10)
+    prompt = (
+        "你是下面这个人格。刚才有人问你：%s\n\n"
+        "【人格】\n%s\n\n"
+        "【情况】你联网查了 %d 轮，还是没找到能回答这个问题的靠谱资料。%s"
+        "【要求】用 1~2 句中文口语告诉对方你不清楚/没查到；"
+        "如果有沾边的线索，一句话带过就行；不要编造任何事实、不要列清单、不要贴链接。\n"
+    ) % (str(query or "")[:120], _style_persona(botdir), rounds,
+         ("查到过的沾边标题（仅供参考，别当成答案）：" + chr(10) + clues) if clues else "")
+    try:
+        raw = await asyncio.to_thread(_call_llm_sync, sconf,
+                                     [{"role": "user", "content": prompt}], 200, 0.8)
+    except Exception as e:
+        log("联网：没查到的说辞没生成（%r）→ 用固定文案" % e, appid)
+        return ""
+    out = _style_answer(_strip_search_marks(raw), 140)
+    if not out:
+        return ""
+    log("联网：没查到时已按人设回一句（模型 %s）" % sconf["model"], appid)
+    return out
+
+
+def _fetch_style_prompt(botdir, content):
+    """#读 的提示词：正文前 3000 字 → 1~3 句自然要点（≤300 字），不要说明书腔。"""
+    return (
+        "你是下面这个人格。有人把这篇网页丢给你，让你看完说两句。\n\n"
+        "【人格】\n%s\n\n"
+        "【要求】\n"
+        "- 用你自己的话把这篇讲了什么说出来，1~3 句中文口语，最多 %d 字\n"
+        "- 像跟朋友转述刚看到的东西：不要「摘要如下」「本文介绍了」这种说明书腔\n"
+        "- 不要编号、不要分点、不要小标题、不要照搬原文长句、不要写链接\n\n"
+        "【网页开头】\n%s\n"
+    ) % (_style_persona(botdir), _FETCH_OUT_CHARS,
+         str(content or "")[:_FETCH_STYLE_CHARS])
+
+
+async def _fetch_reply_styled(appid, botdir, content, url, conf):
+    """#读 的人设化回复：≤300 字摘要 + 原链接。返回 "" = 没成（退回原始贴法）。"""
+    if not conf or not str(content or "").strip():
+        return ""
+    sconf = _conf_for("search") or conf
+    t0 = time.time()
+    try:
+        raw = await asyncio.to_thread(
+            _call_llm_sync, sconf, [{"role": "user", "content": _fetch_style_prompt(botdir, content)}],
+            _FETCH_OUT_CHARS * 2, 0.6,
+        )
+    except Exception as e:
+        log("联网：网页转述失败 %r（模型 %s → 退回原始贴法）" % (e, sconf["model"]), appid)
+        return ""
+    body = _clean_reply(raw, _FETCH_OUT_CHARS)
+    if not body:
+        log("联网：网页转述没返回内容（模型 %s → 退回原始贴法）" % sconf["model"], appid)
+        return ""
+    log("联网：网页已按人设转述（%d 字｜模型 %s｜%.1fs）"
+        % (len(body), sconf["model"], time.time() - t0), appid)
+    return body + chr(10) + _strip_tracking(url)
+
+
+def _is_owner_msg(botdir, message, key=""):
+    """这条消息是不是主人发的（# 指令只认主人）。
+
+    私聊：会话键就是 "p" + 主人 openid（_is_master_key 同一套判定）；
+    群聊：拿消息作者的 openid 跟 _owner_openid 比。主人判定不另算一套 ——
+    来源仍是 owner.json（第一个私聊 bot 的人）→ 回退 known_chats 的第一条 c2c。
+    """
+    owner = _owner_openid(botdir)
+    if not owner:
+        return False
+    if str(key or "").startswith("p"):
+        return str(key) == "p" + owner
+    try:
+        return owner in [str(x) for x in _author_ids(message)]
+    except Exception:
+        return False
+
+
+async def _ask_next_query(appid, botdir, conf, user_query, tries, left):
+    """一轮没搜到：问模型要不要换关键词再查。返回新关键词，"" = 它觉得够了。"""
+    if not conf or left <= 0:
+        return ""
+    sconf = _conf_for("search") or conf
+    prompt = (
+        "你是下面这个人格。有人问你：%s\n\n"
+        "【人格】\n%s\n\n"
+        "【情况】已经用这些关键词查过：%s，都没搜到能用的资料。\n"
+        "【要求】如果换个关键词还有希望，只输出一行 <search>新关键词</search>"
+        "（还能查 %d 次）；觉得查不到了就只输出一行：够了\n"
+    ) % (str(user_query or "")[:120], _style_persona(botdir),
+         "、".join(tries[-5:]), left)
+    try:
+        raw = await asyncio.to_thread(_call_llm_sync, sconf,
+                                     [{"role": "user", "content": prompt}], 120, 0.6)
+    except Exception as e:
+        log("联网：换关键词的追问失败 %r" % e, appid)
+        return ""
+    m = _WEB_MARK_RE.search(raw or "")
+    return (m.group(1) or "").strip()[:120] if m else ""
+
+
+async def _manual_search_answer(appid, botdir, conf, arg):
+    """手动 #搜 的多轮：第 1 轮用主人给的词，之后模型可以继续 <search> 追问（≤5 轮）。
+
+    → (文字, 状态, 命中列表)，状态：ok = 有合成回答 / none = 一条都没搜到 /
+      fail = 搜到了但模型没给出可用回答（调用方自己决定退路）。
+    """
+    hits, last_q = [], str(arg or "").strip()[:120]
+    tries = [last_q]
+    for r in range(1, _SRCH_MAX + 1):
+        got = await _self_web_context(appid, conf, last_q, r,
+                                     "manual" if r == 1 else "decide")
+        hits = _dedup_hits(hits + got)
+        if not hits:
+            # 这一轮没命中：问模型要不要换个关键词（最多查 _SRCH_MAX 轮）
+            nxt = await _ask_next_query(appid, botdir, conf, arg, tries, _SRCH_MAX - r)
+            if not nxt:
+                log("联网：搜索 %d 轮未得结果，按「不清楚」回复" % r, appid)
+                return "", "none", hits
+            last_q = nxt
+            tries.append(nxt)
+            continue
+        text, wants, q = await _search_answer_styled(
+            appid, botdir, hits, arg, conf, left=_SRCH_MAX - r)
+        if text:
+            return text, "ok", hits
+        if not wants:
+            return "", "fail", hits       # 模型调用失败/空回答
+        last_q = q
+    log("联网：搜索 %d 轮未得结果，按「不清楚」回复" % _SRCH_MAX, appid)
+    return "", "exhausted", hits
+
+
+async def _local_web_cmd(appid, message, text, key="", group_openid="", botdir=""):
+    """联网指令：#搜 / #读（只认主人）。返回 True = 这条已经回了；False = 交给正常链路。
+
+    主人发来：按人格合成一段自然回答（#搜 多轮搜索 ≤5 轮、末尾至多一条干净链接）；
+    接口挂了（网络/HTTP）不报错给用户、返回 False 交给正常回复；
+    接口通了但没结果是「没查清楚」一句话；合成没成就退回原始列表贴法。
+    非主人发来：完全不当指令（不搜索、不抓取、# 也不剥），整句按普通聊天走。
+    botdir 用来读人格与主人 openid。
     """
     kind, arg = _web_cmd_of(text)
     if not kind:
+        return False
+    if not _is_owner_msg(botdir, message, key):
+        # 不是主人：# 不当指令，整句（含 #）原样交给普通聊天，模型照人设回
+        log("联网：非主人使用 # 指令，降级为普通聊天（不触发）", appid)
         return False
     api = getattr(message, "_api", None)
     conf = _llm_conf(_base_dir) if _base_dir else None
@@ -1675,33 +2260,69 @@ async def _local_web_cmd(appid, message, text, key="", group_openid=""):
             log("回消息失败（联网指令）：%r" % e, appid)
 
     if not arg:
-        await _send("用法：#搜 关键词（联网搜一下）｜#读 网址（读正文前 500 字）")
+        await _send("用法：#搜 关键词（我上网看看再答你）｜#读 网址（看完说两句）")
         return True
     if conf is None:
         log("联网指令跳过：模型配置没填（llm.json 缺 key / 地址）", appid)
         return False
+    if not conf.get("web_search_enabled", True):
+        log("联网指令 %s 跳过：联网搜索已关闭（web_search_enabled=0），一个请求都不发" % kind, appid)
+        await _send("联网搜索关着呢，去设置里打开再问我吧。")
+        return True
+    style_on = bool(conf.get("search_persona_style", True))
     if kind == "search":
-        hits = await asyncio.to_thread(web_search, arg, conf, appid)
+        if style_on:
+            # 人设化：多轮搜索（≤5 轮）后合成一段自然回答
+            _plog(conf, "手动 #搜（主人）「%s」" % arg[:30], appid)
+            answer, state, hits = await _manual_search_answer(appid, botdir, conf, arg)
+            if state == "ok" and answer:
+                await _send(answer)
+                return True
+            if state in ("none", "exhausted"):
+                # 一条没搜到 / 5 轮都没查到：让人格说「不清楚」，一句带过沾边线索
+                none_line = await _no_result_reply(
+                    appid, botdir, arg, conf, _SRCH_MAX if state == "exhausted" else 1, hits)
+                await _send(none_line or _NO_RESULT_FALLBACK)
+                return True
+            if not hits:
+                log("联网指令 #搜「%s」接口失败，交给正常回复" % arg[:30], appid)
+                return False
+            # 有资料但模型没给出可用回答：退回原始列表贴法（用户至少看到结果）
+            reply = _search_reply_text(hits)
+            _plog(conf, "手动 #搜（主人）「%s」：回 %d 条（原始列表贴法）"
+                % (arg[:30], min(len(hits), _WEB_REPLY_MAX)), appid)
+            await _send(reply)
+            return True
+        hits = await asyncio.to_thread(web_search, arg, conf, appid, _WEB_COUNT, None,
+                                      "manual", 1)
         if not hits:
-            log("联网指令 #搜「%s」没有结果，交给正常回复" % arg[:30], appid)
+            _plog(conf, "手动 #搜（主人）「%s」没搜到结果，交给正常回复" % arg[:30], appid)
             return False
         reply = _search_reply_text(hits)
-        log("联网指令 #搜「%s」：回 %d 条（不走模型）" % (arg[:30], min(len(hits), _WEB_REPLY_MAX)),
-            appid)
+        log("联网指令 手动 #搜（主人）「%s」：回 %d 条（原始列表贴法，人设化加工已关"
+            " search_persona_style=0）" % (arg[:30], min(len(hits), _WEB_REPLY_MAX)), appid)
         await _send(reply)
         return True
     content = await asyncio.to_thread(web_fetch, arg, conf, appid)
+    reply = await _fetch_reply_styled(appid, botdir, content, arg, conf) if style_on else ""
+    if reply:
+        log("联网指令 #读 %s：人设化加工（≤%d 字摘要 + 原链接）" % (arg[:40], _FETCH_OUT_CHARS),
+            appid)
+        await _send(reply)
+        return True
     reply = _fetch_reply_text(content)
     if not reply:
         log("联网指令 #读 %s 没读到正文，交给正常回复" % arg[:40], appid)
         return False
-    log("联网指令 #读 %s：回前 %d 字（不走模型）" % (arg[:40], min(len(content), _WEB_FETCH_CHARS)),
-        appid)
+    log("联网指令 #读 %s：回前 %d 字（原始贴法%s）"
+        % (arg[:40], min(len(content), _WEB_FETCH_CHARS),
+           "，人设化加工已关 search_persona_style=0" if not style_on else ""), appid)
     await _send(reply)
     return True
 
 
 # 自动联网的触发词：出现这些就说明「答案不在聊天记录里」。宁可多搜一次（一次 0.005 元）。
+# 有了「模型自判」之后它退成兜底：模型没主动要资料、但这句明显在问时效性内容时补一次。
 _WEB_HINTS = ("最近", "最新", "今天", "新闻", "多少钱", "价格", "什么时候", "谁是",
               "查一下", "查下", "实时", "汇率", "股价", "比分", "发布会")
 
@@ -1711,28 +2332,86 @@ def _needs_web(text):
     return any(h in t for h in _WEB_HINTS)
 
 
+# ── 模型自判搜索（一次性 mini tool-loop）────────────────────
+#
+# 不做 agent、不做多轮：只在 system 里加一段规则，模型不确定/需要最新信息时**只输出**
+# 一行 <search>关键词</search>；本地解析到就搜一次、把资料拼进第二次请求，第二轮明确
+# 禁止再要资料。单条消息最多 1 次 search + 1 次额外模型调用。
+# 标记永远从最终回复里剥掉（用户不该看见 <search>）。
+_WEB_MARK_RE = re.compile(r"<\s*search\s*>(.*?)<\s*/\s*search\s*>", re.I | re.S)
+_WEB_MARK_ANY_RE = re.compile(r"<\s*/?\s*search\s*>", re.I)
+
+_WEB_HINT_RULE = (
+    chr(10) * 2 + "【要不要先上网查】" + chr(10) + chr(10).join([
+        "- 你确定答案、也不需要最新信息时，照常回答，不要查。",
+        "- 不确定、或需要最新/外部信息（新闻、版本、价格、赛事、人物近况等）时，"
+        "只输出一行 <search>关键词</search>，不要猜、不要编、不要顺便给出答案。",
+    ])
+)
+
+_WEB_HINT_STOP = (
+    chr(10) * 2 + "【资料已经查到了】" + chr(10) + chr(10).join([
+        "- 直接用下面这些资料，用你自己的语气回答对方那句话。",
+        "- 不要再输出 <search>，也不要编资料里没有的东西。",
+    ])
+)
+
+# 三种来源的日志标签（验收要能一眼看出是谁发起的搜索）
+_WEB_SRC = {"manual": "手动 #搜", "decide": "模型自判搜索", "hint": "触发词搜索"}
+
+
+def _strip_search_marks(text):
+    """把 <search>…</search>（以及残缺的半截标记）从正文里剥掉。"""
+    return _WEB_MARK_ANY_RE.sub("", _WEB_MARK_RE.sub("", str(text or ""))).strip()
+
+
 def _web_context_block(hits):
-    """自动搜索的命中 → 拼进上下文的 system 段（每条摘要截 300 字）。"""
+    """自动搜索的命中 → 拼进上下文的 system 段（每条摘要截 300 字，链接去掉跟踪参数）。"""
     lines = []
     for h in hits[:_WEB_REPLY_MAX]:
         one = (h.get("summary") or "")[:_WEB_SUMMARY_CHARS]
-        lines.append("- %s｜%s｜%s" % (h.get("title") or "(无标题)", one, h.get("url") or ""))
+        lines.append("- %s｜%s｜%s" % (h.get("title") or "(无标题)", one,
+                                     _strip_tracking(h.get("url") or "")))
     return ("（联网搜索结果，只是参考信息：用它回答问题，但别念链接、别说自己在联网）"
             + chr(10) + chr(10).join(lines))
 
 
 async def _auto_web_context(appid, conf, text):
-    """正常回复时的自动联网：命中触发词就搜一次，返回要拼进上下文的段（失败返回 ""）。"""
+    """触发词兜底：命中时效性触发词就搜一次，返回要拼进上下文的段（失败返回 ""）。
+
+    模型自判开着的时候它是兜底（模型没主动要资料才轮到它），关掉自判就是老逻辑。
+    """
     q = str(text or "").strip()
     if not q or not conf or not conf.get("web_search_enabled", True):
         return ""
     if not _needs_web(q):
         return ""
-    hits = await asyncio.to_thread(web_search, q, conf, appid)
-    log("联网：自动搜索「%s」→ 命中 %d 条" % (q[:24], len(hits)), appid)
+    hits = await asyncio.to_thread(web_search, q, conf, appid, _WEB_COUNT, None, "hint")
     if not hits:
         return ""
     return _web_context_block(hits)
+
+
+async def _self_web_context(appid, conf, query, round_no=1, source="decide"):
+    """搜一次（第 round_no 轮），返回命中列表（失败/没结果 = []）。"""
+    q = str(query or "").strip()[:120]
+    if not q or not conf:
+        return []
+    return await asyncio.to_thread(web_search, q, conf, appid, _WEB_COUNT, None, source,
+                                  round_no)
+
+
+def _dedup_hits(hits):
+    """多轮累加：同一 url 只留第一次出现的，别把同一篇资料重复喂给模型。"""
+    out, seen = [], set()
+    for h in hits:
+        u = str(h.get("url") or "")
+        if u and u in seen:
+            continue
+        if u:
+            seen.add(u)
+        out.append(h)
+    return out
 
 
 
@@ -1994,6 +2673,69 @@ def _author_ids(message):
         if v:
             out.append(str(v))
     return out
+
+
+# ── 重复消息去重（每个 bot 一份最近 msg_id 的 LRU）──────────────────
+#
+# 平台有时把**同一条消息**投给两个事件回调（私聊的 c2c 双投、群里的 @/普通两种），
+# 两条都跑一遍就会重复回复，而第二次发送必然被 QQ 拒：
+#   ServerError('消息被去重，请检查请求msgseq')
+# 所以按 msg_id 去重，覆盖所有发送路径（回复 / #搜 / #读 / 合成回答 / 群回复）：
+#   · 每个 bot 一份 LRU，300 条 / 10 分钟窗口，只放内存（重启进程自然清空，不落盘）
+#   · msg_id 优先；拿不到才退回 (作者 + 文本前 40 字) 的哈希，窗口缩到 30 秒 ——
+#     免得把「同一个人连发两句一样的话」当成重复吃掉
+#   · 命中重复：不重试、不报错，只记一条日志
+_DEDUP_LIMIT = 300
+_DEDUP_TTL = 600          # msg_id 的去重窗口（秒）
+_DEDUP_HASH_TTL = 30      # 没有 msg_id 时的兜底窗口（秒）
+_dedup = {}               # appid -> OrderedDict{key: ts}
+
+
+def _dedup_key(message):
+    """→ (键, msg_id, 是否用 msg_id)。"""
+    mid = str(getattr(message, "id", "") or getattr(message, "msg_id", "") or "").strip()
+    if mid:
+        return "id:" + mid, mid, True
+    author = ""
+    try:
+        ids = _author_ids(message)
+        author = ids[0] if ids else ""
+    except Exception:
+        author = ""
+    txt = str(getattr(message, "content", "") or "").strip()[:40]
+    return "h:" + author + "|" + txt, "", False
+
+
+def _msg_dup(appid, message):
+    """这条消息是不是已经处理过？→ (是否重复, msg_id 或占位说明)。"""
+    import collections
+
+    key, mid, by_id = _dedup_key(message)
+    now = time.time()
+    ttl = _DEDUP_TTL if by_id else _DEDUP_HASH_TTL
+    with _lock:
+        d = _dedup.get(str(appid or ""))
+        if not isinstance(d, collections.OrderedDict):
+            d = collections.OrderedDict()
+            _dedup[str(appid or "")] = d
+        for k in [k for k, ts in list(d.items()) if now - ts > ttl]:
+            d.pop(k, None)
+        ts = d.get(key)
+        if ts is not None and (now - ts) <= ttl:
+            d.move_to_end(key)
+            return True, (mid or "(无 msg_id)")
+        d[key] = now
+        while len(d) > _DEDUP_LIMIT:
+            d.popitem(last=False)
+    return False, (mid or "(无 msg_id)")
+
+
+def _dedupe_message(appid, message, source):
+    """重复消息的统一 choke point：True = 这条已经处理过，调用方直接 return。"""
+    dup, mid = _msg_dup(appid, message)
+    if dup:
+        log("去重：msg_id=%s 已处理过，跳过（来源=%s）" % (mid, source), appid)
+    return dup
 
 
 # ── 群普通消息（group_message_create）────────────────────
@@ -2586,6 +3328,8 @@ async def _handle_group(appid, botdir, message, tag):
     tag="群@" 是平台的可信 @ 事件（只在本 bot 被 @ 时推），@ 判定直接放行，
     但作者过滤 / 回环 / 限流一样要过 —— 它是复读的另一个入口。
     """
+    if _dedupe_message(appid, message, "群"):
+        return
     trusted_at = (tag == "群@")
     mid = str(getattr(message, "id", "") or "")
     if not _mark_seen(mid):
@@ -2657,8 +3401,8 @@ async def _handle_group(appid, botdir, message, tag):
     # 本地指令先判：过了四道闸就算「该回这条」，回时间不必打扰模型
     if await _local_time_reply(appid, message, clean, group_openid=gid):
         return
-    # 联网指令（#搜 / #读）：同样不走模型，只做排版
-    if await _local_web_cmd(appid, message, clean, group_openid=gid):
+    # 联网指令（#搜 / #读）：搜完交给模型按人格转述（人设化加工），链接洗净后贴出去
+    if await _local_web_cmd(appid, message, clean, group_openid=gid, botdir=botdir):
         return
     try:
         # 模型不该看到 <@hex>：先去掉 @ 标签再进模型/记忆
@@ -2699,6 +3443,8 @@ def _make_client(appid, secret, botdir):
             log("已上线：「%s」" % name, appid)
 
         async def on_at_message_create(self, message):
+            if _dedupe_message(appid, message, "频道"):
+                return
             text = (getattr(message, "content", "") or "").strip()
             log("频道@：%s" % text[:60], appid)
             try:
@@ -2720,6 +3466,9 @@ def _make_client(appid, secret, botdir):
             await _handle_group(appid, botdir, message, "群消息(新事件)")
 
         async def on_c2c_message_create(self, message):
+            # 同一条私聊消息有时会被两个事件回调各投一次：按 msg_id 去重，只处理一次
+            if _dedupe_message(appid, message, "私聊"):
+                return
             text = (getattr(message, "content", "") or "").strip()
             images = _attachments_of(message)
             if images:
@@ -2736,10 +3485,11 @@ def _make_client(appid, secret, botdir):
                     appid, message, text,
                     key="p" + str(getattr(message.author, "user_openid", ""))):
                 return
-            # 联网指令（#搜 / #读）：私聊也认，不走模型
+            # 联网指令（#搜 / #读）：私聊也认，同一套人设化加工
             if await _local_web_cmd(
                     appid, message, text,
-                    key="p" + str(getattr(message.author, "user_openid", ""))):
+                    key="p" + str(getattr(message.author, "user_openid", "")),
+                    botdir=botdir):
                 return
             try:
                 # 私聊的会话键用 p + 对方 openid（之前误用了群的 g + group_openid，
@@ -2790,12 +3540,60 @@ async def _reply(appid, botdir, key, who, incoming, images=None):
     try:
         # 上下文压缩：达到窗口 75% 才压一次（压完这次不再压，见 _maybe_compress）
         await _maybe_compress(botdir, key, appid)
-        msgs = _build_messages(botdir, key, who, incoming, first=first)
-        # 自动联网：消息里有明显需要外部信息的词，就先搜一次拼进上下文（失败为空，不影响回复）
-        web_block = await _auto_web_context(appid, conf, incoming)
+        web_on = bool(conf.get("web_search_enabled", True))
+        auto_decide = web_on and bool(conf.get("search_auto_decide", True))
+        msgs = _build_messages(botdir, key, who, incoming, first=first, search_hint=auto_decide)
+        # ① 触发词兜底：明显在问时效性内容就先搜一次（与「模型自判」互斥，一条消息只搜一次）
+        web_block = await _auto_web_context(appid, conf, incoming) if web_on else ""
         if web_block:
             msgs.insert(len(msgs) - 1, {"role": "system", "content": web_block})
         text = await asyncio.to_thread(_call_llm_sync, conf, msgs)
+        # ② 模型自判：可以连续追问，一条消息最多 _SRCH_MAX 次搜索
+        #    （成本护栏：首轮 1 次 + 每次追问后各 1 次 = 最多 6 次模型调用）
+        asked = _WEB_MARK_RE.search(text or "")
+        hits, rounds = [], 0
+        while asked and auto_decide and not web_block and rounds < _SRCH_MAX:
+            rounds += 1
+            q = (asked.group(1) or "").strip()[:120]
+            hits = _dedup_hits(hits + await _self_web_context(appid, conf, q, rounds))
+            if hits:
+                log("联网：模型自判要查「%s」→ 第 %d 轮（累计 %d 条资料）"
+                    % (q[:30], rounds, len(_shown_hits(hits))), appid)
+                second = (_hits_block(hits) + _WEB_HINT_STOP
+                          + chr(10) + _search_more_rule(_SRCH_MAX - rounds))
+            else:
+                log("联网：模型自判要查「%s」→ 第 %d 轮没搜到" % (q[:30], rounds), appid)
+                second = ("（刚查了，一条资料都没搜到：按你确实知道的回答；不确定就说不知道，"
+                          "不要编造。" + chr(10) + _search_more_rule(_SRCH_MAX - rounds) + "）")
+            msgs2 = list(msgs) + [
+                {"role": "assistant", "content": "<search>%s</search>" % q},
+                {"role": "system", "content": second},
+            ]
+            text = await asyncio.to_thread(_call_llm_sync, conf, msgs2)
+            asked = _WEB_MARK_RE.search(text or "")
+        if rounds:
+            # 用满 5 轮还在要资料 / 一条都没查到 → 收尾，不再花钱搜
+            if asked or not hits:
+                log("联网：搜索 %d 轮未得结果，按「不清楚」回复" % rounds, appid)
+            text = _strip_search_marks(text)
+            if not text:
+                log("自判搜索后没有可用正文 → 让人格说一句「不清楚」（模型 %s）" % conf["model"],
+                    appid)
+                text = await asyncio.to_thread(
+                    _call_llm_sync, conf,
+                    list(msgs) + [{"role": "system",
+                                  "content": "直接回答对方，或者老实说不清楚；"
+                                             "不要输出任何 <search> 标记。"}])
+        # 标记永远不给用户看（关掉自判时模型也可能残留一个）
+        if text and _WEB_MARK_ANY_RE.search(text):
+            text = _strip_search_marks(text)
+        if not text and not rounds:
+            # 第一轮只说「我要查」但资料已经由触发词搜来了（或自判已关）：补一次纯回答
+            log("回复只剩 <search> 标记没有正文 → 要求它直接回答", appid)
+            text = await asyncio.to_thread(
+                _call_llm_sync, conf,
+                list(msgs) + [{"role": "system",
+                              "content": "直接用一句话回答对方，不要输出任何 <search> 标记。"}])
         # 和判定/识图/摘要同一个格式：日志里写清回复实际用的模型
         log("回复（模型 %s）：%s" % (conf["model"],
                                     (text or "(空)")[:40].replace(chr(10), " ")), appid)

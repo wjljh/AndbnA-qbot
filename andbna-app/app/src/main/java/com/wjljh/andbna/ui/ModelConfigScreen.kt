@@ -84,14 +84,36 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
     var visionModel by remember { mutableStateOf(ModelPrefs.read(ctx, "llm_vision_model")) }
     var judgeModel by remember { mutableStateOf(ModelPrefs.read(ctx, "llm_judge_model")) }
     var summaryModel by remember { mutableStateOf(ModelPrefs.read(ctx, "llm_summary_model")) }
-    // 上下文窗口（token）：压缩阈值 = 它的 75%，默认 64000
+    var searchModel by remember { mutableStateOf(ModelPrefs.read(ctx, "llm_search_model")) }
+    // 上下文窗口（token）：压缩阈值 = 它的 75%，默认 131072（128K）
     var contextWindow by remember {
-        mutableStateOf(ModelPrefs.read(ctx, "llm_context_window").ifBlank { "64000" })
+        mutableStateOf(ModelPrefs.read(ctx, "llm_context_window").ifBlank { "131072" })
     }
     // 联网搜索（DeepSeek 官方 Search / Fetch）：默认开
     var webOn by remember {
         mutableStateOf(ModelPrefs.read(ctx, "web_search_enabled").trim() != "0")
     }
+    // 搜索结果人设化加工：默认开（关掉 = 原始列表贴法，便于对比）
+    var personaStyle by remember {
+        mutableStateOf(ModelPrefs.read(ctx, "search_persona_style").trim() != "0")
+    }
+    // 让模型自己判断该不该联网查：默认开（关掉 = 只认 #搜/#读 与触发词）
+    var autoDecide by remember {
+        mutableStateOf(ModelPrefs.read(ctx, "search_auto_decide").trim() != "0")
+    }
+    // 上下文窗口的「自定义…」：只是把输入框就地摊开，值仍由 contextWindow 持有
+    var windowCustom by remember { mutableStateOf(false) }
+    // 搜索后端（deepseek / searxng / custom / off）与它的三个字段
+    var provider by remember {
+        mutableStateOf(ModelPrefs.read(ctx, "search_provider").ifBlank { "deepseek" })
+    }
+    var searchBase by remember { mutableStateOf(ModelPrefs.read(ctx, "search_base")) }
+    var searchFields by remember { mutableStateOf(ModelPrefs.read(ctx, "search_fields")) }
+    val authRaw = remember { ModelPrefs.read(ctx, "search_auth") }
+    // 鉴权："" = 跟随默认（deepseek 用 bearer、其它用 none）
+    var authMode by remember { mutableStateOf(authModeOf(authRaw)) }
+    var authName by remember { mutableStateOf(authNameOf(authRaw)) }
+    var authValue by remember { mutableStateOf(authValueOf(authRaw)) }
     // 老配置可能存过大写（显示值）：预设项一律归一到小写发送值，自定义值原样保留
     var effort by remember {
         mutableStateOf(
@@ -155,18 +177,26 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
     fun save() {
         ModelPrefs.save(
             ctx, api = api, key = key, model = mainModel, vision = visionModel,
-            judge = judgeModel, summary = summaryModel,
-            window = contextWindow, web = webOn, effort = effort,
+            judge = judgeModel, summary = summaryModel, search = searchModel,
+            window = contextWindow, web = webOn, personaStyle = personaStyle,
+            autoDecide = autoDecide, effort = effort,
+            searchProvider = provider, searchBase = searchBase,
+            searchAuth = authWire(authMode, authName, authValue, provider),
+            searchFields = searchFields,
         )
         error = ""
         // 思考强度空串也存：等于「请求体不带该字段」，不是「没保存」
         val v = if (visionModel.isBlank()) "识图留空→主模型" else "识图 " + visionModel.trim()
         val j = if (judgeModel.isBlank()) "判定留空→主模型" else "判定 " + judgeModel.trim()
         val s = if (summaryModel.isBlank()) "摘要留空→主模型" else "摘要 " + summaryModel.trim()
+        val q = if (searchModel.isBlank()) "搜索留空→主模型" else "搜索 " + searchModel.trim()
         val e = if (effort.isBlank()) "思考强度留空 → 请求体不带该字段" else "思考强度 " + effort.trim()
         notice = "已保存（主模型 " + mainModel.trim().ifBlank { "deepseek-chat" } + "，" + v +
-            "，" + j + "，" + s + "，窗口 " + contextWindow.trim().ifBlank { "64000" } + "，" +
-            (if (webOn) "联网开" else "联网关") + "，" + e + "）"
+            "，" + j + "，" + s + "，" + q + "，窗口 " + contextWindow.trim().ifBlank { "131072" } +
+            "，" + (if (webOn) "联网开" else "联网关") +
+            (if (personaStyle) "，人设化回答开" else "，人设化回答关") +
+            (if (autoDecide) "，自判联网开" else "，自判联网关") +
+            "，搜索服务 " + providerLabel(provider) + "，" + e + "）"
     }
 
     /** 验证思考强度：用当前配置发一次最小请求（留空也照发，那就是平台默认行为）。 */
@@ -202,6 +232,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
             "vision" -> visionModel = name
             "judge" -> judgeModel = name
             "summary" -> summaryModel = name
+            "search" -> searchModel = name
         }
         sheetFor = ""
         notice = "已填入「" + name + "」，点保存才落盘"
@@ -289,6 +320,17 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                     anyBusy = busy.isNotEmpty(),
                     onValueChange = { summaryModel = it },
                     onRead = { readInto("summary") },
+                )
+                SlotCard(
+                    metrics = metrics,
+                    title = "搜索模型",
+                    help = "留空则沿用主模型；#搜 / #读 把结果按人格转述成中文时用它（一次一条，配便宜的就够）。",
+                    value = searchModel,
+                    main = mainModel,
+                    busy = busy == "search",
+                    anyBusy = busy.isNotEmpty(),
+                    onValueChange = { searchModel = it },
+                    onRead = { readInto("search") },
                 )
 
                 // ④ 思考强度：点一行 → 弹列表面板（与人格选择器同一个 miuix 下拉）→ 选中回填
@@ -384,37 +426,143 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                     }
                 }
 
-                // ⑤ 上下文窗口（token）：压缩阈值 = 它的 75%，达到才压一次
+                // ⑤ 上下文窗口（token）：与思考强度同一套「点一行 → 弹列表」样式
+                val winPreset = WINDOW_PRESETS.indexOfFirst { it.second == contextWindow.trim() }
+                val winCustomShown = windowCustom || winPreset < 0
                 SectionCard(metrics, title = "上下文窗口") {
-                    PanelEllipsisField(
-                        value = contextWindow,
-                        onValueChange = { contextWindow = it },
-                        hint = "64000",
-                        mono = false,
+                    OverlayDropdownPreference(
+                        insideMargin = PanelTokens.PrefInside,
+                        title = "取值",
+                        summary = if (winCustomShown)
+                            "当前 " + contextWindow.trim().ifBlank { "131072" } + "（自定义）"
+                        else "当前 " + WINDOW_PRESETS[winPreset].first +
+                            "（" + WINDOW_PRESETS[winPreset].second + "）",
+                        items = WINDOW_ITEMS,
+                        selectedIndex = if (winCustomShown) WINDOW_ITEMS.lastIndex else winPreset,
+                        onSelectedIndexChange = { i ->
+                            error = ""
+                            if (i == WINDOW_ITEMS.lastIndex) {
+                                windowCustom = true
+                                notice = "填任意 token 数（各家上限不同，64K~1M 常见），填完点保存"
+                            } else {
+                                windowCustom = false
+                                contextWindow = WINDOW_PRESETS[i].second
+                                notice = "已选「" + WINDOW_PRESETS[i].first + "」（" +
+                                    WINDOW_PRESETS[i].second + " tokens），点保存才落盘"
+                            }
+                        },
                     )
-                    val win = contextWindow.trim().toLongOrNull() ?: 64000L
+                    if (winCustomShown) {
+                        PanelEllipsisField(
+                            value = contextWindow,
+                            onValueChange = { contextWindow = it },
+                            hint = "131072",
+                            mono = false,
+                        )
+                        PanelChip(text = "确定", onClick = { windowCustom = false })
+                    }
+                    val win = contextWindow.trim().toLongOrNull() ?: 131072L
                     Text(
-                        text = "单位 token，默认 64000；估算达到 " + (win * 75 / 100) +
-                            " tokens 才把旧对话压成摘要（压缩后仍保留最近 12 条原文）。",
+                        text = "单位 token，默认 131072（128K）。这是估算阈值，不是硬上限：" +
+                            "估算达到 " + (win * 75 / 100) + " tokens 才把旧对话压成摘要；" +
+                            "真正发出去的只有 system + 摘要 + 最近 12 条原文，所以填大一点不会" +
+                            "让每次请求变贵。压缩后如果没有真的变小，这次压缩会被放弃（不落盘）。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 6.dp),
                     )
                 }
 
-                // ⑥ 联网：DeepSeek 官方 Search / Fetch，与主模型同一个 API Key
+                // ⑥ 联网：搜索后端可换（DeepSeek 官方 / SearXNG / 自定义 JSON / 关）
                 SectionCard(metrics, title = "联网搜索") {
                     SwitchPreference(
-                        title = "联网搜索（DeepSeek Search/Fetch）",
+                        title = "联网搜索",
                         summary = if (webOn) "已开启 · #搜 / #读 与自动搜索都可用"
                         else "已关闭 · 不发送任何联网请求",
                         checked = webOn,
                         onCheckedChange = { webOn = it },
                     )
+                    // 搜索服务：与「思考强度」同一个弹出列表样式
+                    OverlayDropdownPreference(
+                        insideMargin = PanelTokens.PrefInside,
+                        title = "搜索服务",
+                        summary = providerLabel(provider) +
+                            if (provider == "deepseek") "（用主模型 Key 调 /v1/tools）"
+                            else if (provider == "off") "" else "（" +
+                                searchBase.ifBlank { "还没填地址" } + "）",
+                        items = PROVIDER_LABELS,
+                        selectedIndex = PROVIDERS.indexOf(provider).coerceAtLeast(0),
+                        onSelectedIndexChange = { i ->
+                            provider = PROVIDERS[i]
+                            error = ""
+                            notice = "搜索服务已选「" + PROVIDER_LABELS[i] + "」，点保存才落盘"
+                        },
+                    )
+                    if (provider == "searxng" || provider == "custom") {
+                        PanelEllipsisField(
+                            value = searchBase,
+                            onValueChange = { searchBase = it },
+                            hint = if (provider == "searxng") "https://searx.example.com"
+                            else "https://api.example.com/search?q={query}",
+                            label = "搜索地址",
+                            mono = true,
+                        )
+                        OverlayDropdownPreference(
+                            insideMargin = PanelTokens.PrefInside,
+                            title = "鉴权",
+                            summary = AUTH_LABELS[AUTH_MODES.indexOf(authModeCoerced(authMode, provider))],
+                            items = AUTH_LABELS,
+                            selectedIndex = AUTH_MODES.indexOf(authModeCoerced(authMode, provider))
+                                .coerceAtLeast(0),
+                            onSelectedIndexChange = { i ->
+                                authMode = AUTH_MODES[i]
+                                notice = "鉴权已选「" + AUTH_LABELS[i] + "」，点保存才落盘"
+                            },
+                        )
+                        if (authModeCoerced(authMode, provider) == "header") {
+                            PanelEllipsisField(
+                                value = authName, onValueChange = { authName = it },
+                                hint = "X-API-Key", label = "Header 名", mono = true,
+                            )
+                            PanelEllipsisField(
+                                value = authValue, onValueChange = { authValue = it },
+                                hint = "值（不会写进日志）", label = "Header 值", secret = true,
+                            )
+                        }
+                    }
+                    if (provider == "custom") {
+                        PanelEllipsisField(
+                            value = searchFields,
+                            onValueChange = { searchFields = it },
+                            hint = "results[].title,url,summary",
+                            label = "结果字段路径",
+                            mono = true,
+                        )
+                    }
+                    SwitchPreference(
+                        title = "让模型自己决定要不要查",
+                        summary = if (autoDecide)
+                            "已开启 · 聊天时它拿不准/需要最新信息就自己先搜再答（一条最多搜 5 次）"
+                        else "已关闭 · 只有 #搜 / #读 和「最近/新闻/价格」这类触发词才联网",
+                        checked = autoDecide,
+                        onCheckedChange = { autoDecide = it },
+                    )
+                    SwitchPreference(
+                        title = "搜索结果人设化回答",
+                        summary = if (personaStyle)
+                            "已开启 · 搜完按人格合成一段自然回答（至多 1 条干净链接），不列清单"
+                        else "已关闭 · 原始列表贴法（标题｜摘要 + 链接逐条贴，调试/对比用）",
+                        checked = personaStyle,
+                        onCheckedChange = { personaStyle = it },
+                    )
                     Text(
-                        text = "关键词：#搜 关键词（标题+摘要+链接，最多 3 条）、#读 网址（正文前 500 字）；" +
-                            "正常回复里出现「最近/今天/新闻/多少钱/价格/什么时候/谁是/查一下」等词时会先自动搜一次。" +
-                            "计费：每 1000 次成功请求 5 元。",
+                        text = "不用打前缀：聊天里它不确定就会自己搜（「最近/今天/新闻/多少钱/" +
+                            "价格/什么时候/谁是/查一下」这类词也会兜底搜一次），最多连查 5 轮。" +
+                            "#搜 / #读 只有主人能用，别人发 # 就是普通聊天。回复都是一段话，" +
+                            "最多附一条链接。中转站/第三方模型通常没有 /v1/tools，请改用" +
+                            "「SearXNG 自建」或「自定义 JSON 接口」（#读 抓正文只有 DeepSeek 官方" +
+                            "支持）。关掉「人设化回答」= 回到原始列表贴法。" +
+                            "DeepSeek 官方计费：每 1000 次成功请求 5 元。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 6.dp),
@@ -447,6 +595,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 "vision" -> "选择识图模型"
                 "judge" -> "选择判定模型"
                 "summary" -> "选择摘要模型"
+                "search" -> "选择搜索模型"
                 else -> "选择主模型"
             },
             models = models,
@@ -454,6 +603,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 "vision" -> visionModel
                 "judge" -> judgeModel
                 "summary" -> summaryModel
+                "search" -> searchModel
                 else -> mainModel
             },
             onPick = { pick(it) },
@@ -592,6 +742,66 @@ private fun ModelConfigHeader(onBack: () -> Unit) {
  * 「自定义…」里的字符串原样透传（大小写由用户负责，验证按钮会告诉他平台认不认）。
  */
 private val EFFORT_DISPLAYS = listOf("None", "Minimal", "Low", "Medium", "High", "Xhigh", "Ultra", "Max")
+
+/**
+ * 上下文窗口的快捷胶囊：显示名 → 填进输入框的值（token）。
+ *
+ * 只是「帮用户少打字」，点完仍然可以自由输入 —— 不做区间校验、不锁定，
+ * 因为各家模型的真实上限差别很大（64K 到 1M），这里给的是常见档位。
+ */
+private val WINDOW_PRESETS = listOf(
+    "64K" to "65536",
+    "128K" to "131072",
+    "256K" to "262144",
+    "512K" to "524288",
+    "1M" to "1048576",
+)
+private val WINDOW_ITEMS = WINDOW_PRESETS.map { it.first } + listOf("自定义…")
+
+/** 搜索后端（与 Python 侧 _SEARCH_PROVIDERS 一致）。 */
+private val PROVIDERS = listOf("deepseek", "searxng", "custom", "off")
+private val PROVIDER_LABELS = listOf(
+    "DeepSeek 官方（默认）", "SearXNG 自建", "自定义 JSON 接口", "关闭（不联网）",
+)
+
+private fun providerLabel(p: String): String {
+    val i = PROVIDERS.indexOf(p)
+    return if (i >= 0) PROVIDER_LABELS[i] else PROVIDER_LABELS[0]
+}
+
+/** 鉴权：none / bearer（用主模型 Key）/ header:Name=Value。 */
+private val AUTH_MODES = listOf("none", "bearer", "header")
+private val AUTH_LABELS = listOf("无", "Bearer（用主模型 Key）", "自定义 Header…")
+
+/** 空串 = 跟随后端默认：DeepSeek 官方用 bearer，其它用 none。 */
+private fun authModeCoerced(mode: String, provider: String): String = when {
+    mode == "none" || mode == "bearer" || mode == "header" -> mode
+    provider == "deepseek" -> "bearer"
+    else -> "none"
+}
+
+private fun authModeOf(raw: String): String = when {
+    raw.startsWith("header:") -> "header"
+    raw.equals("none", true) -> "none"
+    raw.equals("bearer", true) -> "bearer"
+    else -> ""
+}
+
+private fun authNameOf(raw: String): String {
+    if (!raw.startsWith("header:") || !raw.contains("=")) return ""
+    return raw.removePrefix("header:").substringBefore("=").trim()
+}
+
+private fun authValueOf(raw: String): String {
+    if (!raw.startsWith("header:") || !raw.contains("=")) return ""
+    return raw.removePrefix("header:").substringAfter("=").trim()
+}
+
+/** 存进 llm.json 的 search_auth：header 模式下把名与值拼成 header:Name=Value。 */
+private fun authWire(mode: String, name: String, value: String, provider: String): String {
+    val m = authModeCoerced(mode, provider)
+    return if (m == "header") "header:" + name.trim() + "=" + value.trim() else m
+}
 private val EFFORT_ITEMS = listOf("不指定（用平台默认）") + EFFORT_DISPLAYS + listOf("自定义…")
 
 /** 显示项 → 发送值（小写）。 */
@@ -622,20 +832,36 @@ private object ModelPrefs {
         vision: String,
         judge: String,
         summary: String,
+        search: String,
         window: String,
         web: Boolean,
+        personaStyle: Boolean,
+        autoDecide: Boolean,
         effort: String,
+        searchProvider: String,
+        searchBase: String,
+        searchAuth: String,
+        searchFields: String,
     ) {
         sp(ctx).edit()
             .putString("llm_api", api.trim())
             .putString("llm_model", model.trim())
-            // 三个槽位留空就存空串：Python 侧按「空 = 用主模型」回退
+            // 四个槽位留空就存空串：Python 侧按「空 = 用主模型」回退
             .putString("llm_vision_model", vision.trim())
             .putString("llm_judge_model", judge.trim())
             .putString("llm_summary_model", summary.trim())
-            // 上下文窗口：填的不是数字就回落 64000（Python 侧同一口径）
-            .putString("llm_context_window", window.trim().ifBlank { "64000" })
+            .putString("llm_search_model", search.trim())
+            // 上下文窗口：留空就写默认 131072（Python 侧同一口径；老配置里的值不动）
+            .putString("llm_context_window", window.trim().ifBlank { "131072" })
             .putString("web_search_enabled", if (web) "1" else "0")
+            .putString("search_persona_style", if (personaStyle) "1" else "0")
+            .putString("search_auto_decide", if (autoDecide) "1" else "0")
+            // 搜索后端：换后端不动上层（统一 [{title,url,summary}]）
+            .putString("search_provider", searchProvider.trim().ifBlank { "deepseek" })
+            .putString("search_base", searchBase.trim())
+            .putString("search_auth", searchAuth.trim())
+            .putString("search_fields", searchFields.trim()
+                .ifBlank { "results[].title,url,summary" })
             // 思考强度留空也存空串：Python 侧按「空 = 请求体不带 reasoning_effort」
             .putString("llm_reasoning_effort", effort.trim())
             // 老键读完就删：只保留一个识图模型键

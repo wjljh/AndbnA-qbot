@@ -19,6 +19,7 @@ import com.wjljh.andbna.local.BotStore.llmApi
 import com.wjljh.andbna.local.BotStore.llmJudgeModel
 import com.wjljh.andbna.local.BotStore.llmKey
 import com.wjljh.andbna.local.BotStore.llmModel
+import com.wjljh.andbna.local.BotStore.llmSearchModel
 import com.wjljh.andbna.local.BotStore.llmSummaryModel
 import com.wjljh.andbna.local.BotStore.llmVisionModel
 import com.wjljh.andbna.local.BotStore.replyJudge
@@ -199,10 +200,10 @@ object BotHost {
             // 模型配置与每个人格先落到各自的数据目录，Python 侧读得到
             BotStore.writeLlmJson(context)
             // Key 不落盘：明文只经这一行进 Python 进程内存（llm.json 里只有地址和四个槽位的模型名）
-            // 三个槽位（识图/判定/摘要）留空 = 沿用主模型，由 Python 侧 _conf_for 回退
+            // 四个槽位（识图/判定/摘要/搜索）留空 = 沿用主模型，由 Python 侧 _conf_for 回退
             m.callAttr(
                 "set_llm", context.llmKey, context.llmApi, context.llmModel, context.llmVisionModel,
-                context.llmJudgeModel, context.llmSummaryModel,
+                context.llmJudgeModel, context.llmSummaryModel, context.llmSearchModel,
             )
             // 「回复判定」：非 @ 消息由模型判要不要插话（random 则按「闲聊概率」掷骰子）
             m.callAttr("set_reply_judge", context.replyJudge, context.chatProb)

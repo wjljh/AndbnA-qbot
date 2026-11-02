@@ -52,8 +52,8 @@ object BackupIO {
     /** 自动备份目录前缀（files/backup-auto-<时间戳>/） */
     const val AUTO_PREFIX = "backup-auto-"
 
-    /** 上下文窗口默认值（与 BotStore.llmContextWindow / llm.json 的默认一致） */
-    private const val DEFAULT_CONTEXT_WINDOW = "64000"
+    /** 上下文窗口默认值（与 BotStore.llmContextWindow / llm.json 的默认一致：131072 = 128K） */
+    private const val DEFAULT_CONTEXT_WINDOW = "131072"
 
     /** 每个 bot 目录里归备份管的文件 */
     private val BOT_FILES = listOf("phrases.json", "greetings.json", "tasks.json", "memory.json")
