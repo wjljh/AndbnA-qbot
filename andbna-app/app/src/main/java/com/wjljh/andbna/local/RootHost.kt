@@ -223,7 +223,7 @@ object RootHost {
 
     /** root 下可以直接把 App 拉起来（Activity 是导出的，root 更是通行） */
     fun relaunch(pkg: String): R =
-        sh("am start -n $pkg/com.wjljh.andbna.MainActivity --user 0")
+        sh("am start-foreground-service -n $pkg/com.wjljh.andbna.local.BotService -a com.wjljh.andbna.START_LOCAL --user 0")
 
     /** 一次性把托管条件配齐：开机脚本 + 白名单 */
     fun setup(context: Context): R {

@@ -691,5 +691,5 @@ object ShizukuShell {
 
     /** shell 能启动导出的 Activity，用它把 App 从被杀状态拉回来 */
     fun relaunch(pkg: String): String =
-        exec("am start -n $pkg/com.wjljh.andbna.MainActivity >/dev/null 2>&1; echo done")
+        exec("am start-foreground-service -n $pkg/com.wjljh.andbna.local.BotService -a com.wjljh.andbna.START_LOCAL >/dev/null 2>&1; echo done")
 }

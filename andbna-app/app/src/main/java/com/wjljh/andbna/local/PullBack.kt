@@ -721,7 +721,7 @@ while :; do
       if [ "§COUNT" -eq 0 ]; then SINCE=§NOW; fi
       COUNT=§((COUNT + 1))
       LAST=§NOW
-      am start -n "§PKG/§ACT" >/dev/null 2>&1
+      am start-foreground-service -n "§PKG/com.wjljh.andbna.local.BotService" -a com.wjljh.andbna.START_LOCAL >/dev/null 2>&1
       write_state running
       al "已通过 @VIA@ 拉起（第 §{COUNT} 次）"
     fi
