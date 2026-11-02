@@ -55,6 +55,7 @@ import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
+import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
 /**
@@ -81,6 +82,16 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
     var key by remember { mutableStateOf(ModelPrefs.read(ctx, "llm_key")) }
     var mainModel by remember { mutableStateOf(ModelPrefs.read(ctx, "llm_model")) }
     var visionModel by remember { mutableStateOf(ModelPrefs.read(ctx, "llm_vision_model")) }
+    var judgeModel by remember { mutableStateOf(ModelPrefs.read(ctx, "llm_judge_model")) }
+    var summaryModel by remember { mutableStateOf(ModelPrefs.read(ctx, "llm_summary_model")) }
+    // 上下文窗口（token）：压缩阈值 = 它的 75%，默认 64000
+    var contextWindow by remember {
+        mutableStateOf(ModelPrefs.read(ctx, "llm_context_window").ifBlank { "64000" })
+    }
+    // 联网搜索（DeepSeek 官方 Search / Fetch）：默认开
+    var webOn by remember {
+        mutableStateOf(ModelPrefs.read(ctx, "web_search_enabled").trim() != "0")
+    }
     // 老配置可能存过大写（显示值）：预设项一律归一到小写发送值，自定义值原样保留
     var effort by remember {
         mutableStateOf(
@@ -143,13 +154,19 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
 
     fun save() {
         ModelPrefs.save(
-            ctx, api = api, key = key, model = mainModel, vision = visionModel, effort = effort,
+            ctx, api = api, key = key, model = mainModel, vision = visionModel,
+            judge = judgeModel, summary = summaryModel,
+            window = contextWindow, web = webOn, effort = effort,
         )
         error = ""
         // 思考强度空串也存：等于「请求体不带该字段」，不是「没保存」
-        val v = if (visionModel.isBlank()) "识图模型留空 → 识图沿用主模型" else "识图 " + visionModel.trim()
+        val v = if (visionModel.isBlank()) "识图留空→主模型" else "识图 " + visionModel.trim()
+        val j = if (judgeModel.isBlank()) "判定留空→主模型" else "判定 " + judgeModel.trim()
+        val s = if (summaryModel.isBlank()) "摘要留空→主模型" else "摘要 " + summaryModel.trim()
         val e = if (effort.isBlank()) "思考强度留空 → 请求体不带该字段" else "思考强度 " + effort.trim()
-        notice = "已保存（主模型 " + mainModel.trim().ifBlank { "deepseek-chat" } + "，" + v + "，" + e + "）"
+        notice = "已保存（主模型 " + mainModel.trim().ifBlank { "deepseek-chat" } + "，" + v +
+            "，" + j + "，" + s + "，窗口 " + contextWindow.trim().ifBlank { "64000" } + "，" +
+            (if (webOn) "联网开" else "联网关") + "，" + e + "）"
     }
 
     /** 验证思考强度：用当前配置发一次最小请求（留空也照发，那就是平台默认行为）。 */
@@ -180,7 +197,12 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
     }
 
     fun pick(name: String) {
-        if (sheetFor == "main") mainModel = name else visionModel = name
+        when (sheetFor) {
+            "main" -> mainModel = name
+            "vision" -> visionModel = name
+            "judge" -> judgeModel = name
+            "summary" -> summaryModel = name
+        }
         sheetFor = ""
         notice = "已填入「" + name + "」，点保存才落盘"
         error = ""
@@ -234,29 +256,40 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                     }
                 }
 
-                // ③ 识图模型：留空 = 沿用主模型
-                SectionCard(metrics, title = "识图模型") {
-                    PanelEllipsisField(
-                        value = visionModel,
-                        onValueChange = { visionModel = it },
-                        hint = "留空则沿用主模型",
-                        mono = false,
-                    )
-                    Text(
-                        text = "留空则沿用主模型；收到图片时用这个模型识图。",
-                        fontSize = 13.sp,
-                        color = PanelColors.onSurfaceVariantSummary,
-                        modifier = Modifier.padding(top = 6.dp),
-                    )
-                    PanelPillRow(modifier = Modifier.padding(top = 10.dp)) {
-                        PanelPrimaryButton(
-                            text = if (busy == "vision") "读取中…" else "读取模型",
-                            modifier = Modifier.fillMaxWidth(),
-                            enabled = busy.isEmpty(),
-                            onClick = { readInto("vision") },
-                        )
-                    }
-                }
+                // ③ 三个槽位模型：识图 / 判定 / 摘要。留空 = 沿用主模型（落盘存空串）
+                SlotCard(
+                    metrics = metrics,
+                    title = "识图模型",
+                    help = "留空则沿用主模型；收到图片时用这个模型识图。",
+                    value = visionModel,
+                    main = mainModel,
+                    busy = busy == "vision",
+                    anyBusy = busy.isNotEmpty(),
+                    onValueChange = { visionModel = it },
+                    onRead = { readInto("vision") },
+                )
+                SlotCard(
+                    metrics = metrics,
+                    title = "判定模型",
+                    help = "留空则沿用主模型；「回复判定」只回一个 0/1，配个便宜模型更省。",
+                    value = judgeModel,
+                    main = mainModel,
+                    busy = busy == "judge",
+                    anyBusy = busy.isNotEmpty(),
+                    onValueChange = { judgeModel = it },
+                    onRead = { readInto("judge") },
+                )
+                SlotCard(
+                    metrics = metrics,
+                    title = "摘要模型",
+                    help = "留空则沿用主模型；上下文压缩时用它把旧对话并成一段摘要。",
+                    value = summaryModel,
+                    main = mainModel,
+                    busy = busy == "summary",
+                    anyBusy = busy.isNotEmpty(),
+                    onValueChange = { summaryModel = it },
+                    onRead = { readInto("summary") },
+                )
 
                 // ④ 思考强度：点一行 → 弹列表面板（与人格选择器同一个 miuix 下拉）→ 选中回填
                 SectionCard(metrics, title = "思考强度", gap = 10.dp) {
@@ -351,7 +384,44 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                     }
                 }
 
-                // ⑤ 保存：只在这里落盘（先读取后保存的顺序也成立）
+                // ⑤ 上下文窗口（token）：压缩阈值 = 它的 75%，达到才压一次
+                SectionCard(metrics, title = "上下文窗口") {
+                    PanelEllipsisField(
+                        value = contextWindow,
+                        onValueChange = { contextWindow = it },
+                        hint = "64000",
+                        mono = false,
+                    )
+                    val win = contextWindow.trim().toLongOrNull() ?: 64000L
+                    Text(
+                        text = "单位 token，默认 64000；估算达到 " + (win * 75 / 100) +
+                            " tokens 才把旧对话压成摘要（压缩后仍保留最近 12 条原文）。",
+                        fontSize = 13.sp,
+                        color = PanelColors.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
+
+                // ⑥ 联网：DeepSeek 官方 Search / Fetch，与主模型同一个 API Key
+                SectionCard(metrics, title = "联网搜索") {
+                    SwitchPreference(
+                        title = "联网搜索（DeepSeek Search/Fetch）",
+                        summary = if (webOn) "已开启 · #搜 / #读 与自动搜索都可用"
+                        else "已关闭 · 不发送任何联网请求",
+                        checked = webOn,
+                        onCheckedChange = { webOn = it },
+                    )
+                    Text(
+                        text = "关键词：#搜 关键词（标题+摘要+链接，最多 3 条）、#读 网址（正文前 500 字）；" +
+                            "正常回复里出现「最近/今天/新闻/多少钱/价格/什么时候/谁是/查一下」等词时会先自动搜一次。" +
+                            "计费：每 1000 次成功请求 5 元。",
+                        fontSize = 13.sp,
+                        color = PanelColors.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
+
+                // ⑦ 保存：只在这里落盘（先读取后保存的顺序也成立）
                 SectionCard(metrics) {
                     PanelPrimaryButton(
                         text = "保存",
@@ -359,7 +429,8 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                         onClick = { save() },
                     )
                     Text(
-                        text = "保存会同时写入接口地址、API Key、主模型、识图模型与思考强度；没点保存前改的值不落盘。",
+                        text = "保存会同时写入接口地址、API Key、主模型、识图/判定/摘要三个槽位、" +
+                            "上下文窗口、联网开关与思考强度；没点保存前改的值不落盘。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 8.dp),
@@ -372,12 +443,72 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
     // 底部选择卡片：ModalBottomSheet（现成组件，不自绘）+ miuix 的 BasicComponent 行
     if (sheetFor.isNotBlank()) {
         ModelPickSheet(
-            title = if (sheetFor == "vision") "选择识图模型" else "选择主模型",
+            title = when (sheetFor) {
+                "vision" -> "选择识图模型"
+                "judge" -> "选择判定模型"
+                "summary" -> "选择摘要模型"
+                else -> "选择主模型"
+            },
             models = models,
-            current = if (sheetFor == "vision") visionModel else mainModel,
+            current = when (sheetFor) {
+                "vision" -> visionModel
+                "judge" -> judgeModel
+                "summary" -> summaryModel
+                else -> mainModel
+            },
             onPick = { pick(it) },
             onDismiss = { sheetFor = "" },
         )
+    }
+}
+
+/**
+ * 一个模型槽位（识图 / 判定 / 摘要）的卡片：输入框 +「当前 → 实际使用」+ 留空说明 + 读取模型。
+ *
+ * 三个槽位版式完全一致，只有标题与说明不同，所以共用这一个 composable。
+ * 「实际使用」那一行就是 Python 侧 _conf_for 的回退结果：留空 → 主模型。
+ */
+@Composable
+private fun SlotCard(
+    metrics: Metrics,
+    title: String,
+    help: String,
+    value: String,
+    main: String,
+    busy: Boolean,
+    anyBusy: Boolean,
+    onValueChange: (String) -> Unit,
+    onRead: () -> Unit,
+) {
+    val cur = value.trim()
+    val actual = cur.ifBlank { main.trim().ifBlank { "deepseek-chat" } }
+    SectionCard(metrics, title = title) {
+        PanelEllipsisField(
+            value = value,
+            onValueChange = onValueChange,
+            hint = "留空则沿用主模型",
+            mono = false,
+        )
+        Text(
+            text = "当前：" + cur.ifBlank { "（留空）" } + " → 实际使用：" + actual,
+            fontSize = 13.sp,
+            color = PanelColors.primary,
+            modifier = Modifier.padding(top = 6.dp),
+        )
+        Text(
+            text = help,
+            fontSize = 13.sp,
+            color = PanelColors.onSurfaceVariantSummary,
+            modifier = Modifier.padding(top = 6.dp),
+        )
+        PanelPillRow(modifier = Modifier.padding(top = 10.dp)) {
+            PanelPrimaryButton(
+                text = if (busy) "读取中…" else "读取模型",
+                modifier = Modifier.fillMaxWidth(),
+                enabled = !anyBusy,
+                onClick = onRead,
+            )
+        }
     }
 }
 
@@ -489,13 +620,22 @@ private object ModelPrefs {
         key: String,
         model: String,
         vision: String,
+        judge: String,
+        summary: String,
+        window: String,
+        web: Boolean,
         effort: String,
     ) {
         sp(ctx).edit()
             .putString("llm_api", api.trim())
             .putString("llm_model", model.trim())
-            // 识图模型留空就存空串：Python 侧按「空 = 用主模型」回退
+            // 三个槽位留空就存空串：Python 侧按「空 = 用主模型」回退
             .putString("llm_vision_model", vision.trim())
+            .putString("llm_judge_model", judge.trim())
+            .putString("llm_summary_model", summary.trim())
+            // 上下文窗口：填的不是数字就回落 64000（Python 侧同一口径）
+            .putString("llm_context_window", window.trim().ifBlank { "64000" })
+            .putString("web_search_enabled", if (web) "1" else "0")
             // 思考强度留空也存空串：Python 侧按「空 = 请求体不带 reasoning_effort」
             .putString("llm_reasoning_effort", effort.trim())
             // 老键读完就删：只保留一个识图模型键

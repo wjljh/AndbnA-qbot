@@ -185,6 +185,39 @@ object BotStore {
             sp(this).edit().putString("llm_vision_model", v.trim()).apply()
         }
 
+    /** 回复判定用的模型：留空 = 沿用主模型（判定是短问答，配个便宜模型省钱）。 */
+    var Context.llmJudgeModel: String
+        get() = sp(this).getString("llm_judge_model", "").orEmpty()
+        set(v) {
+            sp(this).edit().putString("llm_judge_model", v.trim()).apply()
+        }
+
+    /** 上下文摘要用的模型：留空 = 沿用主模型（压缩时才用一次）。 */
+    var Context.llmSummaryModel: String
+        get() = sp(this).getString("llm_summary_model", "").orEmpty()
+        set(v) {
+            sp(this).edit().putString("llm_summary_model", v.trim()).apply()
+        }
+
+    /**
+     * 上下文窗口（token）：压缩阈值 = 这个值的 75%。默认 64000。
+     *
+     * 存字符串是为了让输入框原样保存；Python 侧读不到 / 解析失败都按 64000 处理。
+     */
+    var Context.llmContextWindow: String
+        get() = sp(this).getString("llm_context_window", "64000").orEmpty().ifBlank { "64000" }
+        set(v) {
+            sp(this).edit().putString("llm_context_window", v.trim().ifBlank { "64000" }).apply()
+        }
+
+    /** 联网搜索（DeepSeek 官方 Search / Fetch）：默认开。关掉后 #搜/#读 与自动搜索都不发请求。 */
+    var Context.webSearchEnabled: Boolean
+        // 历史键按字符串存（"0"/"1"），别用 getBoolean 撞 ClassCastException
+        get() = sp(this).getString("web_search_enabled", "1").orEmpty().trim() != "0"
+        set(v) {
+            sp(this).edit().putString("web_search_enabled", if (v) "1" else "0").apply()
+        }
+
     /**
      * 思考强度（可选）：空串 = 请求体里不带 reasoning_effort（按平台默认跑）。
      *
@@ -222,10 +255,15 @@ object BotStore {
         val o = JSONObject()
             .put("api", ctx.llmApi)
             .put("model", ctx.llmModel.ifBlank { "deepseek-chat" })
-            // 识图模型：空串就是「沿用主模型」，Python 侧按空回退（这里不复制主模型）
+            // 三个槽位模型：空串就是「沿用主模型」，Python 侧按空回退（这里不复制主模型）
             .put("vision_model", ctx.llmVisionModel)
+            .put("judge_model", ctx.llmJudgeModel)
+            .put("summary_model", ctx.llmSummaryModel)
             // 思考强度：空串也写（Python 侧按空 = 请求体不带该字段）
             .put("reasoning_effort", ctx.llmReasoningEffort)
+            // 上下文压缩阈值基数（token）与联网开关
+            .put("context_window", ctx.llmContextWindow.toIntOrNull() ?: 64000)
+            .put("web_search_enabled", ctx.webSearchEnabled)
         try {
             val f = File(ctx.filesDir, "localbot/llm.json")
             f.parentFile?.mkdirs()

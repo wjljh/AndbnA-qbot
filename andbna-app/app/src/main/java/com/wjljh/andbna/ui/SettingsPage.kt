@@ -21,6 +21,7 @@ import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Tune
+import androidx.compose.material.icons.rounded.Backup
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -106,14 +107,19 @@ fun SettingsPage(
         onReplayOnboarding,
     )
 
+    // 「备份与恢复」小面板：就地弹，不新开二级页（导出 / 导入都在面板里完成）
+    var showBackup by remember { mutableStateOf(false) }
+
     // 进设置页重算一次识图缓存占用（要过 Python / 读目录，放 IO，不在组合期做）
     LaunchedEffect(visible) { if (visible) vm.refreshCache() }
 
     if (LocalUiMode.current == UiMode.Material) {
-        MaterialSettingsBody(vm, actions, bottomInset, curMode)
+        MaterialSettingsBody(vm, actions, bottomInset, curMode, onOpenBackup = { showBackup = true })
     } else {
-        MiuixSettingsBody(vm, actions, bottomInset, curMode)
+        MiuixSettingsBody(vm, actions, bottomInset, curMode, onOpenBackup = { showBackup = true })
     }
+
+    BackupPanel(show = showBackup, onDismiss = { showBackup = false })
 }
 
 /** 页面回调集合（两种结构共用，不重复拆参数）。 */
@@ -212,6 +218,7 @@ private fun MiuixSettingsBody(
     actions: SettingsActions,
     bottomInset: Dp,
     curMode: RunMode,
+    onOpenBackup: () -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier
@@ -339,6 +346,12 @@ private fun MiuixSettingsBody(
                     startAction = { SettingsRowIcon(Icons.Filled.Notes) },
                     onClick = actions.onOpenLog,
                 )
+                ArrowPreference(
+                    title = "备份与恢复",
+                    summary = "导出 / 导入配置，一键备份与换机迁移",
+                    startAction = { SettingsRowIcon(Icons.Rounded.Backup) },
+                    onClick = onOpenBackup,
+                )
             }
         }
 
@@ -407,6 +420,7 @@ private fun MaterialSettingsBody(
     actions: SettingsActions,
     bottomInset: Dp,
     curMode: RunMode,
+    onOpenBackup: () -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -555,6 +569,14 @@ private fun MaterialSettingsBody(
                         summary = "查看 / 导出到系统文件",
                         icon = Icons.Filled.Notes,
                         onClick = actions.onOpenLog,
+                    )
+                }
+                item {
+                    SegmentedArrowItem(
+                        title = "备份与恢复",
+                        summary = "导出 / 导入配置，一键备份与换机迁移",
+                        icon = Icons.Rounded.Backup,
+                        onClick = onOpenBackup,
                     )
                 }
             }

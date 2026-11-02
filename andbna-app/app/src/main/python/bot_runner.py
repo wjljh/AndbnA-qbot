@@ -136,18 +136,21 @@ def _remember(botdir, key, role, text, uid=""):
 
 
 # Kotlin 侧启动前推过来的模型配置（含明文 Key）。Key 不落盘：llm.json 里只有地址、模型名和识图模型。
-_llm = {"key": "", "api": "", "model": "", "vision_model": ""}
+_llm = {"key": "", "api": "", "model": "", "vision_model": "",
+        "judge_model": "", "summary_model": ""}
 
 
-def set_llm(key, api, model, vision_model=""):
+def set_llm(key, api, model, vision_model="", judge_model="", summary_model=""):
     """由 BotHost.startAll 在 start_all 之前调用，把 Key 放进本进程内存。
 
-    vision_model 可以留空：留空 = 识图沿用主模型。
+    四个槽位的模型名都可以留空：留空 = 该槽位沿用主模型（槽位取值见 _conf_for）。
     """
     _llm["key"] = str(key or "").strip()
     _llm["api"] = str(api or "").strip()
     _llm["model"] = str(model or "").strip()
     _llm["vision_model"] = str(vision_model or "").strip()
+    _llm["judge_model"] = str(judge_model or "").strip()
+    _llm["summary_model"] = str(summary_model or "").strip()
     return "OK"
 
 
@@ -163,24 +166,61 @@ def set_reply_judge(judge, prob):
 
 
 def _llm_conf(base_dir):
-    """{key, api, model, vision_model, reasoning_effort}。
+    """{key, api, model, vision_model, judge_model, summary_model, reasoning_effort, ...}。
 
-    api / model / vision_model / reasoning_effort 都可能来自落盘的 llm.json；key 只在内存里
-    （BotHost 推过来的）。vision_model 空串 = 识图沿用主模型（不复制 model，调用时再回退）。
+    api / model / 三个槽位模型 / reasoning_effort 都可能来自落盘的 llm.json；key 只在内存里
+    （BotHost 推过来的）。槽位模型空串 = 沿用主模型（不复制 model，调用时由 _conf_for 回退）。
     reasoning_effort 空串 = 请求体里不带这个字段（用平台默认），见 _req_body。
+    另带两个上下文相关开关：context_window（压缩阈值基数，默认 64000）与
+    web_search_enabled（联网，默认开）。
     """
     c = _load_json(os.path.join(base_dir, "llm.json"), {}) or {}
     key = str(_llm.get("key") or c.get("key") or "").strip()
     api = str(_llm.get("api") or c.get("api") or "").strip()
     model = str(_llm.get("model") or c.get("model") or "").strip() or "deepseek-chat"
     vision_model = str(_llm.get("vision_model") or c.get("vision_model") or "").strip()
+    judge_model = str(_llm.get("judge_model") or c.get("judge_model") or "").strip()
+    summary_model = str(_llm.get("summary_model") or c.get("summary_model") or "").strip()
     effort = str(c.get("reasoning_effort") or "").strip()
+    try:
+        window = int(c.get("context_window") or 64000)
+    except Exception:
+        window = 64000
+    if window <= 0:
+        window = 64000
+    web_on = c.get("web_search_enabled")
+    web_on = True if web_on is None else bool(web_on)
     if not api or not key:
         return None
     if not api.endswith("/chat/completions"):
         api = api.rstrip("/") + "/chat/completions"
     return {"key": key, "api": api, "model": model, "vision_model": vision_model,
-            "reasoning_effort": effort}
+            "judge_model": judge_model, "summary_model": summary_model,
+            "reasoning_effort": effort, "context_window": window,
+            "web_search_enabled": web_on}
+
+
+# 槽位 → 取值字段：reply 就是主模型本身，其余三个留空即回落主模型。
+_SLOTS = {"reply": "", "judge": "judge_model", "vision": "vision_model",
+          "summary": "summary_model"}
+
+
+def _conf_for(kind, base_dir=""):
+    """按槽位取一份配置：conf["model"] 已经是该槽位**实际会用**的模型名。
+
+    kind ∈ reply/judge/vision/summary（未知或空串 = reply）。槽位模型留空就回落主模型，
+    所以调用方只看 conf["model"] 即可，别自己去挑 vision_model 那一类字段。
+    配置不全（缺 api/key）返回 None —— 与 _llm_conf 同一口径。
+    """
+    conf = _llm_conf(base_dir or _base_dir)
+    if not conf:
+        return None
+    out = dict(conf)
+    field = _SLOTS.get(str(kind or "").strip().lower(), "")
+    if field:
+        out["model"] = (conf.get(field) or "").strip() or conf["model"]
+    out["slot"] = str(kind or "reply").strip().lower() or "reply"
+    return out
 
 
 def _extract_text(msg):
@@ -255,7 +295,11 @@ _judge = {"mode": "llm", "prob": 0.3}
 
 
 async def _should_reply(conf, text):
-    """这条没 @ 的消息要不要接一句。"""
+    """这条没 @ 的消息要不要接一句。
+
+    conf 传主模型配置即可：判定槽位（judge_model，留空 = 主模型）在这里现取，
+    所以日志里的「判定（模型 X）」永远是真正发出去的那个 model 字段。
+    """
     if _judge["mode"] != "llm":
         import random as _random
         hit = _random.random() <= _judge["prob"]
@@ -264,6 +308,7 @@ async def _should_reply(conf, text):
     if not conf:
         log("判定跳过：模型配置没填（llm.json 缺 key / 地址）")
         return False
+    jconf = _conf_for("judge") or conf
     prompt = (
         "群里有人说：%s\n\n"
         "如果你觉得这句话该由你接一句，只回 1；不该插话只回 0。\n"
@@ -271,12 +316,12 @@ async def _should_reply(conf, text):
     )
     try:
         raw = await asyncio.to_thread(
-            _call_llm_sync, conf, [{"role": "user", "content": prompt}], 200, 0.2,
+            _call_llm_sync, jconf, [{"role": "user", "content": prompt}], 200, 0.2,
         )
         raw = (raw or "").strip()
         # 推理模型的正文可能只有「1」落在开头或结尾，两头都看一眼
         hit = ("1" in raw[:4]) or (raw[-1:] == "1") or (raw[:1] == "1")
-        log("判定（模型 %s）：%s → %s" % (conf["model"], (raw[:20] or "(空)").replace(chr(10), " "),
+        log("判定（模型 %s）：%s → %s" % (jconf["model"], (raw[:20] or "(空)").replace(chr(10), " "),
                                         "接" if hit else "不接"))
         return hit
     except Exception as e:
@@ -1219,18 +1264,188 @@ def _words_rules(botdir, key=""):
     return chr(10) + chr(10) + s + "。"
 
 
-def _build_messages(botdir, key, who, text, first=False):
-    """persona → 称呼规则 → 群聊硬规则 → 最近 12 条历史。
+# ── 上下文压缩（只有达到窗口 75% 才压一次）────────────────────
+#
+# 估算口径（写清楚：这是**估算**，不追求与平台真正的 tokenizer 一致）：
+#   · 中文按 字数 / 1.5
+#   · 英文及其它字符按 字符数 / 4
+#   · 两者相加取整
+# 触发条件有两条，必须同时满足（第 2 条是成本闸）：
+#   ① estimated_tokens(system + 历史) >= 0.75 * context_window；
+#   ② 自上次压缩以来攒够的新内容 >= max(窗口 15%, 已并入摘要内容的一半)。
+# ② 为什么不省：历史不会因为压缩而变短，只按 ① 判断的话越过阈值之后**每来一条消息
+# 都会再发一次摘要请求**，而每次只并进 1~2 行 —— 那是持续烧钱。② 让摘要请求次数变成
+# O(log 历史) 而不是 O(消息数)。
+# 压缩一次之后**本次回复**不再重复压（_maybe_compress 在 _reply 里只被调用一次）。
+# 压缩产出的摘要落盘在 <botdir>/summary/<key>.json = {summary, covered, updated_at}，
+# 于是 _build_messages 变成：system +（此前对话摘要：…）+ 最近 12 条原文。
 
-    first 参数只为兼容老调用点保留：首句不再注入问候语（问候改成时段随机主动私聊）。
+_SUMMARY_KEEP = 12          # 压缩后仍保留的最近原文条数（_build_messages 也用它）
+_SUMMARY_MAX_CHARS = 600    # 摘要字数上限
+_CTX_RATIO = 0.75           # 阈值：窗口的 75%
+_RESUME_RATIO = 0.15        # 两次压缩之间，新内容至少要占窗口的 15%
+
+
+def _est_tokens(text):
+    """粗估一段文本的 token 数：中文 字数/1.5 + 其它 字符数/4（只用于判断要不要压缩）。"""
+    s = str(text or "")
+    if not s:
+        return 0
+    cjk = 0
+    for ch in s:
+        if "\u4e00" <= ch <= "\u9fff":
+            cjk += 1
+    other = len(s) - cjk
+    return int(cjk / 1.5 + other / 4.0 + 0.5)
+
+
+def _ctx_window(base_dir=""):
+    """context_window：落盘在 llm.json，默认 64000（单位 token）。"""
+    c = _load_json(os.path.join(base_dir or _base_dir, "llm.json"), {}) or {}
+    try:
+        w = int(c.get("context_window") or 64000)
+    except Exception:
+        w = 64000
+    return w if w > 0 else 64000
+
+
+def _summary_path(botdir, key):
+    """<botdir>/summary/<key>.json；key 里的非字母数字折成 _，别让文件名出花样。"""
+    safe = re.sub(r"[^0-9A-Za-z_.-]", "_", str(key or "")) or "default"
+    return os.path.join(botdir, "summary", safe + ".json")
+
+
+def _summary_of(botdir, key):
+    d = _load_json(_summary_path(botdir, key), {})
+    return d if isinstance(d, dict) else {}
+
+
+def _rows_text(rows):
+    """记忆行 → 摘要器的输入文本（只取角色和正文，时间戳/uid 不喂模型）。"""
+    out = []
+    for r in rows:
+        try:
+            role, content = r[0], r[1]
+        except Exception:
+            continue
+        if isinstance(content, str) and content.strip():
+            out.append("%s：%s" % ("对方" if role == "user" else "我", content.strip()))
+    return chr(10).join(out)
+
+
+async def _maybe_compress(botdir, key, appid=""):
+    """超阈值就把最旧约 2/3 历史交给摘要模型，返回 True = 这次真的压了。
+
+    失败一律不打断回复：写日志、返回 False，调用方照旧走原逻辑（纯最近 12 条）。
+    同一个 key 的摘要增量更新：把旧摘要一并交给模型，要求合并成一条新摘要。
     """
+    if not botdir or not key:
+        return False
+    try:
+        rows = _memory(botdir).get(key) or []
+        window = _ctx_window()
+        threshold = int(window * _CTX_RATIO)
+        sys_text = _system_prompt(botdir, key)
+        est = _est_tokens(sys_text + chr(10) + _rows_text(rows))
+        if est < threshold:
+            # 快到阈值时留一行（方便验收「没到 75% 不压缩」），平时不刷日志
+            if est * 2 >= threshold:
+                log("上下文未达阈值：key=%s 约 %d tokens（阈值 %d，窗口 %d）→ 不压缩"
+                    % (key, est, threshold, window), appid)
+            return False
+        n = len(rows)
+        k = max(1, int(n * 2 / 3))
+        old = _summary_of(botdir, key)
+        start = int(old.get("covered") or 0)
+        if start < 0 or start > k:
+            start = 0          # 历史被裁剪过（>400 条时删掉最旧 100 条）→ 从头并
+        chunk = rows[start:k]
+        if not chunk:
+            log("上下文压缩跳过：key=%s 已覆盖到第 %d 条，没有新增内容可合并" % (key, start), appid)
+            return False
+        # 成本闸（触发条件②）：攒够新内容才允许再压一次，门槛取两者较大者
+        if start:
+            pending_est = _est_tokens(_rows_text(chunk))
+            need_est = max(int(window * _RESUME_RATIO),
+                           _est_tokens(_rows_text(rows[:start])) // 2)
+            if pending_est < need_est:
+                log("上下文压缩跳过：key=%s 新增约 %d tokens < 门槛 %d"
+                    "（窗口 %d，上次已并 %d 条）→ 不重复压缩"
+                    % (key, pending_est, need_est, window, start), appid)
+                return False
+        sconf = _conf_for("summary")
+        if not sconf:
+            log("上下文压缩跳过：模型配置没填（llm.json 缺 key / 地址）", appid)
+            return False
+        old_sum = str(old.get("summary") or "").strip()
+        prompt = (
+            "把下面这段聊天记录压成一段中文摘要，最多 %d 字。\n"
+            "只保留：聊了什么话题、对方的身份/偏好/重要事实、我答应过或说过的事。\n"
+            "不要评价，不要分点，不要加标题，直接给摘要正文。\n%s\n"
+            "【新增对话】\n%s"
+        ) % (_SUMMARY_MAX_CHARS,
+             ("【已有摘要（请与新增对话合并成一段，不要重复过去已经写过的话）】\n" + old_sum + "\n")
+             if old_sum else "",
+             _rows_text(chunk)[:12000])
+        t0 = time.time()
+        try:
+            new_sum = await asyncio.to_thread(
+                _call_llm_sync, sconf, [{"role": "user", "content": prompt}], 900, 0.2,
+            )
+        except Exception as e:
+            log("上下文压缩失败：%r（按原逻辑继续，不压缩）" % e, appid)
+            return False
+        new_sum = str(new_sum or "").strip().replace(chr(10), " ")
+        if not new_sum:
+            log("上下文压缩失败：摘要模型 %s 没返回内容（按原逻辑继续）" % sconf["model"], appid)
+            return False
+        new_sum = new_sum[:_SUMMARY_MAX_CHARS]
+        path = _summary_path(botdir, key)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+        if not _save_json(path, {"summary": new_sum, "covered": k,
+                                 "updated_at": int(time.time())}):
+            log("上下文压缩失败：摘要写盘失败（按原逻辑继续）", appid)
+            return False
+        keep = rows[-_SUMMARY_KEEP:]
+        after = (_est_tokens(sys_text)
+                 + _est_tokens("（此前对话摘要：%s）" % new_sum)
+                 + _est_tokens(_rows_text(keep)))
+        log("上下文压缩：key=%s 原 %d 条/约 %d tokens（阈值 %d）→ 摘要 + 最近 %d 条"
+            "（约 %d tokens｜摘要模型 %s｜%.1fs）"
+            % (key, n, est, threshold, len(keep), after, sconf["model"], time.time() - t0),
+            appid)
+        return True
+    except Exception as e:
+        log("上下文压缩异常：%r（按原逻辑继续）" % e, appid)
+        return False
+
+
+def _system_prompt(botdir, key):
+    """系统提示词：人格 → 称呼规则 → 当前时间 → 群聊硬规则。"""
     persona = _persona(botdir)
     sys = persona or "你是一个 QQ 群里的机器人，说话自然简短，像真人聊天。"
     sys = sys + _words_rules(botdir, key)
     sys = sys + chr(10) + chr(10) + "现在是 %s。" % _now_text()
     sys = sys + _CHAT_RULES
-    msgs = [{"role": "system", "content": sys}]
-    for r in (_memory(botdir).get(key) or [])[-12:]:
+    return sys
+
+
+def _build_messages(botdir, key, who, text, first=False):
+    """system →（有摘要时）此前对话摘要 → 最近 12 条原文 → 这一条。
+
+    first 参数只为兼容老调用点保留：首句不再注入问候语（问候改成时段随机主动私聊）。
+    摘要由 _maybe_compress 在 _reply 里写盘，这里只读：读不到就还是纯最近 12 条。
+    """
+    msgs = [{"role": "system", "content": _system_prompt(botdir, key)}]
+    sm = _summary_of(botdir, key)
+    summary = str(sm.get("summary") or "").strip()
+    if summary:
+        msgs.append({"role": "system",
+                     "content": "（此前对话摘要：%s）" % summary})
+    for r in (_memory(botdir).get(key) or [])[-_SUMMARY_KEEP:]:
         try:
             role, content = r[0], r[1]
         except Exception:
@@ -1283,6 +1498,242 @@ def _clean_reply(text, limit=120):
                 break
         s = (s[:cut] if cut else s[:limit]).rstrip("，,、 　")
     return s.strip()
+
+
+# ── 联网（DeepSeek 官方 Search / Fetch）──────────────────────
+#
+# 和主模型同一个 API Key，两个端点：
+#   POST {base}/v1/tools/search  {"query","count","need_content":true}
+#        → results[].title / .url / .summary
+#   POST {base}/v1/tools/fetch   {"url"}
+#        → content（Markdown）
+# 计费：每 1000 次成功请求 5 元（模型配置页里也写了这句）。
+# 失败（4xx / 5xx / 15 秒超时）只写日志，退回纯文本回复 —— 不向用户报错。
+# 触发两种：指令（#搜 / #读，不走模型）与自动（消息里有明显需要外部信息的词）。
+
+_WEB_TIMEOUT = 15
+_WEB_COUNT = 5              # 问接口要几条
+_WEB_REPLY_MAX = 3          # 回复 / 拼上下文最多用几条
+_WEB_SUMMARY_CHARS = 300    # 自动搜索拼进上下文时每条摘要的截断
+_WEB_FETCH_CHARS = 500      # #读 回复的前 500 字
+
+
+def _web_base(conf):
+    base = str((conf or {}).get("api") or "").rstrip("/")
+    if base.endswith("/chat/completions"):
+        base = base[: -len("/chat/completions")]
+    return base.rstrip("/")
+
+
+def _web_url(conf, path):
+    """{base}/v1/tools/...；地址里已经带 /v1 的不重复拼。"""
+    base = _web_base(conf)
+    return base + path if base.endswith("/v1") else base + "/v1" + path
+
+
+def _web_post(conf, path, body, appid="", tag=""):
+    """POST 一个联网端点 → (ok, 响应 dict 或错误说明)。日志写清状态码与耗时（不写 Key）。"""
+    import json
+    import urllib.error
+    import urllib.request
+
+    url = _web_url(conf, path)
+    t0 = time.time()
+    req = urllib.request.Request(
+        url, data=json.dumps(body).encode("utf-8"), method="POST",
+        headers={"Content-Type": "application/json",
+                 "Authorization": "Bearer " + str(conf.get("key") or "")},
+    )
+    code = 0
+    try:
+        with urllib.request.urlopen(req, timeout=_WEB_TIMEOUT) as r:
+            code = int(getattr(r, "status", 200) or 200)
+            raw = r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        code = int(getattr(e, "code", 0) or 0)
+        detail = ""
+        try:
+            detail = e.read().decode("utf-8", "replace")[:200]
+        except Exception:
+            detail = repr(e)
+        log("联网：%s HTTP %d（%.1fs）%s"
+            % (tag, code, time.time() - t0, detail.replace(chr(10), " ")[:160]), appid)
+        return False, "HTTP %d" % code
+    except Exception as e:
+        log("联网：%s 失败 %r（%.1fs）" % (tag, e, time.time() - t0), appid)
+        return False, "网络错误"
+    log("联网：%s HTTP %d（%.1fs）" % (tag, code, time.time() - t0), appid)
+    try:
+        d = json.loads(raw or "{}")
+    except Exception:
+        log("联网：%s 响应不是 JSON（前 120 字）：%s" % (tag, raw[:120]), appid)
+        return False, "响应格式错误"
+    return (True, d) if isinstance(d, dict) else (False, "响应格式错误")
+
+
+def web_search(query, conf, appid="", count=_WEB_COUNT):
+    """Search API → [{"title","url","summary"}]；失败或无结果返回 []。"""
+    q = str(query or "").strip()[:200]
+    if not q or not conf:
+        return []
+    ok, d = _web_post(conf, "/tools/search",
+                      {"query": q, "count": count, "need_content": True},
+                      appid, "search「%s」" % q[:24])
+    if not ok:
+        return []
+    out = []
+    for it in (d.get("results") or []):
+        if not isinstance(it, dict):
+            continue
+        title = str(it.get("title") or "").strip()
+        url = str(it.get("url") or "").strip()
+        summary = " ".join(str(it.get("summary") or it.get("content") or "").split())
+        if not (title or url):
+            continue
+        out.append({"title": title, "url": url, "summary": summary})
+    log("联网：search「%s」→ 命中 %d 条" % (q[:24], len(out)), appid)
+    return out
+
+
+def web_fetch(url, conf, appid=""):
+    """Fetch API → 正文 Markdown；失败返回空串。"""
+    u = str(url or "").strip()
+    if not u or not conf:
+        return ""
+    ok, d = _web_post(conf, "/tools/fetch", {"url": u}, appid, "fetch %s" % u[:24])
+    if not ok:
+        return ""
+    content = str(d.get("content") or "").strip()
+    log("联网：fetch %s → %d 字" % (u[:40], len(content)), appid)
+    return content
+
+
+# 指令：私聊/群里发「#搜 关键词」「#读 网址」。这两条不走模型（只做排版）。
+_WEB_SEARCH_CMDS = ("#搜", "＃搜")
+_WEB_FETCH_CMDS = ("#读", "＃读")
+
+
+def _web_cmd_of(text):
+    """→ (kind, arg)；kind 为 "" 表示不是联网指令。"""
+    t = str(text or "").strip()
+    for pre in _WEB_SEARCH_CMDS:
+        if t.startswith(pre):
+            return "search", t[len(pre):].strip()
+    for pre in _WEB_FETCH_CMDS:
+        if t.startswith(pre):
+            return "fetch", t[len(pre):].strip()
+    return "", ""
+
+
+def _search_reply_text(hits):
+    """指令 #搜 的回复：标题 + 一句摘要 + 链接，最多 3 条。
+
+    编号必须按**结果条**数走（每条结果占两行：标题行 + 链接行），
+    用行数当前缀会得到 1./3./5. 这种错位编号。
+    """
+    lines = []
+    for i, h in enumerate(hits[:_WEB_REPLY_MAX], 1):
+        one = h.get("summary") or ""
+        one = re.split(r"(?<=[。！？.!?])\s*", one)[0][:60] if one else ""
+        head = h.get("title") or "(无标题)"
+        lines.append("%d. %s" % (i, head) + (("｜" + one) if one else ""))
+        if h.get("url"):
+            lines.append(h["url"])
+    return chr(10).join(lines)
+
+
+def _fetch_reply_text(content):
+    """指令 #读 的回复：前 500 字（连续空行压成一行空行，免得占满整屏）。"""
+    s = re.sub(r"\n{3,}", chr(10) * 2, str(content or "")).strip()
+    if not s:
+        return ""
+    return s[:_WEB_FETCH_CHARS] + ("…（后略）" if len(s) > _WEB_FETCH_CHARS else "")
+
+
+async def _local_web_cmd(appid, message, text, key="", group_openid=""):
+    """联网指令：#搜 / #读。返回 True = 这条已经回了；False = 交给正常链路。
+
+    失败（4xx/5xx/超时/无结果）不报错给用户，直接返回 False 让模型按纯文本回。
+    """
+    kind, arg = _web_cmd_of(text)
+    if not kind:
+        return False
+    api = getattr(message, "_api", None)
+    conf = _llm_conf(_base_dir) if _base_dir else None
+
+    async def _send(reply):
+        try:
+            if str(key or "").startswith("p"):
+                await api.post_c2c_message(
+                    openid=getattr(message.author, "user_openid", ""), msg_type=0,
+                    msg_id=getattr(message, "id", ""), content=reply)
+            else:
+                await api.post_group_message(
+                    group_openid=group_openid, msg_type=0,
+                    msg_id=getattr(message, "id", ""), content=reply)
+        except Exception as e:
+            log("回消息失败（联网指令）：%r" % e, appid)
+
+    if not arg:
+        await _send("用法：#搜 关键词（联网搜一下）｜#读 网址（读正文前 500 字）")
+        return True
+    if conf is None:
+        log("联网指令跳过：模型配置没填（llm.json 缺 key / 地址）", appid)
+        return False
+    if kind == "search":
+        hits = await asyncio.to_thread(web_search, arg, conf, appid)
+        if not hits:
+            log("联网指令 #搜「%s」没有结果，交给正常回复" % arg[:30], appid)
+            return False
+        reply = _search_reply_text(hits)
+        log("联网指令 #搜「%s」：回 %d 条（不走模型）" % (arg[:30], min(len(hits), _WEB_REPLY_MAX)),
+            appid)
+        await _send(reply)
+        return True
+    content = await asyncio.to_thread(web_fetch, arg, conf, appid)
+    reply = _fetch_reply_text(content)
+    if not reply:
+        log("联网指令 #读 %s 没读到正文，交给正常回复" % arg[:40], appid)
+        return False
+    log("联网指令 #读 %s：回前 %d 字（不走模型）" % (arg[:40], min(len(content), _WEB_FETCH_CHARS)),
+        appid)
+    await _send(reply)
+    return True
+
+
+# 自动联网的触发词：出现这些就说明「答案不在聊天记录里」。宁可多搜一次（一次 0.005 元）。
+_WEB_HINTS = ("最近", "最新", "今天", "新闻", "多少钱", "价格", "什么时候", "谁是",
+              "查一下", "查下", "实时", "汇率", "股价", "比分", "发布会")
+
+
+def _needs_web(text):
+    t = str(text or "")[:200]
+    return any(h in t for h in _WEB_HINTS)
+
+
+def _web_context_block(hits):
+    """自动搜索的命中 → 拼进上下文的 system 段（每条摘要截 300 字）。"""
+    lines = []
+    for h in hits[:_WEB_REPLY_MAX]:
+        one = (h.get("summary") or "")[:_WEB_SUMMARY_CHARS]
+        lines.append("- %s｜%s｜%s" % (h.get("title") or "(无标题)", one, h.get("url") or ""))
+    return ("（联网搜索结果，只是参考信息：用它回答问题，但别念链接、别说自己在联网）"
+            + chr(10) + chr(10).join(lines))
+
+
+async def _auto_web_context(appid, conf, text):
+    """正常回复时的自动联网：命中触发词就搜一次，返回要拼进上下文的段（失败返回 ""）。"""
+    q = str(text or "").strip()
+    if not q or not conf or not conf.get("web_search_enabled", True):
+        return ""
+    if not _needs_web(q):
+        return ""
+    hits = await asyncio.to_thread(web_search, q, conf, appid)
+    log("联网：自动搜索「%s」→ 命中 %d 条" % (q[:24], len(hits)), appid)
+    if not hits:
+        return ""
+    return _web_context_block(hits)
+
 
 
 # ── 定时消息 ──────────────────────────────────────────
@@ -2206,6 +2657,9 @@ async def _handle_group(appid, botdir, message, tag):
     # 本地指令先判：过了四道闸就算「该回这条」，回时间不必打扰模型
     if await _local_time_reply(appid, message, clean, group_openid=gid):
         return
+    # 联网指令（#搜 / #读）：同样不走模型，只做排版
+    if await _local_web_cmd(appid, message, clean, group_openid=gid):
+        return
     try:
         # 模型不该看到 <@hex>：先去掉 @ 标签再进模型/记忆
         reply = await _reply(appid, botdir, "g" + gid, "", clean, images=images)
@@ -2282,6 +2736,11 @@ def _make_client(appid, secret, botdir):
                     appid, message, text,
                     key="p" + str(getattr(message.author, "user_openid", ""))):
                 return
+            # 联网指令（#搜 / #读）：私聊也认，不走模型
+            if await _local_web_cmd(
+                    appid, message, text,
+                    key="p" + str(getattr(message.author, "user_openid", ""))):
+                return
             try:
                 # 私聊的会话键用 p + 对方 openid（之前误用了群的 g + group_openid，
                 # 而 C2CMessage 根本没有 group_openid 属性 → 回私聊必报 AttributeError）
@@ -2318,7 +2777,8 @@ async def _reply(appid, botdir, key, who, incoming, images=None):
         if conf is None:
             log("识图跳过：模型配置没填（llm.json 缺 key / 地址），这条按纯文本处理", appid)
         else:
-            extra = await _vision_suffix(appid, conf, images)
+            # 识图槽位（vision_model，留空 = 主模型）：实际用的就是 conf["model"]
+            extra = await _vision_suffix(appid, _conf_for("vision") or conf, images)
             if extra:
                 incoming = incoming + extra
     # 「第一句」要在丢进记忆之前判：_remember 之后 key 下就已经有这条了
@@ -2328,8 +2788,17 @@ async def _reply(appid, botdir, key, who, incoming, images=None):
     if conf is None:
         return "（本机模式连通测试）收到：%s" % (incoming or "")[:40]
     try:
+        # 上下文压缩：达到窗口 75% 才压一次（压完这次不再压，见 _maybe_compress）
+        await _maybe_compress(botdir, key, appid)
         msgs = _build_messages(botdir, key, who, incoming, first=first)
+        # 自动联网：消息里有明显需要外部信息的词，就先搜一次拼进上下文（失败为空，不影响回复）
+        web_block = await _auto_web_context(appid, conf, incoming)
+        if web_block:
+            msgs.insert(len(msgs) - 1, {"role": "system", "content": web_block})
         text = await asyncio.to_thread(_call_llm_sync, conf, msgs)
+        # 和判定/识图/摘要同一个格式：日志里写清回复实际用的模型
+        log("回复（模型 %s）：%s" % (conf["model"],
+                                    (text or "(空)")[:40].replace(chr(10), " ")), appid)
         if not text:
             text = "（模型没返回内容）"
         raw_len = len(text)
