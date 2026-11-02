@@ -21,3 +21,6 @@ shots/
 
 # 内部交付文档（思路记录/产物清单），不进公开仓库
 delivery/
+
+# 更新日志放 Release 页，不入库
+CHANGELOG.md
