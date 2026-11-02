@@ -24,3 +24,7 @@ delivery/
 
 # 更新日志放 Release 页，不入库
 CHANGELOG.md
+
+# Python 字节码
+__pycache__/
+*.pyc
