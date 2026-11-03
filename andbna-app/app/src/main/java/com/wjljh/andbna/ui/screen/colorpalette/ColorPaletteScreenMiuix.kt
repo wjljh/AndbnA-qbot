@@ -61,6 +61,7 @@ import com.materialkolor.PaletteStyle
 import com.materialkolor.dynamiccolor.ColorSpec
 import com.materialkolor.rememberDynamicColorScheme
 import com.wjljh.andbna.R
+import com.wjljh.andbna.ui.component.cardOutline
 import com.wjljh.andbna.ui.component.miuix.ScaleDialog
 import com.wjljh.andbna.ui.theme.LocalEnableBlur
 import com.wjljh.andbna.ui.theme.keyColorOptions
@@ -170,7 +171,8 @@ fun ColorPaletteScreenMiuix(
                     Card(
                         modifier = Modifier
                             .padding(top = 12.dp)
-                            .fillMaxWidth(),
+                            .fillMaxWidth()
+                            .cardOutline(),
                     ) {
                         SwitchPreference(
                             title = stringResource(id = R.string.settings_monet),
@@ -276,7 +278,8 @@ fun ColorPaletteScreenMiuix(
                     Card(
                         modifier = Modifier
                             .padding(top = 12.dp)
-                            .fillMaxWidth(),
+                            .fillMaxWidth()
+                            .cardOutline(),
                     ) {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                             SwitchPreference(
@@ -335,7 +338,8 @@ fun ColorPaletteScreenMiuix(
                     Card(
                         modifier = Modifier
                             .padding(top = 12.dp)
-                            .fillMaxWidth(),
+                            .fillMaxWidth()
+                            .cardOutline(),
                     ) {
                         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
                             SwitchPreference(

@@ -188,7 +188,9 @@ fun FloatingBottomBar(
     val pillShape = remember { CircleShape }
     val accentColor = MiuixTheme.colorScheme.primary
     val surfaceContainer = MiuixTheme.colorScheme.surfaceContainer
-    val containerColor = if (isBlurEnabled) surfaceContainer.copy(0.4f) else surfaceContainer
+    // 浅色下必须不透明：0.4 半透明会把底下的列表文字透到导航栏上（截图里能看到「机器人占用/s」字样穿出来）。
+    // 深色保持 0.4 —— 深底上的毛玻璃是设计的一部分，这次不动。
+    val containerColor = if (isBlurEnabled && isInDark) surfaceContainer.copy(0.4f) else surfaceContainer
 
     val tabsBackdrop = rememberLayerBackdrop()
     val density = LocalDensity.current

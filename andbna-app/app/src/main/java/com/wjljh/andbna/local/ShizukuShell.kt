@@ -666,6 +666,30 @@ object ShizukuShell {
         }
     }
 
+    /**
+     * 自更新用的安装通道：把安装包的文件描述符连同大小一起交给 shell 进程，
+     * 由它跑 `pm install -S <size>` 并从 fd 灌 stdin。
+     *
+     * 为什么不能走 [exec]：exec 只有一个字符串参数，塞不进二进制；
+     * 而且 shell 也读不到 App 私有目录里的 cacheDir/update 下的 apk（SELinux）。
+     * 文件描述符跨进程是可读的，所以这里传 fd 而不是路径。
+     */
+    fun pmInstall(apk: java.io.File, size: Long): String {
+        val r = remote ?: return "UserService 没连上"
+        val pfd = try {
+            android.os.ParcelFileDescriptor.open(apk, android.os.ParcelFileDescriptor.MODE_READ_ONLY)
+        } catch (e: Throwable) {
+            return "打开安装包失败：" + (e.message ?: "")
+        }
+        return try {
+            r.pmInstall(pfd, size).orEmpty()
+        } catch (e: Throwable) {
+            "执行异常：${e.message}"
+        } finally {
+            runCatching { pfd.close() }
+        }
+    }
+
     fun whitelist(pkg: String): String = exec("dumpsys deviceidle whitelist +$pkg; echo done")
 
     fun unwhitelist(pkg: String): String = exec("dumpsys deviceidle whitelist -$pkg; echo done")

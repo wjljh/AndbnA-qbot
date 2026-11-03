@@ -103,6 +103,27 @@ object PanelTokens {
     val HeroIconOffsetX: Dp = 10.dp
     val HeroIconOffsetY: Dp = 12.dp
 
+    /** hero 下段用量小字：比副标题再小一档，最多两行（卡片高度随内容撑开）。 */
+    val HeroCostSize: TextUnit = 11.sp
+    val HeroCostLineHeight: TextUnit = 15.sp
+    val HeroCostGap: Dp = 3.dp
+
+    /** 统计行与卡片底边的间距：不留就跟底边贴死。 */
+    val HeroCostBottomPadding: Dp = 8.dp
+
+    /** 上段（模式/状态 + 图标）与下段（通栏统计行）之间的间距。 */
+    val HeroCostTopGap: Dp = 6.dp
+
+    /** 状态页 hero 下方那行「群里只回 @」提示：11sp 次要色，无底无框。 */
+    val PageHintSize: TextUnit = 11.sp
+    val PageHintLineHeight: TextUnit = 16.sp
+
+    /**
+     * 右上角状态图标的实际尺寸：卡片里不再「顶出去」，圆必须完整落在卡内，
+     * 四边各留 16dp（= [HeroPadding]）；72dp 更矮，卡片只长到文字块的高度。
+     */
+    val HeroIconInnerSize: Dp = 72.dp
+
     // ── 信息卡行（SukiSU HomeMiuix.kt:480-516 InfoText）─────────────────
 
     /** 行首图标 24dp。 */

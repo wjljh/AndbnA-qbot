@@ -151,8 +151,9 @@ private fun PanelAppContent() {
     val metrics = rememberMetrics()
     var mode by remember { mutableStateOf(ModeStore.initial(ctx)) }
 
-    // 首次使用引导：只有 debug 包 + 没写过 onboarded=true 才拦在最前面（见 OnboardStore.required）。
-    // release 包 required() 恒为 false —— 老用户升级 release 不会突然弹引导。
+    // 首次使用引导按 versionCode 判定（见 OnboardStore.required）：记下的 onboard_seen_vc
+    // 比当前 BuildConfig.VERSION_CODE 小就拦在最前面 —— 首次安装（0）与每次升级各走一次；
+    // 同一版本第二次打开相等，不再出现。走完 / 跳过时 markDone() 写回当前版本。
     var onboarding by remember { mutableStateOf(OnboardStore.required(ctx)) }
     // 每次进引导换一个 key：这个 if 分支在两段布局中间，不换 key 的话引导内部的 remember
     // 会按位置沿用上一次的值（重看引导会直接落在上次停的那一步）
@@ -398,7 +399,8 @@ private fun MainTabs(
     val materialScroll = TopAppBarDefaults.exitUntilCollapsedScrollBehavior(rememberTopAppBarState())
 
     // 液体玻璃要「取到身后的内容」，所以内容树画进这个 backdrop 层
-    val surfaceColor = MiuixTheme.colorScheme.surface
+    // 页面底色走 PanelColors：浅色下它比卡片暗一档（卡片边界才立得住），深色仍是主题 surface
+    val surfaceColor = PanelColors.pageBackground
     val backdrop = rememberLayerBackdrop {
         drawRect(surfaceColor)
         drawContent()
@@ -556,6 +558,8 @@ private fun MainTabs(
             topBar = {
                 TopAppBar(
                     title = tabTitle,
+                    // 顶栏与页面同一底色：页面底换了色，顶栏还用主题 surface 就会在标题下留一道接缝
+                    color = surfaceColor,
                     // 用户要求：顶栏任何状态下都显示当前页名，不再出现 AndbnA
                     largeTitle = tabTitle,
                     // 用户要求：去掉标题下的小字说明（root 托管 · N 个 bot 这类），状态页自己有 hero 展示

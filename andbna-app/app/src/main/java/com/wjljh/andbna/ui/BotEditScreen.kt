@@ -45,6 +45,8 @@ import androidx.compose.ui.unit.sp
 import com.wjljh.andbna.ModelCatalog
 import com.wjljh.andbna.local.BotHost
 import com.wjljh.andbna.local.BotStore
+import com.wjljh.andbna.local.BotStore.groupAutochatOverride
+import com.wjljh.andbna.local.BotStore.setGroupAutochatOverride
 import com.wjljh.andbna.local.BotStore.llmApi
 import com.wjljh.andbna.local.BotStore.llmKey
 import com.wjljh.andbna.local.BotStore.llmModel
@@ -58,6 +60,7 @@ import com.wjljh.andbna.ui.component.BotFormSecretSection
 import com.wjljh.andbna.ui.component.BotFormSection
 import com.wjljh.andbna.ui.component.BotFormSwitchRow
 import com.wjljh.andbna.ui.component.rememberPersonaImporter
+import com.wjljh.andbna.ui.component.PanelArrowRow
 import com.wjljh.andbna.ui.component.PanelGroupCard
 import com.wjljh.andbna.ui.component.PanelIconPillButton
 import com.wjljh.andbna.ui.component.PanelPillRow
@@ -78,6 +81,7 @@ import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.basic.TopAppBar
+import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Add
 import top.yukonga.miuix.kmp.icon.extended.Back
@@ -103,6 +107,12 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
+    // 「群配置」二级页就地接管整屏（不新增 App 路由）：返回就回到本页，编辑页状态全在 remember 里
+    var showGroups by remember(appid) { mutableStateOf(false) }
+    if (showGroups) {
+        GroupConfigScreen(metrics = metrics, appid = appid, onBack = { showGroups = false })
+        return
+    }
     // 组合期一律不读盘、不读 prefs：bot 详情 / 模型三件套 / 人格清单 / 定时表 / openid 全在下面的
     // LaunchedEffect 里按 IO 读回来再填状态（这几行以前都是 remember { ... } 里同步读文件）。
     var bot by remember(appid) { mutableStateOf<LocalBot?>(null) }
@@ -130,6 +140,9 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     var idMsg by remember(appid) { mutableStateOf("") }
 
     var msg by remember { mutableStateOf("") }
+    // 群里自动接话的**按 bot 覆盖**（BotStore.group_autochat_override）：""=跟随全局 / "1"=开 / "0"=关。
+    // 组合期不读 prefs，等下面 IO 回来再填；生效优先级见 bot_runner._group_autochat_state。
+    var autochatOverride by remember(appid) { mutableStateOf("") }
 
     // 称呼（<botdir>/phrases.json）：只有两个对象，键名写死 master / others
     var aliasMaster by remember(appid) { mutableStateOf("") }
@@ -187,6 +200,8 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
         llmA = a
         llmM = m
         globalModel = m
+        // 群里自动接话：本 bot 的三态覆盖（设置页那一行是全局默认，两者不再共用同一个值）
+        autochatOverride = withContext(Dispatchers.IO) { ctx.groupAutochatOverride(appid) }
 
         // ② 称呼 + 问候：本 bot 自己的 phrases.json / greetings.json（缺文件就是空 / 默认值）
         val words = withContext(Dispatchers.IO) { WordsStore.loadBot(ctx, appid) }
@@ -527,7 +542,42 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 }
             }
 
-            // ⑧ 模型：继承开关 / 接口地址 / API Key / 模型下拉（与「添加 bot」页同一份共享组件）
+            // ⑧ 群里接话：按 bot 的三态覆盖（跟随全局 / 开 / 关）。设置页那一行是全局默认，
+            //    两者是**不同的存储**：这里改的是 BotStore.group_autochat_override，只影响本 bot。
+            BotFormSection(title = "群里接话") {
+                OverlayDropdownPreference(
+                    insideMargin = PanelTokens.PrefInside,
+                    title = "群里自动接话",
+                    summary = "关着时群里只有 @ 才会回",
+                    items = AUTOCHAT_LABELS,
+                    selectedIndex = autochatIndex(autochatOverride),
+                    onSelectedIndexChange = { i ->
+                        val v = autochatValue(i)
+                        autochatOverride = v
+                        ctx.setGroupAutochatOverride(appid, v)
+                        // 立刻推给 Python（判定是每条消息现读的），不用重启 bot
+                        scope.launch {
+                            withContext(Dispatchers.IO) {
+                                BotHost.setGroupAutochatOverride(ctx, appid, v)
+                            }
+                            msg = "群里自动接话：" + AUTOCHAT_LABELS[i]
+                        }
+                    },
+                )
+            }
+
+            // ⑨ 群配置：每个群单独设自动接话 / 每日额度 / 联网 / 整群静音
+            //    （<botdir>/groups/<openid>.json；没配过的群沿用上面那三层判定）
+            BotFormSection(title = "群配置") {
+                PanelArrowRow(
+                    title = "按群单独设置",
+                    summary = "自动接话 / 每日额度 / 联网 / 整群静音；没配过的群沿用上面的设置",
+                    feedback = false,
+                    onClick = { showGroups = true },
+                )
+            }
+
+            // ⑨ 模型：继承开关 / 接口地址 / API Key / 模型下拉（与「添加 bot」页同一份共享组件）
             BotFormModelSection(
                 inherit = inherit,
                 onInheritChange = { inherit = it },
@@ -540,7 +590,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 onModel = { llmM = it },
             )
 
-            // ⑨ 动作
+            // ⑩ 动作
             PanelGroupCard {
                 PanelPillRow {
                     PanelPrimaryButton(text = "保存", onClick = { saveAll() }, modifier = Modifier.weight(1f))
@@ -928,4 +978,21 @@ private fun GreetSlotRow(
             }
         }
     }
+}
+
+/** 「群里自动接话」三态的下拉文案：与 BotStore.group_autochat_override 的三个取值一一对应。 */
+private val AUTOCHAT_LABELS = listOf("跟随全局", "开", "关")
+
+/** 落盘值 → 下拉下标（"" 跟随 / "1" 开 / "0" 关，脏值一律按跟随）。 */
+private fun autochatIndex(value: String): Int = when (value.trim()) {
+    "1" -> 1
+    "0" -> 2
+    else -> 0
+}
+
+/** 下拉下标 → 落盘值。 */
+private fun autochatValue(index: Int): String = when (index) {
+    1 -> "1"
+    2 -> "0"
+    else -> ""
 }

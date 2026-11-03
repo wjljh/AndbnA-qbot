@@ -15,6 +15,7 @@ import com.chaquo.python.android.AndroidPlatform
 import com.wjljh.andbna.MainActivity
 import com.wjljh.andbna.local.BotStore.chatProb
 import com.wjljh.andbna.local.BotStore.groupAutochat
+import com.wjljh.andbna.local.BotStore.groupAutochatOverride
 import com.wjljh.andbna.local.BotStore.llmApi
 import com.wjljh.andbna.local.BotStore.llmJudgeModel
 import com.wjljh.andbna.local.BotStore.llmKey
@@ -207,9 +208,15 @@ object BotHost {
             )
             // 「回复判定」：非 @ 消息由模型判要不要插话（random 则按「闲聊概率」掷骰子）
             m.callAttr("set_reply_judge", context.replyJudge, context.chatProb)
-            // 「群里自动接话」默认关（设置页那一行已删）：开了才轮到上面的回复判定
-            m.callAttr("set_group_autochat", context.groupAutochat)
+            // 「群里自动接话」三层：先交全局开关，再交每个 bot 的覆盖（"" = 跟随全局）
+            m.callAttr("set_group_autochat", "", "", context.groupAutochat)
             BotStore.load(context).forEach { b ->
+                m.callAttr(
+                    "set_group_autochat",
+                    b.appid,
+                    context.groupAutochatOverride(b.appid),
+                    context.groupAutochat,
+                )
                 if (b.persona.isNotBlank()) {
                     val d = File(dataDir(context), b.appid)
                     d.mkdirs()
@@ -254,6 +261,54 @@ object BotHost {
 
     private fun botDir(context: Context, appid: String): String =
         File(dataDir(context), appid).absolutePath
+
+    /**
+     * 今日成本/用量快照（bot_runner.cost_snapshot）。
+     *
+     * {calls, in_tokens, out_tokens, today_cost_yuan|null, search_calls}
+     * token 与次数来自 chat/completions 的 usage，金额 = 今日首次余额 − 当前余额（上游余额接口）；
+     * 余额查不到就是 null，界面只显示 token 与次数。失败给空串，hero 少一行字，不影响别的。
+     */
+    fun costSnapshot(context: Context, appid: String): String = try {
+        ensure()?.callAttr("cost_snapshot", appid, dataDir(context).absolutePath)?.toString() ?: ""
+    } catch (e: Throwable) {
+        ""
+    }
+
+    /**
+     * 「群里自动接话」开关：改了立刻生效（Python 侧 _autochat 是每条消息现读的，不用重启 bot）。
+     * 关着时群里只有 @ 才回 —— 状态页那行小字读的就是这个落盘值。
+     */
+    fun setGroupAutochat(on: Boolean): Boolean = try {
+        ensure()?.callAttr("set_group_autochat", "", "", on) != null
+    } catch (e: Throwable) {
+        false
+    }
+
+    /**
+     * 某个 bot 的三态覆盖改了：把（覆盖值 + 当前全局值）一起推给 Python，立刻生效。
+     * override = "" 跟随全局 / "1" 开 / "0" 关（落盘在 BotStore.group_autochat_override）。
+     */
+    fun setGroupAutochatOverride(context: Context, appid: String, override: String): Boolean = try {
+        ensure()?.callAttr(
+            "set_group_autochat", appid, override, context.groupAutochat,
+        ) != null
+    } catch (e: Throwable) {
+        false
+    }
+
+    /**
+     * 群资料（群名 / 人数）：bot_runner.group_info → GET /v2/groups/{openid}/info。
+     *
+     * 用这个 bot 自己的 AppID/AppSecret 换 token（Python 侧按 appid 缓存到过期）；
+     * 返回 {"ok":true,"name":"…","members":N}，失败给空串 —— 界面用 openid 兜底，绝不挡页面。
+     */
+    fun groupInfo(context: Context, appid: String, gid: String): String = try {
+        val secret = BotStore.load(context).firstOrNull { it.appid == appid }?.secret.orEmpty()
+        ensure()?.callAttr("group_info", appid, secret, gid)?.toString() ?: ""
+    } catch (e: Throwable) {
+        ""
+    }
 
     fun memoryList(context: Context, appid: String): String = try {
         ensure()?.callAttr("memory_list", botDir(context, appid))?.toString() ?: "[]"
@@ -386,6 +441,86 @@ object BotHost {
 
     private fun imageBytes(dir: File): Long =
         dir.listFiles()?.sumOf { if (it.isFile) it.length() else 0L } ?: 0L
+
+    // ── 消息存档（<botdir>/messages.db，每个 bot 一个库）──
+
+    private fun fileBytes(f: File): Long = if (f.isFile) f.length() else 0L
+
+    /**
+     * 消息存档的占用与条数（跨全部 bot 累加）。
+     *
+     * 条数要走 Python 的 archive_stats —— 它跟检索、导出同一套口径（先把内存缓冲 flush 再数）。
+     * Python 没起来就只报文件大小、条数给 -1（界面显示「条数未知」），
+     * 绝不为了显示一行字去把解释器拉起来。
+     */
+    fun archiveStats(context: Context): Pair<Long, Int> {
+        val dirs = botDirs(context)
+        val m = try { ensure() } catch (e: Throwable) { null }
+            ?: return dirs.sumOf { fileBytes(File(it, "messages.db")) } to -1
+        var bytes = 0L
+        var rows = 0
+        var known = true
+        dirs.forEach { d ->
+            val o = try {
+                org.json.JSONObject(m.callAttr("archive_stats", d.absolutePath).toString())
+            } catch (e: Throwable) {
+                null
+            }
+            if (o == null) {
+                bytes += fileBytes(File(d, "messages.db"))
+                known = false
+            } else {
+                bytes += o.optLong("bytes", 0L)
+                rows += o.optInt("rows", 0)
+            }
+        }
+        return bytes to if (known) rows else -1
+    }
+
+    /** 清空所有 bot 的存档（DELETE + VACUUM）→ (删掉的条数, 清完的字节数)。 */
+    fun archiveClear(context: Context): Pair<Int, Long> {
+        val m = try { ensure() } catch (e: Throwable) { null }
+        var rows = 0
+        var bytes = 0L
+        botDirs(context).forEach { d ->
+            val o = if (m == null) null else try {
+                org.json.JSONObject(m.callAttr("archive_clear", d.absolutePath).toString())
+            } catch (e: Throwable) {
+                null
+            }
+            if (o == null) {
+                // Python 没起来也得能清：直接删库文件，下次 bot 启动会重建一个空库
+                val f = File(d, "messages.db")
+                bytes += f.length()
+                if (f.exists() && f.delete()) rows += 1
+            } else {
+                rows += o.optInt("rows", 0)
+                bytes += o.optLong("bytes", 0L)
+            }
+        }
+        return rows to bytes
+    }
+
+    /**
+     * 导出正文（一行一条 [时间] 群/私聊 作者：消息 ⇢ 回复，时间正序）。
+     *
+     * 只有一个 bot 有存档时第一行就是消息本身；多个 bot 都有才在每段前加一行「# <appid>」。
+     */
+    fun archiveExportText(context: Context): String {
+        val m = try { ensure() } catch (e: Throwable) { null } ?: return ""
+        val parts = ArrayList<Pair<String, String>>()
+        botDirs(context).forEach { d ->
+            val t = try {
+                m.callAttr("archive_export_text", d.absolutePath).toString()
+            } catch (e: Throwable) {
+                ""
+            }
+            if (t.isNotBlank()) parts.add(d.name to t)
+        }
+        if (parts.isEmpty()) return ""
+        if (parts.size == 1) return parts[0].second
+        return parts.joinToString("\n\n") { p -> "# " + p.first + "\n" + p.second }
+    }
 
     /**
      * 真跑着的解释器版本（bot_runner.python_version）。

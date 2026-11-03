@@ -9,6 +9,7 @@
   · 自己的 botpy 客户端
 """
 import asyncio
+import contextvars
 import json
 import os
 import random
@@ -209,6 +210,8 @@ def _llm_conf(base_dir):
     s_auth = str(c.get("search_auth") or "").strip() or (
         "bearer" if provider == "deepseek" else "none")
     s_fields = str(c.get("search_fields") or "").strip() or "results[].title,url,summary"
+    # 余额接口地址只在特殊场景手填（中转站 / 验收时造坏地址）；留空按 api 推导
+    balance_api = str(c.get("balance_api") or "").strip()
     if not api or not key:
         return None
     if not api.endswith("/chat/completions"):
@@ -220,7 +223,8 @@ def _llm_conf(base_dir):
             "web_search_enabled": web_on, "search_persona_style": style_on,
             "search_auto_decide": auto_decide,
             "search_provider": provider, "search_base": s_base,
-            "search_auth": s_auth, "search_fields": s_fields}
+            "search_auth": s_auth, "search_fields": s_fields,
+            "balance_api": balance_api}
 
 
 # 槽位 → 取值字段：reply 就是主模型本身，其余四个留空即回落主模型。
@@ -294,6 +298,268 @@ def _log_body(body):
         log("请求体字段：%s（未设置思考强度，不带 reasoning_effort）" % fields)
 
 
+# ── 成本统计（token / 余额差值 / 联网次数）──────────────────
+#
+# 只记**上游给的数**，不写本地价格表：
+#   · chat/completions 的 usage → 按（日期 + 用途）累加 token（这个接口只给 token，没有钱）；
+#   · GET /user/balance 的 total_balance → 今日消耗 = 今日首次余额 − 当前余额（上游真实扣费）。
+# 余额每 10 分钟最多查一次，失败静默：金额留空，token 与次数照常显示，回复链路不受影响。
+# 同一 Key 在别的端（网页/别的机器）的消耗会混进余额差值里 —— 所以界面写「约」。
+
+_USAGE_SLOTS = ("reply", "judge", "vision", "summary", "search")
+_USAGE_KEEP_DAYS = 30
+_BALANCE_GAP = 600          # 秒：余额接口每 10 分钟最多打一次
+_usage_lock = threading.Lock()
+_balance_lock = threading.Lock()
+_balance_running = set()
+# 「这次模型调用算哪个 bot 的账」：_call_llm_sync 跑在 asyncio.to_thread 里（会复制上下文），
+# 所以入口线程 set 一次就行，不用给每个调用点加参数。
+_usage_appid = contextvars.ContextVar("andbna_usage_appid", default="")
+
+
+def _day_str(offset_days=0):
+    return time.strftime("%Y-%m-%d", time.localtime(time.time() + offset_days * 86400))
+
+
+def _usage_path(botdir):
+    return os.path.join(botdir, "usage.json")
+
+
+def _balance_path(botdir):
+    return os.path.join(botdir, "balance.json")
+
+
+def _usage_dir(appid=""):
+    """appid → <botdir>；拿不到就返回空串（不计账，也不影响回复）。"""
+    aid = str(appid or _usage_appid.get() or "").strip()
+    if not aid or not _base_dir:
+        return ""
+    return _bot_dir(_base_dir, aid)
+
+
+def _trim_usage(d):
+    """按天分桶只留最近 30 天（search_calls 也一起裁），防止文件无限长。"""
+    keep = _day_str(-(_USAGE_KEEP_DAYS - 1))
+    sc = d.pop("search_calls", None)
+    for day in list(d.keys()):
+        if not isinstance(day, str) or len(day) != 10 or day < keep:
+            d.pop(day, None)
+    if isinstance(sc, dict):
+        d["search_calls"] = {k: int(v or 0) for k, v in sc.items()
+                             if isinstance(k, str) and len(k) == 10 and k >= keep}
+    return d
+
+
+def _usage_add(botdir, slot, usage):
+    """记一次 chat/completions 的 usage（调用次数 +1，token 累加）。"""
+    slot = str(slot or "").strip().lower()
+    if slot not in _USAGE_SLOTS:
+        slot = "reply"
+    u = usage if isinstance(usage, dict) else {}
+    try:
+        pin = int(u.get("prompt_tokens") or 0)
+        pout = int(u.get("completion_tokens") or 0)
+    except Exception:
+        pin, pout = 0, 0
+    day = _day_str()
+    with _usage_lock:
+        d = _load_json(_usage_path(botdir), {})
+        if not isinstance(d, dict):
+            d = {}
+        day_map = d.get(day) if isinstance(d.get(day), dict) else {}
+        old = day_map.get(slot) if isinstance(day_map.get(slot), dict) else {}
+        day_map[slot] = {"calls": int(old.get("calls") or 0) + 1,
+                         "in": int(old.get("in") or 0) + pin,
+                         "out": int(old.get("out") or 0) + pout}
+        d[day] = day_map
+        _save_json(_usage_path(botdir), _trim_usage(d))
+        today_calls = day_map[slot]["calls"]
+    log("用量记一笔：%s 入 %d / 出 %d（今日该用途第 %d 次调用）"
+        % (slot, pin, pout, today_calls), _usage_appid.get())
+    _balance_tick(botdir)          # 顺手看一眼余额（内部 10 分钟节流，后台线程）
+
+
+def _usage_search(botdir):
+    """联网 Search / Fetch 单独计次：hero 上的「联网 N 次」。"""
+    if not botdir:
+        return
+    day = _day_str()
+    with _usage_lock:
+        d = _load_json(_usage_path(botdir), {})
+        if not isinstance(d, dict):
+            d = {}
+        m = d.get("search_calls") if isinstance(d.get("search_calls"), dict) else {}
+        m[day] = int(m.get(day) or 0) + 1
+        d["search_calls"] = m
+        _save_json(_usage_path(botdir), _trim_usage(d))
+
+
+def _usage_from_response(conf, d):
+    """响应里取 usage 记账；取不到（中转站不回 usage / 字段缺失）就只记次数。"""
+    try:
+        botdir = _usage_dir()
+        if not botdir:
+            return
+        u = d.get("usage") if isinstance(d, dict) else None
+        _usage_add(botdir, (conf or {}).get("slot") or "reply", u or {})
+    except Exception as e:
+        log("用量记账失败（忽略）：%r" % e)
+
+
+def _balance_url(conf):
+    """余额接口地址：官方 Key 用 api.deepseek.com，中转站退回 api 主机根路径的 /user/balance。"""
+    override = str(conf.get("balance_api") or "").strip()
+    if override:
+        return override
+    api = str(conf.get("api") or "").strip()
+    if "deepseek.com" in api:
+        return "https://api.deepseek.com/user/balance"
+    try:
+        import urllib.parse
+        p = urllib.parse.urlsplit(api)
+        if p.scheme and p.netloc:
+            return "%s://%s/user/balance" % (p.scheme, p.netloc)
+    except Exception:
+        pass
+    return ""
+
+
+def _balance_query(conf):
+    """→ 余额（CNY，float）或 None。任何失败（网络/HTTP/字段缺失）都只返回 None。"""
+    url = _balance_url(conf or {})
+    if not url or not conf or not conf.get("key"):
+        return None
+    try:
+        import urllib.request
+        req = urllib.request.Request(url, headers={
+            "Authorization": "Bearer " + conf["key"],
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=8) as r:
+            d = json.loads(r.read().decode("utf-8", "replace"))
+        infos = d.get("balance_infos") if isinstance(d, dict) else None
+        for it in infos or []:
+            if str((it or {}).get("currency") or "").upper() == "CNY":
+                return round(float(it.get("total_balance")), 2)
+        log("余额查询：响应里没有 CNY 余额，金额留空")
+        return None
+    except Exception as e:
+        # 不打印 URL 里的任何凭据（Key 在头里，从来没进过日志/文件）
+        log("余额查询失败（金额留空，不影响回复）：%r" % e)
+        return None
+
+
+def _balance_store(botdir, val):
+    """落 balance.json：{date, first, last, ts, ok}；跨天把 first 重置为当天第一条读数。"""
+    day = _day_str()
+    with _balance_lock:
+        old = _load_json(_balance_path(botdir), {})
+        if not isinstance(old, dict):
+            old = {}
+        today = old.get("date") == day
+        if val is None:
+            # 失败也要落 ts（否则界面每 10 秒戳一次 = 刷接口），并标 ok=False → 界面把金额留空
+            new = {"date": day,
+                   "first": old.get("first") if today else None,
+                   "last": old.get("last") if today else None,
+                   "ts": time.time(), "ok": False}
+        else:
+            first = old.get("first") if today else None
+            new = {"date": day, "first": val if first is None else first,
+                   "last": val, "ts": time.time(), "ok": True}
+        _save_json(_balance_path(botdir), new)
+    if new.get("ok"):
+        log("余额：今日首条 %.2f / 当前 %.2f → 今日约 ¥%.2f（每 10 分钟查一次）"
+            % (float(new["first"]), float(new["last"]),
+               max(0.0, float(new["first"]) - float(new["last"]))))
+    else:
+        log("余额：这次没取到，今日金额留空（10 分钟内不再重试）")
+    return new
+
+
+def _balance_tick(botdir, conf=None):
+    """余额刷新：10 分钟最多一次，查询放后台线程（界面轮询调它不会卡）。"""
+    if not botdir:
+        return
+    old = _load_json(_balance_path(botdir), {})
+    try:
+        ts = float((old or {}).get("ts") or 0)
+    except Exception:
+        ts = 0.0
+    if time.time() - ts < _BALANCE_GAP:
+        return
+    with _balance_lock:
+        if botdir in _balance_running:
+            return
+        _balance_running.add(botdir)
+    conf = conf if conf is not None else (_llm_conf(_base_dir) if _base_dir else None)
+    if not conf:
+        with _balance_lock:
+            _balance_running.discard(botdir)
+        return
+
+    def _run():
+        try:
+            _balance_store(botdir, _balance_query(conf))
+        finally:
+            with _balance_lock:
+                _balance_running.discard(botdir)
+
+    try:
+        threading.Thread(target=_run, daemon=True).start()
+    except Exception as e:
+        with _balance_lock:
+            _balance_running.discard(botdir)
+        log("余额查询线程起不来（忽略）：%r" % e)
+
+
+def _cost_money(botdir):
+    """今日消耗（元）= 首次余额 − 当前余额；无数据 / 上次查询失败 / 跨天 → None。"""
+    b = _load_json(_balance_path(botdir), {})
+    if not isinstance(b, dict) or not b.get("ok"):
+        return None
+    if b.get("date") != _day_str():
+        return None
+    try:
+        first = float(b.get("first"))
+        last = float(b.get("last"))
+    except Exception:
+        return None
+    return round(max(0.0, first - last), 2)      # 充过钱 → 负数按 0 显示，别显示负花费
+
+
+def cost_snapshot(appid, base_dir=""):
+    """hero 下段那一行的数据源（JSON 字符串，Kotlin 侧解析）。
+
+    {calls, in_tokens, out_tokens, today_cost_yuan|null, search_calls}
+    calls / tokens = 今日全部用途（reply/judge/vision/summary/search 槽位）之和；
+    search_calls = 今日 Search/Fetch 的真实调用次数（不是模型调用次数）。
+    余额在这顺手刷一次（内部 10 分钟节流 + 后台线程），读不到金额就返回 null。
+    """
+    botdir = _bot_dir(base_dir or _base_dir or os.getcwd(), appid)
+    day = _day_str()
+    d = _load_json(_usage_path(botdir), {})
+    if not isinstance(d, dict):
+        d = {}
+    calls = tin = tout = 0
+    buckets = d.get(day) if isinstance(d.get(day), dict) else {}
+    for b in buckets.values():
+        if not isinstance(b, dict):
+            continue
+        calls += int(b.get("calls") or 0)
+        tin += int(b.get("in") or 0)
+        tout += int(b.get("out") or 0)
+    sc = d.get("search_calls") if isinstance(d.get("search_calls"), dict) else {}
+    out = {"calls": calls, "in_tokens": tin, "out_tokens": tout,
+           "today_cost_yuan": _cost_money(botdir),
+           "search_calls": int(sc.get(day) or 0)}
+    try:
+        _balance_tick(botdir)
+    except Exception:
+        pass
+    return json.dumps(out, ensure_ascii=False)
+
+
 def _call_llm_sync(conf, messages, max_tokens=400, temperature=0.9):
     import json
     import urllib.request
@@ -306,6 +572,7 @@ def _call_llm_sync(conf, messages, max_tokens=400, temperature=0.9):
     })
     with urllib.request.urlopen(req, timeout=30) as r:
         d = json.loads(r.read().decode("utf-8", "replace"))
+    _usage_from_response(conf, d)
     return _extract_text(d["choices"][0]["message"])
 
 
@@ -1185,6 +1452,10 @@ async def _maybe_greet(client, appid, botdir, now=None):
                 key = slot["name"] + "|group:" + gid
                 if key in sent:
                     continue
+                if not _group_conf(botdir, gid)["enabled"]:
+                    log("随机问候跳过：群 %s 已静音（groups/%s.json enabled=false）"
+                        % (_oid8(gid), _oid8(gid)), appid)
+                    continue
                 try:
                     await client.api.post_group_message(group_openid=gid, msg_type=0, content=line)
                     _greet_mark(botdir, date_s, key)
@@ -1477,9 +1748,588 @@ async def _maybe_compress(botdir, key, appid=""):
         return False
 
 
+# ── 消息存档（<botdir>/messages.db）──────────────────────
+#
+# 每个 bot 一个库：QQ 的 openid 按 bot 分配，库跟着 bot 目录走 —— 删 bot 目录
+# 就是删它的存档，也不会出现两个 bot 互相往对方库里写。
+#
+# 表：msg(id INTEGER PRIMARY KEY, chat_type, chat_id, author_openid, author_name,
+#          ts, text, reply_text)
+# 检索：分级探测设备上的 SQLite，启动日志里写明实际用了哪一档 ——
+#   · trigram 分词器（首选）→ fts5(text, reply_text, content='msg', tokenize='trigram')，
+#     中文可以按任意子串查（「张伟提」命中「张伟提过档期」），查询走 msg_fts MATCH；
+#   · unicode61（退化档：老设备 / 不支持 trigram）→ 中文按整串匹配，检索补一次 LIKE；
+#   · 两档都建不出（精简版 SQLite）→ 普通表 + text LIKE + ts 索引，功能不降级（只是慢）。
+# 三个触发器（增/删/改）跟着 msg 同步索引；老库启动时自动重建成 trigram 并全量回填。
+#
+# 写入为什么是「收消息一条 + 回复 UPDATE 同一行」，而不是写第二条：
+#   msg 只有一张表，第二条就得靠标记位区分谁说的，导出时还要再拼回去；
+#   直接把 reply_text 补到同一行最省事 —— 导出一行就是「作者：原文 ⇢ 回复」，
+#   不用额外状态、不用二次关联。收消息先进内存缓冲（20 条 / 5 秒 flush，
+#   后台线程落盘），回复路径上那次 UPDATE 也不会阻塞发送；代价是进程被杀时
+#   最多丢 5 秒内还没 flush 的几条（可接受，不做 WAL 式的强一致）。
+_ARC_KEEP_DAYS = 30            # 保留天数（滚动删除）
+_ARC_KEEP_PER_CHAT = 5000      # 每个会话最多留多少条
+_ARC_FLUSH_N = 20              # 攒够 20 条立刻落盘
+_ARC_FLUSH_SEC = 5.0           # 否则最多等 5 秒
+_ARC_RECALL_N = 8              # 召回取最近 8 条
+_ARC_HIT_CHARS = 200           # 召回单条截断
+_ARC_EXPORT_MAX = 100000       # 导出口数上限（够用又不会把内存撑爆）
+
+_arc_lock = threading.RLock()
+_arc_buf = []                  # 待写缓冲：[{botdir, chat_type, chat_id, …, done}]
+_arc_last = {}                 # (botdir, chat_type, chat_id) -> 已落盘那条请求行的 id
+_arc_db = {}                   # botdir -> {"conn": …, "mode": "FTS5"|"LIKE"}
+_arc_trim_ts = {}              # botdir -> 上次滚动清理的时间
+_arc_off = ""                  # 非空 = sqlite3 用不了，整块功能静默关闭（不影响收发消息）
+_arc_worker = {"on": False}
+
+_ARC_TRIGGERS = (
+    ("msg_ai", "AFTER INSERT ON msg BEGIN"
+               " INSERT INTO msg_fts(rowid, text, reply_text)"
+               " VALUES (new.id, new.text, new.reply_text); END"),
+    ("msg_ad", "AFTER DELETE ON msg BEGIN"
+               " INSERT INTO msg_fts(msg_fts, rowid, text, reply_text)"
+               " VALUES ('delete', old.id, old.text, old.reply_text); END"),
+    ("msg_au", "AFTER UPDATE ON msg BEGIN"
+               " INSERT INTO msg_fts(msg_fts, rowid, text, reply_text)"
+               " VALUES ('delete', old.id, old.text, old.reply_text);"
+               " INSERT INTO msg_fts(rowid, text, reply_text)"
+               " VALUES (new.id, new.text, new.reply_text); END"),
+)
+
+# 召回标记：与 <search> 并列的第二个本地工具，只认一行 <recall>关键词</recall>
+_ARC_RECALL_MARK_RE = re.compile(r"<\s*recall\s*>(.*?)<\s*/\s*recall\s*>", re.I | re.S)
+_ARC_RECALL_ANY_RE = re.compile(r"<\s*/?\s*recall\s*>", re.I)
+
+
+def _arc_appid(botdir):
+    """库所在目录名就是 appid（日志标签用）。"""
+    return os.path.basename(str(botdir or "").rstrip("/"))
+
+
+def _arc_path(botdir):
+    return os.path.join(str(botdir or ""), "messages.db")
+
+
+def _arc_bytes(path):
+    try:
+        return int(os.path.getsize(path))
+    except Exception:
+        return 0
+
+
+def _arc_probe_fts5(conn):
+    """设备 SQLite 到底有没有编译 FTS5？建一个假的虚表再删掉 —— 建不出来就是没有。"""
+    conn.execute("CREATE VIRTUAL TABLE IF NOT EXISTS _fts_probe USING fts5(x)")
+    conn.execute("DROP TABLE IF EXISTS _fts_probe")
+    return True
+
+
+# FTS5 分词器分级，按顺序探测（写成数据，日志里报实际生效的那一档）：
+#   · trigram：三字一段建索引，中文可以用任意子串查（「张伟提」能查到「张伟提过档期」）；
+#   · unicode61：SQLite 默认分词器，把一整串中文当一个词 —— 只作退化档；
+#   · 两档都建不出来才退普通表 + text LIKE（功能还在，只是全表扫）。
+# trigram 查询有个硬限制：关键词长度必须 ≥3 个字符，短词（「张伟」）MATCH 一条都查不到，
+# 所以 archive_search 在 MATCH 没命中时仍补一次 LIKE —— 索引是快路，LIKE 是兜底。
+_ARC_FTS_SPECS = (("trigram", "trigram"), ("unicode61", "unicode61"))
+
+
+def _arc_make_fts(conn, tokenize):
+    """按分词器建 msg_fts（外部内容表 content='msg'）。建不出来就抛，由调用方试下一档。"""
+    conn.execute(
+        "CREATE VIRTUAL TABLE msg_fts USING fts5(text, reply_text, content='msg',"
+        " content_rowid='id', tokenize='%s')" % tokenize)
+
+
+def _arc_fts_sql(conn):
+    """库里 msg_fts 的建表语句（没这张表就是空串）。升级老库时靠它认出原来的分词器。"""
+    try:
+        row = conn.execute("SELECT sql FROM sqlite_master WHERE name = 'msg_fts'").fetchone()
+    except Exception:
+        row = None
+    return str((row[0] if row else "") or "")
+
+
+def _arc_make_triggers(conn):
+    """三个触发器（增 / 删 / 改）让 msg_fts 跟着 msg 走。"""
+    for name, body in _ARC_TRIGGERS:
+        conn.execute("CREATE TRIGGER IF NOT EXISTS %s %s" % (name, body))
+
+
+def _arc_setup_fts(conn, botdir):
+    """建或升级 FTS5 索引 → "trigram" / "unicode61" / "LIKE"，并把用的哪一档写进日志。
+
+    老库（上一版建的是默认 unicode61）在启动时**自动升级**：整张丢掉按 trigram 重建，
+    再用 fts5 的 rebuild 命令从 msg 全量回填 —— 用户不用删库，历史消息照样能查。
+    """
+    appid = _arc_appid(botdir)
+    try:
+        _arc_probe_fts5(conn)
+    except Exception as e:
+        log("存档：FTS5 不可用（%r）→ 退回普通表 + text LIKE + ts 索引" % e, appid)
+        return "LIKE"
+    old = _arc_fts_sql(conn)
+    old_mode = ("trigram" if "trigram" in old.lower() else "unicode61") if old else ""
+    if old_mode == "trigram":
+        _arc_make_triggers(conn)
+        conn.commit()
+        log("存档：FTS5(trigram) 可用 → %s 走 trigram 全文索引"
+            "（msg_fts MATCH，中文可子串查）" % _arc_path(botdir), appid)
+        return "trigram"
+    if old:
+        try:
+            conn.execute("DROP TABLE msg_fts")      # 老索引整张丢掉，下面按新分词器重建
+            conn.commit()
+        except Exception as e:
+            log("存档：旧 FTS 表删不掉（%r）→ 本次不建索引，走 LIKE" % e, appid)
+            return "LIKE"
+    mode = ""
+    for tokenize, name in _ARC_FTS_SPECS:
+        try:
+            _arc_make_fts(conn, tokenize)
+            mode = name
+            break
+        except Exception as e:
+            log("存档：FTS5(%s) 建不出来（%r）→ 试下一档" % (name, e), appid)
+            try:
+                conn.execute("DROP TABLE IF EXISTS msg_fts")
+            except Exception:
+                pass
+    if not mode:
+        log("存档：FTS5 不可用（trigram / unicode61 都建不出）→ 退回普通表 + text LIKE"
+            " + ts 索引", appid)
+        return "LIKE"
+    _arc_make_triggers(conn)
+    conn.commit()
+    n = 0
+    try:
+        n = int(conn.execute("SELECT COUNT(*) FROM msg").fetchone()[0] or 0)
+        if n:
+            conn.execute("INSERT INTO msg_fts(msg_fts) VALUES('rebuild')")   # 从 msg 全量回填
+            conn.commit()
+    except Exception as e:
+        log("存档：索引回填失败（%r）→ 检索会补 LIKE" % e, appid)
+    if old_mode and old_mode != mode:
+        log("存档索引已升级为 %s，回填 %d 条（原 %s）" % (mode, n, old_mode), appid)
+    elif mode == "trigram":
+        log("存档：FTS5(trigram) 可用 → %s 走 trigram 全文索引"
+            "（msg_fts MATCH，中文可子串查）" % _arc_path(botdir), appid)
+    else:
+        log("存档：FTS5(unicode61) 可用 → %s 走 unicode61 全文索引"
+            "（中文按整串匹配，检索会补 LIKE）" % _arc_path(botdir), appid)
+    return mode
+
+
+def _arc_connect(botdir):
+    """打开（必要时建 + 升级）本 bot 的库 → {"conn":…, "mode":"trigram"|"unicode61"|"LIKE"}。
+
+    失败返回 None（这一轮就不落库，收发消息完全不受影响）。
+    """
+    global _arc_off
+    botdir = str(botdir or "")
+    if not botdir or _arc_off:
+        return None
+    with _arc_lock:
+        got = _arc_db.get(botdir)
+        if got is not None:
+            return got
+        appid = _arc_appid(botdir)
+        try:
+            import sqlite3
+        except Exception as e:
+            _arc_off = "sqlite3 不可用：%r" % e
+            log("消息存档关闭：%s（收发消息照常，只是不落库）" % _arc_off, appid)
+            return None
+        try:
+            try:
+                os.makedirs(botdir, exist_ok=True)
+            except Exception:
+                pass
+            conn = sqlite3.connect(_arc_path(botdir), timeout=5.0, check_same_thread=False)
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS msg(id INTEGER PRIMARY KEY, chat_type TEXT,"
+                " chat_id TEXT, author_openid TEXT, author_name TEXT, ts INTEGER,"
+                " text TEXT, reply_text TEXT)")
+        except Exception as e:
+            log("存档：打开 messages.db 失败（%r）→ 本次不落库" % e, appid)
+            return None
+        try:
+            mode = _arc_setup_fts(conn, botdir)
+        except Exception as e:
+            log("存档：索引初始化失败（%r）→ 本次走 LIKE" % e, appid)
+            mode = "LIKE"
+        if mode == "LIKE":
+            try:
+                conn.execute("CREATE INDEX IF NOT EXISTS msg_ts ON msg(ts)")
+                conn.commit()
+            except Exception:
+                pass
+        info = {"conn": conn, "mode": mode}
+        _arc_db[botdir] = info
+        return info
+
+
+def _arc_start_worker():
+    """起后台 flush 线程（一次就够，全进程共用；守护线程，随进程退出）。"""
+    with _arc_lock:
+        if _arc_worker["on"]:
+            return
+        _arc_worker["on"] = True
+    try:
+        threading.Thread(target=_arc_loop, name="archive-flush", daemon=True).start()
+    except Exception as e:
+        _arc_worker["on"] = False
+        log("存档：flush 线程起不来（%r）→ 改为每条直接落盘" % e)
+
+
+def _arc_loop():
+    """后台：每 0.5 秒看一次缓冲 —— 够 20 条或最旧那条满 5 秒就 flush；顺带每天清理一次。"""
+    while True:
+        time.sleep(0.5)
+        try:
+            _arc_flush()
+        except Exception as e:
+            log("存档：后台 flush 异常（忽略）：%r" % e)
+        try:
+            _arc_daily()
+        except Exception as e:
+            log("存档：每日清理异常（忽略）：%r" % e)
+
+
+def _arc_daily(now=None):
+    """每天滚动清理一次（启动时已经清过一次，见 _arc_boot）。"""
+    now = time.time() if now is None else now
+    for botdir in list(_arc_db.keys()):
+        if now - float(_arc_trim_ts.get(botdir) or 0.0) < 86400:
+            continue
+        _arc_trim(botdir)
+
+
+def _arc_trim(botdir, days=0, per_chat=0):
+    """滚动删除：超保留期的一律删；每个会话超量的删最旧的。
+
+    → (按时间删掉几条, 按条数删掉几条)；days/per_chat 传 0 就用默认值
+    （默认 30 天 / 每会话 5000 条，没有「永久保留」开关）。
+    """
+    info = _arc_connect(botdir)
+    if info is None:
+        return 0, 0
+    days = int(days or _ARC_KEEP_DAYS)
+    per_chat = int(per_chat or _ARC_KEEP_PER_CHAT)
+    conn = info["conn"]
+    cutoff = int(time.time()) - days * 86400
+    n_old = 0
+    n_over = 0
+    with _arc_lock:
+        try:
+            n_old = int(conn.execute("DELETE FROM msg WHERE ts < ?", (cutoff,)).rowcount or 0)
+            rows = conn.execute(
+                "SELECT chat_type, chat_id, COUNT(*) FROM msg GROUP BY chat_type, chat_id"
+                " HAVING COUNT(*) > ?", (per_chat,)).fetchall()
+            for ct, cid, cnt in rows:
+                n_over += int(conn.execute(
+                    "DELETE FROM msg WHERE id IN (SELECT id FROM msg WHERE chat_type = ?"
+                    " AND chat_id = ? ORDER BY ts ASC, id ASC LIMIT ?)",
+                    (ct, cid, int(cnt) - per_chat)).rowcount or 0)
+            conn.commit()
+            _arc_trim_ts[str(botdir)] = time.time()
+        except Exception as e:
+            log("存档：滚动清理失败（忽略）：%r" % e, _arc_appid(botdir))
+            return 0, 0
+    if n_old or n_over:
+        log("存档清理：保留 %d 天 / 每会话 %d 条 → 删掉 %d 条（超期 %d + 超量 %d）"
+            % (days, per_chat, n_old + n_over, n_old, n_over), _arc_appid(botdir))
+    return n_old, n_over
+
+
+def _arc_boot(botdir):
+    """bot 启动时调一次：开库（顺带把 FTS5 探测结果写进日志）+ 至少清一次 + 起 flush 线程。"""
+    _arc_connect(botdir)
+    _arc_trim(botdir)
+    _arc_start_worker()
+
+
+def _arc_put(botdir, chat_type, chat_id, author_openid, text, author_name=""):
+    """收消息入缓冲（不阻塞回复）。空文本 / 空会话直接丢。"""
+    one = str(text or "").strip()
+    if not one or not botdir:
+        return
+    row = {
+        "botdir": str(botdir), "chat_type": str(chat_type or ""),
+        "chat_id": str(chat_id or ""), "author_openid": str(author_openid or ""),
+        "author_name": str(author_name or ""), "ts": int(time.time()),
+        "text": one, "reply_text": "", "done": False,
+    }
+    with _arc_lock:
+        _arc_buf.append(row)
+    _arc_start_worker()
+
+
+def _arc_flush(force=False):
+    """把缓冲落盘（20 条 / 5 秒 / force）→ 写了几条。"""
+    with _arc_lock:
+        if not _arc_buf:
+            return 0
+        now = time.time()
+        age = now - float(_arc_buf[0].get("ts") or now)
+        if not force and len(_arc_buf) < _ARC_FLUSH_N and age < _ARC_FLUSH_SEC:
+            return 0
+        rows = list(_arc_buf)
+        del _arc_buf[:]
+        n = 0
+        for r in rows:
+            info = _arc_connect(r["botdir"])
+            if info is None:
+                continue
+            try:
+                cur = info["conn"].execute(
+                    "INSERT INTO msg(chat_type, chat_id, author_openid, author_name, ts,"
+                    " text, reply_text) VALUES(?,?,?,?,?,?,?)",
+                    (r["chat_type"], r["chat_id"], r["author_openid"], r["author_name"],
+                     r["ts"], r["text"], r["reply_text"]))
+                rid = int(cur.lastrowid or 0)
+                if rid and not r["reply_text"]:
+                    # 只有「还没补过回复」的请求行才记下来，回复到了 UPDATE 它
+                    _arc_last[(r["botdir"], r["chat_type"], r["chat_id"])] = rid
+                n += 1
+            except Exception as e:
+                log("存档：写入失败（忽略）：%r" % e, _arc_appid(r["botdir"]))
+        for bd in set([r["botdir"] for r in rows]):
+            try:
+                _arc_db[bd]["conn"].commit()
+            except Exception:
+                pass
+        return n
+
+
+def _arc_reply(botdir, chat_type, chat_id, reply_text):
+    """给「刚收到的那条」补上这一轮发出的回复。
+
+    还没 flush → 直接改缓冲里那条（连 reply_text 一起落盘）；
+    已经落盘 → UPDATE 同一行。找不到请求行（例如主动问候、定时消息）就什么也不做。
+    """
+    one = str(reply_text or "").strip()
+    if not one or not botdir:
+        return False
+    key = (str(botdir), str(chat_type or ""), str(chat_id or ""))
+    with _arc_lock:
+        for r in reversed(_arc_buf):
+            if (r["botdir"], r["chat_type"], r["chat_id"]) == key and not r["done"]:
+                r["reply_text"] = one
+                r["done"] = True
+                return True
+        rid = _arc_last.get(key)
+        info = _arc_connect(key[0])
+        if not rid or info is None:
+            return False
+        try:
+            info["conn"].execute("UPDATE msg SET reply_text = ? WHERE id = ?", (one, rid))
+            info["conn"].commit()
+            return True
+        except Exception as e:
+            log("存档：补 reply_text 失败（忽略）：%r" % e, _arc_appid(key[0]))
+            return False
+
+
+def _arc_reply_by_key(botdir, key, reply_text):
+    """会话键 → (chat_type, chat_id)："g<群 openid>" / "p<对方 openid>"（与记忆同一套键）。"""
+    k = str(key or "")
+    if len(k) < 2:
+        return False
+    return _arc_reply(botdir, "group" if k[0] == "g" else "c2c", k[1:], reply_text)
+
+
+def _arc_fts_query(q):
+    """把自然语言切成 FTS5 认的词：每个词加引号，用 OR 连（查不到就退回 LIKE）。"""
+    toks = re.findall(r"[\w\u4e00-\u9fff]+", str(q or ""))[:8]
+    return " OR ".join(['"' + t.replace('"', "") + '"' for t in toks if t])
+
+
+def _arc_like(conn, q, n):
+    """LIKE 兜底检索：整库没有 FTS5，或关键词短于 3 个字喂不动 trigram 时用它。"""
+    like = "%" + str(q) + "%"
+    with _arc_lock:
+        return conn.execute(
+            "SELECT ts, author_openid, author_name, text, reply_text FROM msg"
+            " WHERE text LIKE ? OR reply_text LIKE ? ORDER BY ts DESC, id DESC LIMIT ?",
+            (like, like, int(n))).fetchall()
+
+
+def archive_search(botdir, query, n=0):
+    """检索存档 → (实际走的检索路径, 命中行列表[时间正序])。
+
+    路径写进日志：trigram / unicode61 / LIKE（整库没有 FTS5）/ trigram→LIKE（短词兜底）。
+    trigram 让中文子串走索引（「张伟提」能查到「张伟提过档期」）；但 trigram 要求关键词
+    ≥3 个字符，「张伟」这种两字词 MATCH 必然 0 条 —— 所以 MATCH 没命中时补一次 text LIKE，
+    日志里写清是哪条路命中的：宁可多查一次，也不要让「上周谁提过 X」问出来是空的。
+    """
+    n = int(n or _ARC_RECALL_N)
+    q = str(query or "").strip()
+    info = _arc_connect(botdir)
+    if info is None or not q:
+        return "", []
+    mode = info["mode"]
+    conn = info["conn"]
+    rows = []
+    if mode in ("trigram", "unicode61"):
+        mq = _arc_fts_query(q)
+        if mq:
+            try:
+                with _arc_lock:
+                    rows = conn.execute(
+                        "SELECT m.ts, m.author_openid, m.author_name, m.text, m.reply_text"
+                        " FROM msg_fts JOIN msg m ON m.id = msg_fts.rowid"
+                        " WHERE msg_fts MATCH ? ORDER BY m.ts DESC, m.id DESC LIMIT ?",
+                        (mq, n)).fetchall()
+            except Exception as e:
+                log("存档：FTS5 查询失败（%r）→ 本次退回 LIKE" % e, _arc_appid(botdir))
+                mode = "LIKE"
+        if mode != "LIKE":
+            if rows:
+                return mode, list(reversed(rows))
+            # trigram 要求关键词 ≥3 个字符：短词（「张伟」）MATCH 必然 0 条，补一次 LIKE
+            extra = _arc_like(conn, q, n)
+            return ((mode + "→LIKE") if extra else mode), list(reversed(extra))
+    return "LIKE", list(reversed(_arc_like(conn, q, n)))
+
+
+def _recall_line(r):
+    """一条存档 → 「[时间] 作者：原文」（单条截 200 字）。"""
+    ts, oid, name = r[0], r[1], r[2]
+    when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts or 0)))
+    who = str(name or "").strip() or (_oid8(oid) or "有人")
+    one = " ".join(str(r[3] or "").split())
+    if len(one) > _ARC_HIT_CHARS:
+        one = one[:_ARC_HIT_CHARS] + "…"
+    return "[%s] %s：%s" % (when, who, one)
+
+
+def _recall_block(rows):
+    """召回命中 → 拼进第二次请求的 system 段。"""
+    return ("（聊天存档里翻到的原文，只是参考：用它回答，别念时间戳、别说自己在查库）"
+            + chr(10) + chr(10).join([_recall_line(r) for r in rows]))
+
+
+def _strip_recall_marks(text):
+    """把 <recall>…</recall>（以及残缺的半截标记）从正文里剥掉 —— 用户不该看见。"""
+    return _ARC_RECALL_ANY_RE.sub("", _ARC_RECALL_MARK_RE.sub("", str(text or ""))).strip()
+
+
+_RECALL_HINT_RULE = (
+    chr(10) * 2 + "【要不要先翻聊天存档】" + chr(10) + chr(10).join([
+        "- 有人让你回忆以前聊过的事（例如「上周谁提过 X」「之前那件事是怎么说的」）时，"
+        "只输出一行 <recall>关键词</recall>，不要猜、不要编。",
+        "- 关键词只写要查的那个词或那件事，别写成整句话；中文给到 3 个字以上"
+        "（写「张伟提过档期」而不是「张伟」），太短的词本地索引翻不动。",
+        "- 不确定有没有，也可以先翻一次。",
+    ])
+)
+
+_RECALL_STOP = (
+    chr(10) * 2 + "【存档已经翻到了】" + chr(10) + chr(10).join([
+        "- 用下面这些原文回答，说清是谁、在什么时候说的；照旧用你自己的语气。",
+        "- 不要再输出 <recall>，也不要编存档里没有的事。",
+    ])
+)
+
+_RECALL_EMPTY = "（聊天存档里一条都没翻到：老实说没印象，别编。）"
+
+
+def archive_stats(botdir):
+    """设置页的占用快照：{"bytes": …, "rows": …, "mode": "FTS5"|"LIKE"}（JSON 串）。"""
+    botdir = str(botdir or "")
+    _arc_flush(force=True)
+    info = _arc_connect(botdir)
+    rows = -1
+    mode = ""
+    if info is not None:
+        mode = info["mode"]
+        try:
+            with _arc_lock:
+                rows = int(info["conn"].execute("SELECT COUNT(*) FROM msg").fetchone()[0] or 0)
+        except Exception:
+            rows = -1
+    return json.dumps({"bytes": _arc_bytes(_arc_path(botdir)), "rows": rows, "mode": mode},
+                      ensure_ascii=False)
+
+
+def archive_trim(botdir, days=0, per_chat=0):
+    """手动触发一次滚动清理（验收用；日常走 _arc_boot + _arc_daily）。"""
+    _arc_flush(force=True)
+    n_old, n_over = _arc_trim(botdir, days, per_chat)
+    return json.dumps({"expired": n_old, "over": n_over}, ensure_ascii=False)
+
+
+def archive_clear(botdir):
+    """清空本 bot 的存档（DELETE + VACUUM 收回文件大小）→ {"rows": …, "bytes": …}。"""
+    botdir = str(botdir or "")
+    info = _arc_connect(botdir)
+    if info is None:
+        return json.dumps({"rows": 0, "bytes": _arc_bytes(_arc_path(botdir))})
+    conn = info["conn"]
+    n = 0
+    with _arc_lock:
+        try:
+            # 缓冲里还没落盘的也算「清空」：一起丢掉，否则清完又冒出来几条
+            keep = [r for r in _arc_buf if r["botdir"] != botdir]
+            n = len(_arc_buf) - len(keep)
+            del _arc_buf[:]
+            _arc_buf.extend(keep)
+            for k in [k for k in list(_arc_last.keys()) if k[0] == botdir]:
+                del _arc_last[k]
+            n += int(conn.execute("DELETE FROM msg").rowcount or 0)
+            conn.commit()
+            try:
+                conn.execute("VACUUM")
+            except Exception:
+                pass
+        except Exception as e:
+            log("存档：清空失败：%r" % e, _arc_appid(botdir))
+            return json.dumps({"rows": 0, "bytes": _arc_bytes(_arc_path(botdir))})
+    log("存档已清空：删掉 %d 条，文件现在 %d 字节（%s）"
+        % (n, _arc_bytes(_arc_path(botdir)), _arc_path(botdir)), _arc_appid(botdir))
+    return json.dumps({"rows": n, "bytes": _arc_bytes(_arc_path(botdir))}, ensure_ascii=False)
+
+
+def archive_export_text(botdir, max_rows=0):
+    """导出正文：一行一条「[2026-11-03 20:11] 群/私聊 作者：消息 ⇢ 回复」。
+
+    时间正序（老的在前），最多 _ARC_EXPORT_MAX 行；界面上再拼 bot 标题。
+    """
+    botdir = str(botdir or "")
+    _arc_flush(force=True)
+    info = _arc_connect(botdir)
+    if info is None:
+        return ""
+    limit = int(max_rows or _ARC_EXPORT_MAX)
+    try:
+        with _arc_lock:
+            rows = info["conn"].execute(
+                "SELECT chat_type, author_openid, author_name, ts, text, reply_text FROM msg"
+                " ORDER BY ts ASC, id ASC LIMIT ?", (limit,)).fetchall()
+    except Exception as e:
+        log("存档：导出失败：%r" % e, _arc_appid(botdir))
+        return ""
+    if len(rows) >= limit:
+        log("存档导出：只导了最早的 %d 行（上限），后面还有" % limit, _arc_appid(botdir))
+    lines = []
+    for ct, oid, name, ts, text, reply in rows:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts or 0)))
+        kind = "群" if str(ct) == "group" else "私聊"
+        who = str(name or "").strip() or (_oid8(oid) or "有人")
+        one = " ".join(str(text or "").split())
+        rep = " ".join(str(reply or "").split())
+        lines.append("[%s] %s %s：%s" % (when, kind, who, one) + ((" ⇢ " + rep) if rep else ""))
+    return chr(10).join(lines)
+
+
 def _system_prompt(botdir, key):
-    """系统提示词：人格 → 称呼规则 → 当前时间 → 群聊硬规则。"""
-    persona = _persona(botdir)
+    """系统提示词：人格 → 称呼规则 → 当前时间 → 群聊硬规则。
+
+    人格走 _persona_for：该群配了 persona（groups/<gid>.json）就用群人格，否则仍是 bot 人格。
+    """
+    persona = _persona_for(botdir, key)
     sys = persona or "你是一个 QQ 群里的机器人，说话自然简短，像真人聊天。"
     sys = sys + _words_rules(botdir, key)
     sys = sys + chr(10) + chr(10) + "现在是 %s。" % _now_text()
@@ -1497,6 +2347,8 @@ def _build_messages(botdir, key, who, text, first=False, search_hint=False):
     sys_text = _system_prompt(botdir, key)
     if search_hint:
         sys_text = sys_text + _WEB_HINT_RULE
+    # 存档召回与联网并列：跟 web_search 开关无关（翻的是本机聊天记录，不花钱、不出网）
+    sys_text = sys_text + _RECALL_HINT_RULE
     msgs = [{"role": "system", "content": sys_text}]
     sm = _summary_of(botdir, key)
     summary = str(sm.get("summary") or "").strip()
@@ -1825,6 +2677,7 @@ def web_search(query, conf, appid="", count=_WEB_COUNT, meta=None, source="", ro
             log("联网(searxng)：没填搜索地址（search_base），无法搜索", appid)
             return []
         url = base + "/search?q=" + urllib.parse.quote(q) + "&format=json"
+        _usage_search(_usage_dir(appid))
         ok, d = _http_get_json(url, _search_headers(conf), appid,
                                "search「%s」" % q[:24], provider)
         rows = _norm_hits((d.get("results") if isinstance(d, dict) else d) or []) if ok else []
@@ -1836,10 +2689,12 @@ def web_search(query, conf, appid="", count=_WEB_COUNT, meta=None, source="", ro
             url = base.replace("{query}", urllib.parse.quote(q))
         else:
             url = base + ("&" if "?" in base else "?") + "q=" + urllib.parse.quote(q)
+        _usage_search(_usage_dir(appid))
         ok, d = _http_get_json(url, _search_headers(conf), appid,
                                "search「%s」" % q[:24], provider)
         rows = _norm_hits(_parse_fields(conf.get("search_fields"), d)) if ok else []
     else:
+        _usage_search(_usage_dir(appid))
         ok, d = _web_post(conf, "/tools/search",
                           {"query": q, "count": count, "need_content": True},
                           appid, "search「%s」" % q[:24], "deepseek")
@@ -1869,6 +2724,7 @@ def web_fetch(url, conf, appid=""):
         log("联网(%s)：这个后端不支持抓正文（#读 需要 DeepSeek 官方 Search/Fetch）"
             % provider, appid)
         return ""
+    _usage_search(_usage_dir(appid))
     ok, d = _web_post(conf, "/tools/fetch", {"url": u}, appid, "fetch %s" % u[:24], provider)
     if not ok:
         return ""
@@ -2236,6 +3092,7 @@ async def _local_web_cmd(appid, message, text, key="", group_openid="", botdir="
     非主人发来：完全不当指令（不搜索、不抓取、# 也不剥），整句按普通聊天走。
     botdir 用来读人格与主人 openid。
     """
+    _usage_appid.set(appid)          # 这条链路里的模型调用记到该 bot 账上
     kind, arg = _web_cmd_of(text)
     if not kind:
         return False
@@ -2268,6 +3125,12 @@ async def _local_web_cmd(appid, message, text, key="", group_openid="", botdir="
     if not conf.get("web_search_enabled", True):
         log("联网指令 %s 跳过：联网搜索已关闭（web_search_enabled=0），一个请求都不发" % kind, appid)
         await _send("联网搜索关着呢，去设置里打开再问我吧。")
+        return True
+    if not _group_web_on(botdir, group_openid):
+        # 主人也不行：群配置里显式关了联网，这条指令一个请求都不发
+        log("联网指令 #%s 被拒：该群已关闭联网（groups/%s.json web_search=false，主人也不行）"
+            % ("搜" if kind == "search" else "读", _oid8(group_openid)), appid)
+        await _send("这个群关掉了联网，去「bot 详情 → 群配置」里打开再问我吧。")
         return True
     style_on = bool(conf.get("search_persona_style", True))
     if kind == "search":
@@ -2505,6 +3368,10 @@ async def _send_all_groups(client, t, botdir=""):
     sent = 0
     failed = 0
     for oid in groups:
+        if not _group_conf(botdir, oid)["enabled"]:
+            log("定时消息跳过：群 %s 已静音（groups/%s.json enabled=false）"
+                % (_oid8(oid), _oid8(oid)), appid)
+            continue
         try:
             await client.api.post_group_message(group_openid=oid, msg_type=0, content=text)
             sent += 1
@@ -2908,6 +3775,223 @@ def _log_soft(msg):
         pass
 
 
+# ── 群级配置（<botdir>/groups/<group_openid>.json）──────────────────
+#
+# 一个群一份覆盖；**没有这份文件 = 这个群全部走 bot 全局配置**（升级后老用户零变化）。
+# 字段缺项 / null / 0 都是「跟随」，不是 false：
+#   {"auto_reply": true|null,   群里是否自动接话（覆盖该 bot 的覆盖值 / 全局开关）
+#    "daily_limit": 0,          本群每天最多回几条（0 = 不限），计数在 <botdir>/group_quota.json
+#    "web_search": true|null,   false = 本群禁止自判搜索与 #搜 / #读（主人也不行）
+#    "enabled": true}           false = 本群完全静默（回复 / 随机问候 / 定时群发都不发）
+# 群人格（persona / <gid>.persona.txt）已下线：人格恒取 bot 详情页那一份。
+# 群消息是每条都要过的热路径，所以读盘带缓存：文件 mtime / size 变了才重读。
+
+_GROUP_DEFAULT = {
+    "auto_reply": None,
+    "daily_limit": 0,
+    "web_search": None,
+    "enabled": True,
+}
+
+_group_cache = {}           # (botdir, gid) -> ((mtime_ns, size), conf)
+_group_lock = threading.Lock()
+
+
+def _groups_dir(botdir):
+    return os.path.join(str(botdir or ""), "groups")
+
+
+def _group_conf_path(botdir, gid):
+    """群配置文件的路径；gid 里出现路径分隔符就返回空串（绝不拿它去拼路径）。"""
+    gid = str(gid or "").strip()
+    if not gid or gid in (".", "..") or os.sep in gid or (os.altsep and os.altsep in gid):
+        return ""
+    return os.path.join(_groups_dir(botdir), gid + ".json")
+
+
+def _file_stamp(path):
+    try:
+        st = os.stat(path)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def _group_conf(botdir, gid):
+    """该群的覆盖配置（缺项 = 跟随全局）。没有这份文件 = 全部跟随全局。"""
+    path = _group_conf_path(botdir, gid)
+    if not path:
+        return dict(_GROUP_DEFAULT)
+    key = (str(botdir or ""), str(gid))
+    stamp = _file_stamp(path)
+    if stamp is None:
+        with _group_lock:
+            _group_cache.pop(key, None)
+        return dict(_GROUP_DEFAULT)
+    with _group_lock:
+        hit = _group_cache.get(key)
+        if hit and hit[0] == stamp:
+            return dict(hit[1])
+    raw = _load_json(path, {})
+    conf = dict(_GROUP_DEFAULT)
+    if isinstance(raw, dict):
+        for name in _GROUP_DEFAULT:
+            if name not in raw:
+                continue
+            v = raw.get(name)
+            if name in ("auto_reply", "web_search"):
+                conf[name] = v if isinstance(v, bool) else None
+            elif name == "enabled":
+                conf[name] = v if isinstance(v, bool) else True
+            elif name == "daily_limit":
+                try:
+                    conf[name] = max(0, int(v or 0))
+                except (TypeError, ValueError):
+                    conf[name] = 0
+    with _group_lock:
+        _group_cache[key] = (stamp, dict(conf))
+    return conf
+
+
+def _persona_for(botdir, _key):
+    """这一轮用的人格正文：群人格已下线，恒用 bot 详情页那一份。"""
+    return _persona(botdir)
+
+
+def _group_of_key(key):
+    """"g"+group_openid 这种会话键里的群 openid；不是群就返回空串。"""
+    s = str(key or "")
+    return s[1:].strip() if len(s) > 1 and s.startswith("g") else ""
+
+
+def _group_web_on(botdir, gid):
+    """本群允许联网吗：群配置 web_search 显式 false → False；null / 没有文件 → True。"""
+    gid = str(gid or "").strip()
+    if not gid:
+        return True
+    return _group_conf(botdir, gid).get("web_search") is not False
+
+
+# ── 群资料（群名 / 人数）：GET /v2/groups/{group_openid}/info ──────────
+#
+# 官方只有这一个口径能拿到群名（30 次/分钟）。凭据就是 bot 自己的 AppID/AppSecret：
+# 先换 app access token（与 botpy 登录同一套），再带 Authorization: QQBot <token> 调接口。
+# token 按 appid 缓存到过期前一分钟；失败一律返回 {"ok": false}，界面用 openid 兜底。
+_QQ_TOKEN_API = "https://bots.qq.com/app/getAppAccessToken"
+_QQ_GROUP_API = "https://api.sgroup.qq.com/v2/groups/%s/info"
+
+_gc_token_lock = threading.Lock()
+_gc_tokens = {}     # appid -> (access_token, expire_ts)
+
+
+def _app_access_token(appid, secret):
+    """取（并缓存）bot 的 app access token；失败返回空串。"""
+    appid = str(appid or "").strip()
+    secret = str(secret or "").strip()
+    if not appid or not secret:
+        return ""
+    now = time.time()
+    with _gc_token_lock:
+        hit = _gc_tokens.get(appid)
+        if hit and hit[0] and hit[1] - 60 > now:
+            return hit[0]
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            _QQ_TOKEN_API,
+            data=json.dumps({"appId": appid, "clientSecret": secret}).encode("utf-8"),
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=8) as r:
+            raw = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        log("群资料：取 token 失败 %r" % e)
+        return ""
+    token = str(raw.get("access_token") or "")
+    try:
+        ttl = int(raw.get("expires_in") or 7200)
+    except (TypeError, ValueError):
+        ttl = 7200
+    if not token:
+        log("群资料：token 响应里没有 access_token（%s）" % str(raw)[:120])
+        return ""
+    with _gc_token_lock:
+        _gc_tokens[appid] = (token, now + max(60, ttl))
+    return token
+
+
+def group_info(appid, secret, gid):
+    """一个群的资料：{"ok": true, "name": "…", "members": N}；拿不到就是 {"ok": false, "error": "…"}。
+
+    7 天缓存由界面侧（GroupConfigScreen → group_names.json）负责，这里只做网络与 token 缓存。
+    """
+    gid = str(gid or "").strip()
+    if not gid:
+        return json.dumps({"ok": False, "error": "没有群 openid"}, ensure_ascii=False)
+    token = _app_access_token(appid, secret)
+    if not token:
+        return json.dumps({"ok": False, "error": "取 token 失败"}, ensure_ascii=False)
+    try:
+        import urllib.request
+        req = urllib.request.Request(_QQ_GROUP_API % gid, method="GET", headers={
+            "Authorization": "QQBot " + token,
+            "X-Union-Appid": str(appid or "").strip(),
+        })
+        with urllib.request.urlopen(req, timeout=8) as r:
+            raw = json.loads(r.read().decode("utf-8", "replace"))
+    except Exception as e:
+        log("群资料：%s 读取失败 %r" % (_oid8(gid), e))
+        return json.dumps({"ok": False, "error": "请求失败：%r" % e}, ensure_ascii=False)
+    name = str(raw.get("group_name") or "").strip()
+    try:
+        members = int(raw.get("group_member_num") or 0)
+    except (TypeError, ValueError):
+        members = 0
+    if not name and not members:
+        return json.dumps(
+            {"ok": False, "error": "响应里没有群名（%s）" % str(raw)[:120]}, ensure_ascii=False)
+    return json.dumps({"ok": True, "name": name, "members": members}, ensure_ascii=False)
+
+
+def _group_quota_path(botdir):
+    return os.path.join(str(botdir or ""), "group_quota.json")
+
+
+def _group_quota_take(botdir, gid, limit):
+    """本群今天还能回吗：返回 (放行?, 今天已回条数)。放行时条数 +1 并落盘。
+
+    计数和群配置分开存（group_quota.json）：界面改配置、甚至删掉覆盖，都不会把当天的
+    计数冲掉。按群记 {gid: {"date": "YYYY-MM-DD", "n": N}}，跨天自然归零，
+    7 天没动过的行顺手裁掉。
+    """
+    gid = str(gid or "")
+    if not gid or not botdir or not os.path.isdir(str(botdir)):
+        return True, 0
+    path = _group_quota_path(botdir)
+    today = _day_str()
+    with _group_lock:
+        d = _load_json(path, {})
+        if not isinstance(d, dict):
+            d = {}
+        row = d.get(gid)
+        used = 0
+        if isinstance(row, dict) and str(row.get("date") or "") == today:
+            try:
+                used = int(row.get("n") or 0)
+            except (TypeError, ValueError):
+                used = 0
+        if limit > 0 and used >= limit:
+            return False, used
+        d[gid] = {"date": today, "n": used + 1}
+        keep = _day_str(-6)
+        for other in [k for k, v in d.items()
+                      if not isinstance(v, dict) or str(v.get("date") or "") < keep]:
+            d.pop(other, None)
+        _save_json(path, d)
+    return True, used + 1
+
+
 # ── 群消息闸门：作者过滤 / 回环 / @ 判定 / 限流 + 熔断 ──────────────
 #
 # 事故：群里 @ 一个 bot，4 个 bot 都回，互相触发 → 消息爆炸。
@@ -2934,18 +4018,71 @@ _rate = {}               # (appid, group) -> [ts, ...]
 _intent = {}             # group -> [ts, ...]（含被限流挡下的，熔断用）
 _mute = {}               # group -> 静音截止 ts
 _self_ids = {}           # appid -> set(appid / robot.id 这类登记来的 id)
-_autochat = {"on": False}  # 设置页「群里自动接话（默认关）」
+# 「群里自动接话」三层：全局开关（设置页那一行）+ 该 bot 的覆盖（Bot 编辑页三态）。
+# 判定优先级：群配置显式值 > 该 bot 覆盖 > 全局。
+_autochat = {"on": False}   # 全局开关（默认关）
+_autochat_override = {}     # appid -> "1" / "0"；没有键 = 跟随全局
 
 
-def set_group_autochat(on):
-    """Kotlin 侧 BotHost.startAll 在 start_all 之前推过来；默认关。"""
-    _autochat["on"] = bool(on)
-    log("群里自动接话：%s" % ("开" if _autochat["on"] else "关（默认只回 @）"))
+def set_group_autochat(appid="", override="", global_on=None):
+    """Kotlin 侧推过来：global_on = 全局开关；appid + override = 该 bot 的覆盖（"" = 跟随全局）。
+
+    老调用形式 set_group_autochat(True)（只有一个 bool）仍按「只改全局」处理。
+    """
+    global _autochat_hinted
+    if isinstance(appid, bool) or appid is None:
+        global_on = appid
+        appid, override = "", ""
+    if global_on is not None:
+        _autochat["on"] = bool(global_on)
+        if _autochat["on"]:
+            _autochat_hinted = False      # 再关回来时还允许提示一条
+    key = str(appid or "").strip()
+    if key:
+        v = str(override if override is not None else "").strip()
+        if v in ("1", "0"):
+            _autochat_override[key] = v
+        else:
+            _autochat_override.pop(key, None)
+    log("群里自动接话：全局%s｜该 bot 覆盖=%s｜生效：%s" % (
+        "开" if _autochat["on"] else "关（只回 @）",
+        _autochat_override_label(key),
+        "开" if _group_autochat_state(key, {})[0] else "关（只回 @）"))
     return "OK"
 
 
-def group_autochat():
-    return bool(_autochat["on"])
+def _autochat_override_label(appid):
+    """给人看的覆盖值：开 / 关 / 跟随全局。"""
+    v = _autochat_override.get(str(appid or "").strip(), "")
+    return "开" if v == "1" else ("关" if v == "0" else "跟随全局")
+
+
+def _group_autochat_state(appid, gc):
+    """该群的 auto_on 判定：群配置显式值 > 该 bot 覆盖 > 全局。返回 (on, 来源)。"""
+    if gc.get("auto_reply") is not None:
+        return bool(gc["auto_reply"]), "该群配置"
+    v = _autochat_override.get(str(appid or "").strip(), "")
+    if v in ("1", "0"):
+        return v == "1", "该 bot 覆盖"
+    return bool(_autochat["on"]), "全局"
+
+
+def group_autochat(appid=""):
+    """某 bot 的生效值（没有群上下文：只看覆盖 / 全局）。"""
+    return _group_autochat_state(appid, {})[0]
+
+
+_autochat_hinted = False
+
+
+def _hint_autochat_once(appid=""):
+    """群里自动接话关着时，本次进程只写一条提示（别每条消息刷屏）。"""
+    global _autochat_hinted
+    if _autochat_hinted or _group_autochat_state(appid, {})[0]:
+        return False
+    _autochat_hinted = True
+    log("提示：群里自动接话关闭，当前只回 @（可在设置里打开「群里自动接话」）", appid)
+    return True
 
 
 def _register_self_id(appid, *ids):
@@ -3341,6 +4478,12 @@ async def _handle_group(appid, botdir, message, tag):
     gid = str(getattr(message, "group_openid", "") or "")
     brief = "%s｜id=%s｜群=%s｜内容=%s" % (tag, mid[:12], gid[:8], text[:40])
 
+    # 闸 5 · 群级配置（<botdir>/groups/<gid>.json）：整群静音直接掐掉，后面几道闸都不用走
+    gc = _group_conf(botdir, gid)
+    if not gc["enabled"]:
+        log("跳过：该群已静音（groups/%s.json enabled=false）｜%s" % (_oid8(gid), brief), appid)
+        return
+
     # 闸 0 · 只有可信 @ 事件允许从正文猜 id；mentions.is_you=true 是平台判定，两种事件都学
     if trusted_at:
         _learn_own_ids(botdir, text)
@@ -3365,10 +4508,14 @@ async def _handle_group(appid, botdir, message, tag):
             log("跳过：判不出是否 @ 本 bot（%s｜%s）" % (why_at, brief), appid)
             return
         if state == "no":
-            if not _autochat["on"]:
-                log("跳过：未 @ 本 bot（%s），且「群里自动接话」关闭 → 默认只回 @（%s）"
-                    % (why_at, brief), appid)
+            # 三层判定：群配置显式值 > 该 bot 覆盖 > 全局（日志写清是哪一层判的）
+            auto_on, auto_src = _group_autochat_state(appid, gc)
+            if not auto_on:
+                log("跳过：未 @ 本 bot（%s），且「群里自动接话」关闭（判定来源：%s）"
+                    "→ 默认只回 @（%s）" % (why_at, auto_src, brief), appid)
                 return
+            # 开着也写清是哪一层判的（群配置 / 该 bot 覆盖 / 全局），便于核对三态
+            log("自动接话开（判定来源：%s）｜%s" % (auto_src, brief), appid)
             # 自动接话开着：交给「回复判定」（设置页那一行）决定要不要插话
             conf_j = _llm_conf(_base_dir) if _base_dir else None
             if not await _should_reply(conf_j, text):
@@ -3385,7 +4532,19 @@ async def _handle_group(appid, botdir, message, tag):
             log("%s（%s）" % (why_rate, brief), appid)
         return
 
+    # 闸 6 · 群级每日额度（groups/<gid>.json daily_limit，0 = 不限）：超了静默
+    limit = int(gc.get("daily_limit") or 0)
+    if limit > 0:
+        ok_quota, used = _group_quota_take(botdir, gid, limit)
+        if not ok_quota:
+            log("跳过：该群今日已回 %d 条，达到上限 %d 条 → 今日不再回复"
+                "（groups/%s.json daily_limit）｜%s" % (used, limit, _oid8(gid), brief), appid)
+            return
+
     log("%s：%s" % (tag, text[:60]), appid)
+    # 存档：过了作者过滤与复读闸的消息一律入库 —— 不为了这条要回复，只为以后能被回忆
+    # （没 @ 本 bot、判定不接的那些句子也照存，否则「上周谁提过 X」根本没东西可查）
+    _arc_put(botdir, "group", gid, (_author_ids(message) or [""])[0], _strip_mentions(text))
     try:
         _note_chat(botdir, "group", gid)
         for _id in _author_ids(message):
@@ -3426,10 +4585,12 @@ def _make_client(appid, secret, botdir):
             # @ 判定只认本 bot 自己的 id：appid 一定算，robot 上还有别的就一起登记
             _register_self_id(appid, getattr(self.robot, "id", None),
                               getattr(self.robot, "union_openid", None))
-            log("本 bot 的 @ 判定 id 集合：%s｜own_ids.json：%s｜群里自动接话：%s" % (
+            log("本 bot 的 @ 判定 id 集合：%s｜own_ids.json：%s｜群里自动接话：%s（全局%s / 该 bot 覆盖=%s）" % (
                 (",".join(sorted(_self_id_set(appid))[:4]) or "(空)")[:60],
                 (",".join(sorted(_own_ids(botdir))[:4]) or "(空，等可信 @ 事件学习)"),
-                "开" if _autochat["on"] else "关（默认只回 @）"), appid)
+                "开" if _group_autochat_state(appid, {})[0] else "关（默认只回 @）",
+                "开" if _autochat["on"] else "关",
+                _autochat_override_label(appid)), appid)
             # 定时消息 + 随机问候：上线后起一个循环，隔 30 秒看一次任务表
             try:
                 _spawn_sched(_sched_loop(self, appid, botdir))
@@ -3474,6 +4635,9 @@ def _make_client(appid, secret, botdir):
             if images:
                 log("私聊收到 %d 张图片附件" % len(images), appid)
             log("私聊：%s" % text[:60], appid)
+            # 存档：私聊收到的每一条都记（会话 id 就是对方的 user_openid）
+            _arc_put(botdir, "c2c", str(getattr(message.author, "user_openid", "") or ""),
+                     (_author_ids(message) or [""])[0], text)
             try:
                 # 采集：私聊对方的 user_openid；第一次私聊的人记成主人
                 for _id in _author_ids(message):
@@ -3520,6 +4684,7 @@ async def _reply(appid, botdir, key, who, incoming, images=None):
     LLM 没配（localbot/llm.json 缺失或没 key）时退回连通测试文案，
     这样至少能看出「收到消息了」，而不是静默不回复。
     """
+    _usage_appid.set(appid)          # 这条链路里的模型调用（含判定/识图/摘要/搜索合成）记到该 bot 账上
     if images and not incoming:
         incoming = "（发了张图）"
     conf = _llm_conf(_base_dir) if _base_dir else None
@@ -3540,7 +4705,13 @@ async def _reply(appid, botdir, key, who, incoming, images=None):
     try:
         # 上下文压缩：达到窗口 75% 才压一次（压完这次不再压，见 _maybe_compress）
         await _maybe_compress(botdir, key, appid)
-        web_on = bool(conf.get("web_search_enabled", True))
+        # 群级：该群 web_search=false 时自判搜索与触发词兜底一起关（#搜 / #读 在 _local_web_cmd 里另拦）
+        gid_key = _group_of_key(key)
+        group_web = _group_web_on(botdir, gid_key)
+        web_on = bool(conf.get("web_search_enabled", True)) and group_web
+        if not group_web and _needs_web(incoming or ""):
+            log("联网：该群已关闭联网（groups/%s.json web_search=false），本条跳过触发词搜索"
+                % _oid8(gid_key), appid)
         auto_decide = web_on and bool(conf.get("search_auto_decide", True))
         msgs = _build_messages(botdir, key, who, incoming, first=first, search_hint=auto_decide)
         # ① 触发词兜底：明显在问时效性内容就先搜一次（与「模型自判」互斥，一条消息只搜一次）
@@ -3548,6 +4719,23 @@ async def _reply(appid, botdir, key, who, incoming, images=None):
         if web_block:
             msgs.insert(len(msgs) - 1, {"role": "system", "content": web_block})
         text = await asyncio.to_thread(_call_llm_sync, conf, msgs)
+        # ①' 存档召回：模型只输出一行 <recall>关键词</recall> → 查本地库、拼进第二次请求。
+        #    最多 1 轮（不像联网能连续追问）：翻本机记录一次就够，翻到了也用不着再翻。
+        #    同一条回复里两种标记都出现时只认召回（先翻本地记录，再谈上网）。
+        rc = _ARC_RECALL_MARK_RE.search(text or "")
+        if rc:
+            rq = (rc.group(1) or "").strip()[:60]
+            rmode, rrows = await asyncio.to_thread(archive_search, botdir, rq, _ARC_RECALL_N)
+            log("存档召回：key=%s 「%s」→ %s" % (
+                key, rq, ("命中 %d 条（%s）" % (len(rrows), rmode)) if rrows
+                else ("未命中（%s）" % (rmode or "无库"))), appid)
+            second = (_recall_block(rrows) + _RECALL_STOP) if rrows else _RECALL_EMPTY
+            text = await asyncio.to_thread(
+                _call_llm_sync, conf, list(msgs) + [
+                    {"role": "assistant", "content": "<recall>%s</recall>" % rq},
+                    {"role": "system", "content": second}])
+            if text and _ARC_RECALL_ANY_RE.search(text):
+                text = _strip_recall_marks(text)
         # ② 模型自判：可以连续追问，一条消息最多 _SRCH_MAX 次搜索
         #    （成本护栏：首轮 1 次 + 每次追问后各 1 次 = 最多 6 次模型调用）
         asked = _WEB_MARK_RE.search(text or "")
@@ -3584,7 +4772,9 @@ async def _reply(appid, botdir, key, who, incoming, images=None):
                     list(msgs) + [{"role": "system",
                                   "content": "直接回答对方，或者老实说不清楚；"
                                              "不要输出任何 <search> 标记。"}])
-        # 标记永远不给用户看（关掉自判时模型也可能残留一个）
+        # 标记永远不给用户看（关掉自判时模型也可能残留一个；<recall> 同理，含残缺的半截标记）
+        if text and _ARC_RECALL_ANY_RE.search(text):
+            text = _strip_recall_marks(text)
         if text and _WEB_MARK_ANY_RE.search(text):
             text = _strip_search_marks(text)
         if not text and not rounds:
@@ -3603,6 +4793,8 @@ async def _reply(appid, botdir, key, who, incoming, images=None):
         text = _clean_reply(text)
         log("回复清洗：原 %d 字 → 现 %d 字" % (raw_len, len(text)), appid)
         _remember(botdir, key, "assistant", text)
+        # 存档：把这一轮发出去的话补到「刚收到那条」的 reply_text 上（一行 = 原文 ⇢ 回复）
+        _arc_reply_by_key(botdir, key, text)
         return text
     except Exception as e:
         log("调模型失败：%r" % e, appid)
@@ -3681,6 +4873,14 @@ def start_one(appid, secret, base_dir):
                 f.write("\n===== %s 启动 =====\n" % _stamp())
         except Exception:
             pass
+    # 消息存档：开库（顺带探测设备 SQLite 有没有 FTS5）、滚动清理一次、起 flush 线程。
+    # 放在 _log_path 之后：探测结果要进日志文件（「日志」页和验收都要看得见）。
+    try:
+        _arc_boot(botdir)
+    except Exception as e:
+        log("消息存档初始化失败（忽略，收发照常）：%r" % e, appid)
+    # 「群里只回 @」的一次性提示：状态页那行小字是界面侧，日志这边只在本次进程写一条
+    _hint_autochat_once(appid)
     gen = time.time()
     with _lock:
         _bots[appid] = {

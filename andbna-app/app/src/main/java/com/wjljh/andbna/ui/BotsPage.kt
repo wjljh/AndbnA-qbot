@@ -48,6 +48,7 @@ import com.wjljh.andbna.ui.component.PanelPrimaryButton
 import com.wjljh.andbna.ui.component.PanelScreen
 import com.wjljh.andbna.ui.component.PanelSecondaryButton
 import com.wjljh.andbna.ui.component.PanelTokens
+import com.wjljh.andbna.ui.component.cardOutline
 import com.wjljh.andbna.ui.component.material.SegmentedArrowItem
 import com.wjljh.andbna.ui.component.material.SegmentedContentItem
 import com.wjljh.andbna.ui.component.material.SegmentedDropdownItem
@@ -420,7 +421,7 @@ private fun BotCard(
     val summaryColor = PanelColors.onSurfaceVariantSummary
 
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().cardOutline(PanelTokens.CardRadius),
         cornerRadius = PanelTokens.CardRadius,
         insideMargin = PaddingValues(0.dp),
         // 整卡不可点：没有 onClick，也就不给按压反馈

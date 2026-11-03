@@ -84,6 +84,7 @@ import com.wjljh.andbna.ui.component.PanelPillRow
 import com.wjljh.andbna.ui.component.PanelPrimaryButton
 import com.wjljh.andbna.ui.component.PanelSecondaryButton
 import com.wjljh.andbna.ui.component.PanelTokens
+import com.wjljh.andbna.ui.component.panelStepTransition
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -97,18 +98,20 @@ import top.yukonga.miuix.kmp.icon.extended.Close
 import top.yukonga.miuix.kmp.icon.extended.Community
 import top.yukonga.miuix.kmp.icon.extended.Info
 import top.yukonga.miuix.kmp.icon.extended.Lock
+import top.yukonga.miuix.kmp.icon.extended.Messages
 import top.yukonga.miuix.kmp.icon.extended.Ok
 import top.yukonga.miuix.kmp.icon.extended.Timer
 import top.yukonga.miuix.kmp.icon.extended.Tune
 
 /**
- * 首次使用引导（5 步）。只有 debug 变体进得来，见 OnboardStore.required。
+ * 首次使用引导（6 步）。同一版只强制走一次，判定见 OnboardStore.required。
  *
- * 状态机是一个 Int：0 欢迎 → 1 选保活方式 → 2 真检测 → 3 模型配置（可跳过）→ 4 完成。
+ * 状态机是一个 Int：0 欢迎 → 1 @ 规则说明（不阻塞，点「知道了」就往下走）
+ * → 2 选保活方式 → 3 真检测 → 4 模型配置（可跳过）→ 5 完成。
  * 「跳过引导」与「开始使用」都只是回调 [onFinish]（由 App.kt 写 onboarded=true 再回主页），
  * 所以引导本身不落任何盘，模式走 ModeStore.set、模型走 llm_api/llm_key/llm_model 同一套键。
  *
- * 第 ③ 步不是动画：按第 ② 步选的方式真去问系统 ——
+ * 第 ④ 步不是动画：按第 ③ 步选的方式真去问系统 ——
  *  ADB → ShizukuShell.bind(pkg) + ShizukuShell.isWhitelisted(pkg)（真连 UserService 跑 dumpsys）
  *  root → RootHost.checkRoot() + RootHost.isWhitelisted(pkg)（真 su 一次再查白名单）
  *  普通 → 不需要额外权限（显式写明，不假检测）
@@ -119,16 +122,17 @@ import top.yukonga.miuix.kmp.icon.extended.Tune
  *  · 每步「大图标 + 27sp 大标题 + 15sp/22sp 说明」的 hero 区，上下各 24dp；
  *  · 步骤切换走 AnimatedContent，方向由 targetState 与 initialState 比较：
  *    slideInHorizontally(±宽/6) + fadeIn / slideOutHorizontally(∓宽/6) + fadeOut，tween(300)；
- *  · 第 ③ 步结果卡三态配色，卡高变化 animateContentSize(spring)，
+ *  · 第 ④ 步结果卡三态配色，卡高变化 animateContentSize(spring)，
  *    原始返回值收进默认收起的「详细信息」（PanelNotice mono）；
- *  · 第 ⑤ 步一张三行小结卡（保活方式 / 电池白名单 / 模型），行首通过或不通过的图标。
+ *  · 第 ⑥ 步一张三行小结卡（保活方式 / 电池白名单 / 模型），行首通过或不通过的图标。
  */
-private const val STEPS = 5
-private val STEP_TITLES = listOf("欢迎", "保活方式", "权限检测", "模型配置", "完成")
+private const val STEPS = 6
+private val STEP_TITLES = listOf("欢迎", "@ 规则", "保活方式", "权限检测", "模型配置", "完成")
 
 /** 每一步 hero 的图形与三态图标：全部取自 MiuixIcons，顶层建一次（不在 Composable 里现场构造 Vector）。 */
 private object OnboardIcons {
     val Welcome: ImageVector = MiuixIcons.Community
+    val AtRule: ImageVector = MiuixIcons.Messages
     val KeepAlive: ImageVector = MiuixIcons.Timer
     val Probe: ImageVector = MiuixIcons.Lock
     val Model: ImageVector = MiuixIcons.Tune
@@ -147,7 +151,7 @@ private enum class ProbeState(val label: String) {
 }
 
 /**
- * 通知权限三态（引导第 ③ 步底部的「通知权限」块）。
+ * 通知权限三态（引导第 ④ 步底部的「通知权限」块）。
  * API < 33 没有这个运行时权限，如实写「系统不需要单独授权」，不假装检测过。
  */
 private enum class NotifState(val label: String) {
@@ -194,11 +198,11 @@ fun OnboardingScreen(onFinish: () -> Unit) {
     val metrics = rememberMetrics()
 
     var step by remember { mutableIntStateOf(0) }
-    // 第 ② 步选的方式：默认取已落盘的值（没有就按 root 探测结果，与 ModeStore.initial 一致）
+    // 第 ③ 步选的方式：默认取已落盘的值（没有就按 root 探测结果，与 ModeStore.initial 一致）
     var mode by remember { mutableStateOf(ModeStore.get(ctx) ?: ModeStore.initial(ctx)) }
 
     var probe by remember { mutableStateOf(ProbeResult()) }
-    // 第 ② 步选 ADB 时的一句话说明（ADB 要等第 ③ 步授权+绑定成功才落盘）
+    // 第 ③ 步选 ADB 时的一句话说明（ADB 要等第 ④ 步授权+绑定成功才落盘）
     var modeNotice by remember { mutableStateOf("") }
     var detecting by remember { mutableStateOf(false) }
 
@@ -277,14 +281,21 @@ fun OnboardingScreen(onFinish: () -> Unit) {
         }
     }
 
-    // 进到第 ③ 步（或换了模式再回来）就真检测一次
+    // 进到「权限检测」那一步（或换了模式再回来）就真检测一次
     LaunchedEffect(step, mode) {
-        if (step == 2) detect()
+        if (step == 3) detect()
     }
 
     fun next() {
-        if (step == 3) vm.save(ctx)
+        if (step == 4) vm.save(ctx)
         if (step < STEPS - 1) step += 1 else onFinish()
+    }
+
+    // 第 ② 步（@ 规则）这页没别的动作，底部那颗主按钮就直接说「知道了」，点了照常下一页
+    val primaryLabel = when (step) {
+        1 -> "知道了"
+        STEPS - 1 -> "开始使用"
+        else -> "下一步"
     }
 
     Scaffold(
@@ -310,7 +321,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                     }
                 }
                 PanelPrimaryButton(
-                    text = if (step == STEPS - 1) "开始使用" else "下一步",
+                    text = primaryLabel,
                     modifier = Modifier.weight(1f),
                     onClick = { next() },
                 )
@@ -333,13 +344,14 @@ fun OnboardingScreen(onFinish: () -> Unit) {
             ) {
                 when (s) {
                     0 -> WelcomeStep()
-                    1 -> ModeStep(current = mode, notice = modeNotice) { picked ->
+                    1 -> AtRuleStep()
+                    2 -> ModeStep(current = mode, notice = modeNotice) { picked ->
                         probe = ProbeResult()
-                        // ADB 只是「打算用」：模式要不要真落盘由第 ③ 步的 ShizukuShell.switchToAdb
+                        // ADB 只是「打算用」：模式要不要真落盘由第 ④ 步的 ShizukuShell.switchToAdb
                         // 决定（授权 + 绑定都成功才写），这里写了就是没权限也自称 ADB 的半死状态
                         if (picked == RunMode.ADB) {
                             mode = picked
-                            modeNotice = "ADB 模式要先拿到 Shizuku 授权：第 ③ 步点「申请 Shizuku 授权」，" +
+                            modeNotice = "ADB 模式要先拿到 Shizuku 授权：第 ④ 步点「申请 Shizuku 授权」，" +
                                 "授权并绑定成功后才真正切过去；没成会保持原来的模式。"
                         } else {
                             ModeStore.set(ctx, picked)
@@ -347,7 +359,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                             modeNotice = ""
                         }
                     }
-                    2 -> ProbeStep(
+                    3 -> ProbeStep(
                         mode = mode,
                         probe = probe,
                         detecting = detecting,
@@ -365,11 +377,11 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                         },
                         onOpenNotifSettings = { openNotifSettings(ctx) },
                     )
-                    3 -> ModelStep(
+                    4 -> ModelStep(
                         metrics = metrics,
                         vm = vm,
                         scope = scope,
-                        onSkip = { step = 4 },
+                        onSkip = { step = STEPS - 1 },
                     )
                     else -> DoneStep(mode = mode, probe = probe, modelConfigured = vm.configured)
                 }
@@ -378,7 +390,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
     }
 }
 
-// ── 顶部：3dp 细进度条 + 第 N / 5 步 · 名字 + 跳过 ──────────────────────
+// ── 顶部：3dp 细进度条 + 第 N / 6 步 · 名字 + 跳过 ──────────────────────
 
 @Composable
 private fun OnboardHeader(step: Int, onSkip: () -> Unit) {
@@ -445,16 +457,9 @@ private fun OnboardHeader(step: Int, onSkip: () -> Unit) {
 
 // ── 方向感：前进往左推、后退往右推，各走 1/6 屏宽 ────────────────────────
 
-private fun AnimatedContentTransitionScope<Int>.onboardStepTransition(): ContentTransform {
-    val forward = targetState > initialState
-    val ms = PanelTokens.OnboardAnimMs
-    val enter = slideInHorizontally(tween(ms)) { full -> if (forward) full / 6 else -full / 6 } +
-        fadeIn(tween(ms))
-    val exit = slideOutHorizontally(tween(ms)) { full -> if (forward) -full / 6 else full / 6 } +
-        fadeOut(tween(ms))
-    // clip = false：两步高度不同时不要在中途咔嚓裁一刀
-    return (enter togetherWith exit).using(SizeTransform(clip = false))
-}
+private fun AnimatedContentTransitionScope<Int>.onboardStepTransition(): ContentTransform =
+    // 过渡本体在 component/PanelTransition.kt：群配置的二级页用的是同一份（别自造第二套）
+    panelStepTransition(forward = targetState > initialState)
 
 // ── hero：大图标 + 大标题 + 说明，上下各 24dp ─────────────────────────────
 
@@ -552,7 +557,71 @@ private fun ColumnScope.WelcomeStep() {
     )
 }
 
-// ── ② 选保活方式 ──────────────────────────────────────────────────────
+// ── ② @ 规则说明：群里默认只回 @，两个开关各在哪（不阻塞，点「知道了」就走） ────
+
+/**
+ * 用户反馈「bot 必须 @ 才回」：那是设计（群里「自动接话」默认关），但入口藏得深。
+ * 这页只讲清楚默认行为和两个开关的位置，不替用户改任何设置 —— 点「知道了」就下一页。
+ */
+private val AT_RULE_POINTS = listOf(
+    "群里默认只有 @ 它时才回" to
+        "不 @ 就不出声，免得刷屏 —— 不是坏了，默认就是这样。",
+    "想让它自己判断要不要接话" to
+        "Bot → 编辑 → 打开「群里自动接话」",
+    "只想让某些群活跃" to
+        "Bot → 编辑 → 群配置 → 单独给那个群开，别的群保持安静。",
+)
+
+@Composable
+private fun ColumnScope.AtRuleStep() {
+    StepHero(
+        icon = OnboardIcons.AtRule,
+        title = "群聊里它默认只回 @",
+        body = "群里被 @ 才开口，这是默认行为；要不要它自己接话，开关在 bot 编辑页里。",
+    )
+    PanelGroupCard {
+        AT_RULE_POINTS.forEachIndexed { index, point ->
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(top = if (index == 0) 0.dp else PanelTokens.ContentGap),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Icon(
+                    imageVector = OnboardIcons.Pass,
+                    contentDescription = null,
+                    tint = PanelColors.primary,
+                    modifier = Modifier.size(PanelTokens.OnboardDetailGlyph),
+                )
+                Column(modifier = Modifier.padding(start = PanelTokens.InfoIconGap)) {
+                    Text(
+                        text = point.first,
+                        fontSize = PanelTokens.OnboardListTitleSize,
+                        fontWeight = FontWeight.Medium,
+                        color = PanelColors.onBackground,
+                    )
+                    Text(
+                        text = point.second,
+                        fontSize = PanelTokens.OnboardListNoteSize,
+                        lineHeight = PanelTokens.OnboardHeroBodyLineHeight,
+                        color = PanelColors.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = PanelTokens.InfoValueGap),
+                    )
+                }
+            }
+        }
+    }
+    Text(
+        text = "点「知道了」继续，这两处开关随时能在 Bot 编辑页里改。",
+        fontSize = PanelTokens.OnboardWelcomeSize,
+        lineHeight = PanelTokens.OnboardHeroBodyLineHeight,
+        color = PanelColors.onSurfaceVariantSummary,
+        textAlign = TextAlign.Center,
+        modifier = Modifier.fillMaxWidth().padding(horizontal = PanelTokens.ContentGap),
+    )
+}
+
+// ── ③ 选保活方式 ──────────────────────────────────────────────────────
 
 @Composable
 private fun ColumnScope.ModeStep(
@@ -595,7 +664,7 @@ private fun ColumnScope.ModeStep(
     }
 }
 
-// ── ③ 真检测 ──────────────────────────────────────────────────────────
+// ── ④ 真检测 ──────────────────────────────────────────────────────────
 
 @Composable
 private fun stateTint(state: ProbeState): Color = when (state) {
@@ -626,7 +695,7 @@ private fun ColumnScope.ProbeStep(
     StepHero(
         icon = OnboardIcons.Probe,
         title = "权限检测",
-        body = "按第 ② 步选的方式，真的去问系统要一次结论 —— 原始返回值都留着，不是预估。",
+        body = "按第 ③ 步选的方式，真的去问系统要一次结论 —— 原始返回值都留着，不是预估。",
     )
     var detailOpen by remember { mutableStateOf(false) }
     val tint = stateTint(probe.state)
@@ -771,7 +840,7 @@ private fun ColumnScope.ProbeStep(
 }
 
 /**
- * 第 ③ 步的「用电脑 adb」栏（只在 ADB 模式显示）：Shizuku 没跑起来时用电脑把服务启动起来，
+ * 第 ④ 步的「用电脑 adb」栏（只在 ADB 模式显示）：Shizuku 没跑起来时用电脑把服务启动起来，
  * 顺手把本应用加进电池白名单。
  *
  * 包名取 ctx.packageName —— release 是 com.wjljh.andbna.qbot，debug 是另一个包名，
@@ -830,7 +899,7 @@ private fun ColumnScope.AdbCommandCard() {
     }
 }
 
-// ── ③-b 通知权限（被动申请，不阻塞流程）────────────────────────────────
+// ── ④-b 通知权限（被动申请，不阻塞流程）────────────────────────────────
 
 /** 拒绝之后显示的声明：两句话，说清「只用来显示运行状态、关掉不影响 bot」。 */
 private const val NOTIF_STATEMENT =
@@ -919,7 +988,7 @@ private fun ColumnScope.NotifPermCard(
     }
 }
 
-// ── ④ 模型配置（可跳过）────────────────────────────────────────────────
+// ── ⑤ 模型配置（可跳过）────────────────────────────────────────────────
 
 /** 与 ModelConfigScreen 写的是同一套键（llm_api / llm_key / llm_model），识图模型不在这里碰。 */
 private class ModelStepVm(ctx: Context) {
@@ -1032,7 +1101,7 @@ private fun ColumnScope.ModelStep(
     }
 }
 
-// ── ⑤ 完成：三行小结卡 + 欢迎语 ────────────────────────────────────────
+// ── ⑥ 完成：三行小结卡 + 欢迎语 ────────────────────────────────────────
 
 @Composable
 private fun SummaryRow(

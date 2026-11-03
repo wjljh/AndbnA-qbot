@@ -160,12 +160,18 @@ object StatusColors {
     /** 淡底叠加强度：10%。 */
     const val TintAlpha: Float = 0.10f
 
+    /** 浅色专用的 idle 灰：原 #9E9AA0 压在 10% 淡底上只有 2.4:1，「未启动」胶囊几乎读不出来。 */
+    val IdleAccentLight: Color = Color(0xFF6A666D)
+
     @Composable
     fun accent(tone: StatusTone): Color = when (tone) {
         StatusTone.Ok -> OkAccent
         StatusTone.Warn -> WarnAccent
         StatusTone.Error -> ErrorAccent
-        StatusTone.Idle -> IdleAccent
+        // 浅色加深一档深色原样：胶囊文字与淡底都读这一个值
+        StatusTone.Idle ->
+            if (MiuixTheme.colorScheme.surfaceContainer.luminance() >= 0.5f) IdleAccentLight
+            else IdleAccent
     }
 
     /**
@@ -175,9 +181,14 @@ object StatusColors {
     @Composable
     fun surface(tone: StatusTone): Color {
         val container = MiuixTheme.colorScheme.surfaceContainer
+        val dark = container.luminance() < 0.5f
         if (tone == StatusTone.Ok) {
-            return if (container.luminance() < 0.5f) OkSurfaceDark else OkSurfaceLight
+            return if (dark) OkSurfaceDark else OkSurfaceLight
         }
+        // 浅色下 10% 灰叠在白卡上只有 #F5F5F5，和页面底 #EFEFF4/#F7F7F7 几乎同色，hero 边界直接消失；
+        // 浅色这一档退回白卡，边界交给 1dp 描边（StatusHeroCard 的 cardOutline）。
+        // 深色不动：叠加后的淡底在深色里是有意义的层次。
+        if (tone == StatusTone.Idle && !dark) return container
         return accent(tone).copy(alpha = TintAlpha).compositeOver(container)
     }
 }

@@ -1,10 +1,12 @@
 package com.wjljh.andbna.ui
 
 import android.Manifest
+import android.content.Context
 import android.os.Build
 import android.util.Log
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -36,14 +38,20 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.layout.Placeable
+import androidx.compose.ui.layout.SubcomposeLayout
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import com.wjljh.andbna.BuildConfig
 import com.wjljh.andbna.local.AdbHost
 import com.wjljh.andbna.local.BotHost
 import com.wjljh.andbna.local.BotService
@@ -55,6 +63,8 @@ import com.wjljh.andbna.local.RunMode
 import com.wjljh.andbna.local.ShizukuAuth
 import com.wjljh.andbna.local.ShizukuShell
 import com.wjljh.andbna.local.ShizukuState
+import com.wjljh.andbna.local.UpdateDownloadService
+import com.wjljh.andbna.local.Updater
 import com.wjljh.andbna.ui.component.PanelAnimatedNotice
 import com.wjljh.andbna.ui.component.PanelGroupCard
 import com.wjljh.andbna.ui.component.PanelInfoRow
@@ -67,13 +77,16 @@ import com.wjljh.andbna.ui.component.PanelSecondaryButton
 import com.wjljh.andbna.ui.component.PanelStatCard
 import com.wjljh.andbna.ui.component.PanelTertiaryButton
 import com.wjljh.andbna.ui.component.PanelTokens
+import com.wjljh.andbna.ui.component.cardOutline
 import com.wjljh.andbna.ui.design.StatusColors
 import com.wjljh.andbna.ui.design.StatusTone
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import java.util.Locale
 import org.json.JSONArray
+import org.json.JSONObject
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.basic.Icon
@@ -118,6 +131,15 @@ private fun LocalStatusContent(
 ) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
+
+    // 自动检查更新：一个进程最多查一次（真正的 24 小时节流在 Updater.autoCheck 里），
+    // 开关关着就一次网络请求都不发。查到新版本 → hero 下面出一张提示卡。
+    LaunchedEffect(Unit) {
+        UpdateRuntime.triggerOnce(ctx, BuildConfig.VERSION_NAME)
+    }
+    val pendingUpdate = UpdateRuntime.release
+    var updateDialog by remember { mutableStateOf(false) }
+
     // 用户真正选的模式：存过就用存的，没选过才回退到 initial() 的 root 探测推断
     // （不用 remember：ModeStore.get 只是一次内存里的 prefs 读，initial 的 su 探测在 RootHost 里也只跑一次）
     val curMode = mode ?: ModeStore.get(ctx) ?: ModeStore.initial(ctx)
@@ -132,6 +154,9 @@ private fun LocalStatusContent(
         )
     }
     var botCount by remember { mutableIntStateOf(0) }
+    // 今日用量/花费（成本统计）：全部来自上游（usage + 余额差值），复用下面那条轮询，每 3 轮 ≈10 秒取一次
+    var cost by remember { mutableStateOf<CostSnapshot?>(null) }
+    var costTick by remember { mutableIntStateOf(0) }
     // hero 副标题显示运行时长：第一次判定为 running 的时刻（毫秒）
     var runSince by remember { mutableLongStateOf(0L) }
     // 服务启动时间（落盘）：来自 BotService.onCreate，跨 Compose 重组/切页/进程重启都不丢
@@ -184,6 +209,9 @@ private fun LocalStatusContent(
             pullText = withContext(Dispatchers.IO) { PullBack.statusText(ctx, curMode) }
             svcSince = withContext(Dispatchers.IO) { Prefs.get(ctx, "svc_started_at").toLongOrNull() ?: 0L }
             tick = System.currentTimeMillis()
+            // 成本快照：3 轮取一次（轮询一格 3 秒），用计数取模，不新起循环
+            costTick++
+            if (costTick % 3 == 1) cost = withContext(Dispatchers.IO) { loadCost(ctx) }
             // 启动阶段更快：还没跑起来时 1 秒一次，跑起来后 3 秒一次，省电
             val up = status.contains("已上线") || status.contains("连接中")
             if (up && runSince == 0L) runSince = System.currentTimeMillis()
@@ -252,9 +280,23 @@ private fun LocalStatusContent(
                 title = heroTitle,
                 subtitle = heroSubtitle,
                 modeLabel = heroMode,
+                costCandidates = costCandidates(cost),
                 tone = tone,
                 onClick = onOpenDetail,
             )
+        }
+
+        // 发现新版本：临时提示卡紧贴 hero（Notice 级 = tertiaryContainer，与错误红卡分开）。
+        // 卡上只留一行字，点它弹详情对话框（不直接开始下载）；
+        // 「忽略此版本」只在对话框里给（见下方 UpdateDialog.onIgnore），卡上不再放第二个入口。
+        if (pendingUpdate != null) item(key = "update") {
+            Box(Modifier.fillMaxWidth().clickable { updateDialog = true }) {
+                Note(
+                    text = "发现新版本 " + pendingUpdate.versionName +
+                        "（当前 " + BuildConfig.VERSION_NAME + "）· 点击查看",
+                    ok = true,
+                )
+            }
         }
 
         if (msg.isNotBlank()) item(key = "notice") {
@@ -376,12 +418,32 @@ private fun LocalStatusContent(
         if (curMode == RunMode.ROOT) item(key = "root") { RootCard() }
         if (curMode == RunMode.ADB) item(key = "adb") { AdbCard() }
     }
+
+    // 更新详情：标题「发现新版本 X（当前 Y）」+ Markdown 正文 + 更新 / 取消 / 忽略此版本
+    if (updateDialog && pendingUpdate != null) {
+        UpdateDialog(
+            current = BuildConfig.VERSION_NAME,
+            newer = pendingUpdate,
+            onUpdate = {
+                updateDialog = false
+                UpdateDownloadService.start(
+                    ctx, pendingUpdate.apkUrl, pendingUpdate.apkName, pendingUpdate.size,
+                )
+            },
+            onIgnore = {
+                Updater.ignoreVersion(ctx, pendingUpdate.versionName)
+                UpdateRuntime.clear()
+                updateDialog = false
+            },
+            onDismiss = { updateDialog = false },
+        )
+    }
 }
 
 // ── 页面内私有拼装 ──────────────────────────────────────────────────────────
 
 /**
- * hero 中等卡：110dp 最小高 + 状态色淡底 + 右下角 92dp 状态图标。
+ * hero 中等卡：110dp 最小高 + 状态色淡底 + 右上角 92dp 状态图标 + 底部通栏用量小字。
  *
  * 左上角先放运行模式胶囊（SukiSU「Built-in」的位置），底下才是 22sp SemiBold 主标题
  * 与 14sp 副标题。可点（进 hero 详情）→ Tilt 按压反馈、无水波。
@@ -391,6 +453,8 @@ private fun StatusHeroCard(
     title: String,
     subtitle: String,
     modeLabel: String,
+    /** 下段那行用量小字的候选（从全到简，宽度够的取第一条；空表就不显示） */
+    costCandidates: List<String>,
     tone: StatusTone,
     onClick: () -> Unit,
 ) {
@@ -404,7 +468,7 @@ private fun StatusHeroCard(
         else -> PanelColors.onSurfaceVariantSummary
     }
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().cardOutline(PanelTokens.CardRadius),
         cornerRadius = PanelTokens.CardRadius,
         insideMargin = androidx.compose.foundation.layout.PaddingValues(0.dp),
         colors = CardDefaults.defaultColors(color = StatusColors.surface(tone)),
@@ -412,41 +476,88 @@ private fun StatusHeroCard(
         showIndication = false,
         onClick = onClick,
     ) {
+        // 图标贴右上角（垂直对齐胶囊那一行）；下面每一行都是**同一宽度**（卡内左右各 16dp），
+        // 所以上下两段的左右边界完全一致，不会出现「上窄下宽」。
         Box(Modifier.fillMaxWidth().heightIn(min = PanelTokens.HeroMinHeight)) {
+            // 图标完整落在卡内：距上边、右边各 16dp（= HeroPadding），不靠卡片圆角裁切。
             Icon(
                 imageVector = icon,
                 contentDescription = null,
                 tint = iconTint,
                 modifier = Modifier
-                    .align(Alignment.BottomEnd)
-                    .offset(x = PanelTokens.HeroIconOffsetX, y = PanelTokens.HeroIconOffsetY)
-                    .size(PanelTokens.HeroIconSize),
+                    .align(Alignment.TopEnd)
+                    .padding(top = PanelTokens.HeroPadding, end = PanelTokens.HeroPadding)
+                    .size(PanelTokens.HeroIconInnerSize),
             )
             Column(
                 modifier = Modifier
-                    .align(Alignment.CenterStart)
-                    .padding(horizontal = PanelTokens.HeroPadding),
-                verticalArrangement = Arrangement.spacedBy(PanelTokens.HeroTextGap),
+                    .fillMaxWidth()
+                    .padding(
+                        start = PanelTokens.HeroPadding,
+                        end = PanelTokens.HeroPadding,
+                        top = PanelTokens.HeroPadding,
+                        bottom = PanelTokens.HeroCostBottomPadding,
+                    ),
             ) {
-                PanelModePill(text = modeLabel, tint = accent)
-                Text(
-                    text = title,
-                    fontSize = PanelTokens.HeroTitleSize,
-                    lineHeight = PanelTokens.HeroTitleLineHeight,
-                    fontWeight = FontWeight.SemiBold,
-                    color = PanelColors.onSurface,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    text = subtitle,
-                    fontSize = PanelTokens.HeroSubtitleSize,
-                    color = PanelColors.onSurfaceVariantSummary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                )
+                Column(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalArrangement = Arrangement.spacedBy(PanelTokens.HeroTextGap),
+                ) {
+                    PanelModePill(text = modeLabel, tint = accent)
+                    Text(
+                        text = title,
+                        fontSize = PanelTokens.HeroTitleSize,
+                        lineHeight = PanelTokens.HeroTitleLineHeight,
+                        fontWeight = FontWeight.SemiBold,
+                        color = PanelColors.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        text = subtitle,
+                        fontSize = PanelTokens.HeroSubtitleSize,
+                        color = PanelColors.onSurfaceVariantSummary,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                }
+                if (costCandidates.isNotEmpty()) {
+                    CostLineText(
+                        costCandidates,
+                        Modifier.padding(top = PanelTokens.HeroCostTopGap),
+                    )
+                }
             }
         }
+    }
+}
+
+/**
+ * hero 下段那行用量：**永远单行**、通栏（与上面几行同宽），不做任何折行 / 换行。
+ *
+ * 候选按「全 → 简」排好，逐个用真 Text 量一次（不受字体度量差异影响），取第一条放得下的；
+ * 都放不下就退到最短那条（只剩次数）。maxLines=1 + clip 保证任何数据下都不折行、不越界。
+ */
+@Composable
+private fun CostLineText(candidates: List<String>, modifier: Modifier = Modifier) {
+    SubcomposeLayout(modifier.fillMaxWidth().clipToBounds()) { constraints ->
+        val avail = constraints.maxWidth
+        var placeable: Placeable? = null
+        for ((i, s) in candidates.withIndex()) {
+            val p = subcompose(i) {
+                Text(
+                    text = s,
+                    fontSize = PanelTokens.HeroCostSize,
+                    lineHeight = PanelTokens.HeroCostLineHeight,
+                    color = PanelColors.onSurfaceVariantSummary,
+                    maxLines = 1,
+                )
+            }.first().measure(Constraints())
+            placeable = p
+            if (p.width <= avail) break
+        }
+        val h = placeable?.height ?: 0
+        layout(avail, h) { placeable?.place(0, 0) }
     }
 }
 
@@ -462,6 +573,96 @@ private fun MonoText(text: String) {
 }
 
 private fun countText(n: Int): String = if (n < 0) "—" else n.toString()
+
+// ── 成本统计（今日用量）────────────────────────────────────────────────────
+//
+// 数据全部来自上游，本地不存价格表：
+//   · 次数 / token ← chat/completions 响应的 usage（Python 侧按日期+用途累加到 usage.json）
+//   · 金额 ← 今日首次余额 − 当前余额（GET /user/balance，每 10 分钟最多查一次）
+// 余额查不到就是 null，这一行只显示次数与 token。
+
+/** bot_runner.cost_snapshot 的解析结果（今日）。 */
+internal data class CostSnapshot(
+    val calls: Int,
+    val inTokens: Long,
+    val outTokens: Long,
+    /** 今日花费（元）；null = 没有余额数据 / 上次查询失败 */
+    val yuan: Double?,
+    val searchCalls: Int,
+)
+
+
+
+internal fun parseCost(json: String): CostSnapshot? = runCatching {
+    if (json.isBlank()) return null
+    val o = JSONObject(json)
+    CostSnapshot(
+        calls = o.optInt("calls"),
+        inTokens = o.optLong("in_tokens"),
+        outTokens = o.optLong("out_tokens"),
+        yuan = if (o.isNull("today_cost_yuan")) null else o.optDouble("today_cost_yuan"),
+        searchCalls = o.optInt("search_calls"),
+    )
+}.getOrNull()
+
+/**
+ * 把所有启用中的 bot 的快照加起来：次数与 token 求和，金额取第一个非空值
+ * （金额是账号级的余额差值，多个 bot 共用一个 Key 时不能相加，否则重复计算）。
+ */
+private fun loadCost(ctx: Context): CostSnapshot? {
+    var calls = 0
+    var tin = 0L
+    var tout = 0L
+    var searches = 0
+    var yuan: Double? = null
+    var any = false
+    for (b in BotStore.load(ctx).filter { it.enabled }) {
+        val s = parseCost(BotHost.costSnapshot(ctx, b.appid)) ?: continue
+        any = true
+        calls += s.calls
+        tin += s.inTokens
+        tout += s.outTokens
+        searches += s.searchCalls
+        if (yuan == null) yuan = s.yuan
+    }
+    return if (any) CostSnapshot(calls, tin, tout, yuan, searches) else null
+}
+
+/** token 数：≥10000 用「X.X万」（hero 一行放得下的紧凑写法），否则原样。 */
+internal fun tokText(n: Long): String = when {
+    n >= 100_000_000L -> String.format(Locale.US, "%.1f亿", n / 100_000_000.0)
+    n >= 10_000L -> String.format(Locale.US, "%.1f万", n / 10_000.0)
+    else -> n.toString()
+}
+
+/**
+ * hero 下段那行的候选，从「全都有」到「只留次数+金额」，按顺序试到放得下为止：
+ *   今日 42 次 · 12.7万/2.2万 tok · 约 ¥0.42（余额差值估算） · 联网 6 次
+ * 数字太长就省掉 tokens 段（次数 / 金额 / 联网优先），永远单行。
+ * 金额为 null（余额查不到）时金额段消失；整句口径说明在「设置 → 关于」页底部。
+ */
+internal fun costCandidates(c: CostSnapshot?): List<String> {
+    if (c == null) return emptyList()
+    if (c.calls <= 0 && c.inTokens == 0L && c.outTokens == 0L) return listOf("今日暂无调用")
+    val head = "今日 ${c.calls} 次"
+    val toks = "${tokText(c.inTokens)}/${tokText(c.outTokens)} tok"
+    val toksShort = "${tokText(c.inTokens)}/${tokText(c.outTokens)}"
+    val money = c.yuan?.let { String.format(Locale.US, "约 ¥%.2f", it) }
+    val net = if (c.searchCalls > 0) "联网 ${c.searchCalls} 次" else null
+    fun line(vararg parts: String?): String =
+        parts.filterNotNull().filter { it.isNotBlank() }.joinToString(" · ")
+    // 通栏宽度下正常态能全放下；放不下才按序省：
+    //   ① 去掉「 tok」两个字 ② 去掉「今日」 ③ 省 tokens 段（次数/金额/联网优先）④ 省联网 ⑤ 只剩次数
+    // 字号与图标位一律不动（拍板要求）。
+    return listOf(
+        line(head, toks, money, net),
+        line(head, toksShort, money, net),
+        line("${c.calls} 次", toksShort, money, net),
+        line(head, money, net),
+        line(head, money),
+        line(head),
+    ).distinct()
+}
 
 /**
  * 把 Python 自检的多行依赖清单压成一行结论；完整清单只写日志（前缀「自检：」）。

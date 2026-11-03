@@ -1,0 +1,5 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 只暴露 cacheDir/update：系统安装器回退路径要读这个 apk，别的目录一概不给 -->
+<paths>
+    <cache-path name="update" path="update/" />
+</paths>

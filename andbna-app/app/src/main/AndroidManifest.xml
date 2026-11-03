@@ -16,6 +16,8 @@
     <!-- 让系统在本 App 窗口上隐藏第三方 overlay（MIUI 的 securitycenter 浮窗就是左侧那条竖线） -->
     <uses-permission android:name="android.permission.HIDE_OVERLAY_WINDOWS" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+    <!-- 自更新：普通模式用 PackageInstaller / 系统安装器装新包（没有它只能走 root/Shizuku） -->
+    <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
 
     <queries>
         <package android:name="moe.shizuku.privileged.api" />
@@ -45,10 +47,42 @@
             </intent-filter>
         </activity>
 
+        <!-- 看门狗（shell 通道）用的无界面跳板：BotService 不导出，shell 起不来它，
+             只能由 shell start 这个 exported 的 Activity 间接把服务拉起来。
+             不接任何外部参数、不进最近任务、NoDisplay 不闪界面。 -->
+        <activity
+            android:name=".local.WakeActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:launchMode="singleInstance"
+            android:theme="@android:style/Theme.NoDisplay" />
+
         <service
             android:name=".local.BotService"
             android:exported="false"
             android:foregroundServiceType="dataSync" />
+
+        <!-- 更新包下载：前台服务 + 通知进度（独立通道「更新下载」） -->
+        <service
+            android:name=".local.UpdateDownloadService"
+            android:exported="false"
+            android:foregroundServiceType="dataSync" />
+
+        <!-- PackageInstaller 的 commit 回执（结果只进日志）；不导出，外部叫不到 -->
+        <receiver
+            android:name=".local.UpdateInstallReceiver"
+            android:exported="false" />
+
+        <!-- 系统安装器回退路径：cacheDir/update 里的 apk 通过 FileProvider 借给安装器读 -->
+        <provider
+            android:name="androidx.core.content.FileProvider"
+            android:authorities="${applicationId}.updatefp"
+            android:exported="false"
+            android:grantUriPermissions="true">
+            <meta-data
+                android:name="android.support.FILE_PROVIDER_PATHS"
+                android:resource="@xml/file_paths" />
+        </provider>
 
         <!-- 开机自启：系统发起，不受 non-exported 限制，且不需要 root -->
         <receiver

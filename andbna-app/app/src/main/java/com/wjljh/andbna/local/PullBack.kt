@@ -721,9 +721,29 @@ while :; do
       if [ "§COUNT" -eq 0 ]; then SINCE=§NOW; fi
       COUNT=§((COUNT + 1))
       LAST=§NOW
-      am start-foreground-service -n "§PKG/com.wjljh.andbna.local.BotService" -a com.wjljh.andbna.START_LOCAL >/dev/null 2>&1
+      # 拉起：root 直接起服务（uid 0 不受 exported 限制）；shell 只能 start 无界面跳板
+      # （BotService 是 exported=false，shell 起它会被 AMS Permission Denial）。
+      # 两条通道都必须看返回码与输出：失败就记失败，不许再写「已通过 … 拉起」。
+      if [ "§CH" = "root" ]; then
+        OUT=§(am start-foreground-service -n "§PKG/com.wjljh.andbna.local.BotService" -a com.wjljh.andbna.START_LOCAL 2>&1)
+      else
+        OUT=§(am start -n "§PKG/com.wjljh.andbna.local.WakeActivity" 2>&1)
+      fi
+      RC=§?
+      OK=0
+      # 成功判据：rc=0、没有 Error 行、且输出里有 Starting（Activity 是 "Starting: Intent"，
+      # 服务是 "Starting service: Intent"，两种都认）
+      if [ "§RC" -eq 0 ] && ! printf '%s' "§OUT" | grep -q '^Error' && printf '%s' "§OUT" | grep -q 'Starting'; then
+        OK=1
+      fi
       write_state running
-      al "已通过 @VIA@ 拉起（第 §{COUNT} 次）"
+      if [ "§OK" = "1" ]; then
+        al "已通过 @VIA@ 拉起（第 §{COUNT} 次）"
+      else
+        WHY=§(printf '%s' "§OUT" | grep -m1 -E 'Error|Exception|not exported|Permission Denial' | cut -c1-160)
+        [ -z "§WHY" ] && WHY="rc=§RC 无输出"
+        al "拉起失败（第 §{COUNT} 次，rc=§RC）：§WHY"
+      fi
     fi
   fi
   date +%s > "§HB"

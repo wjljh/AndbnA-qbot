@@ -48,6 +48,9 @@ data class LocalBot(
 
 object BotStore {
 
+    /** 「群里自动接话」按 bot 覆盖的落盘键（值 = {appid: "1"/"0"}，缺键 = 跟随全局）。 */
+    const val KEY_AUTOCHAT_OVERRIDE = "group_autochat_override"
+
     private fun file(ctx: Context): File = File(ctx.filesDir, "localbots.json")
 
     fun load(ctx: Context): List<LocalBot> {
@@ -309,10 +312,44 @@ object BotStore {
     val Context.chatProb: String
         get() = sp(this).getString("chat_prob", "0.3").orEmpty().ifBlank { "0.3" }
 
-    /** 群里自动接话（没有界面行，默认关）：开了才轮到「回复判定」决定要不要插话 */
-    val Context.groupAutochat: Boolean
+    /**
+     * 群里自动接话（默认关）：开了才轮到「回复判定」决定要不要插话。
+     *
+     * 设置页与 Bot 编辑页各有一行，写的是同一个键（全局开关，所有 bot 共用）：
+     * 关着时群里只有 @ 才回 —— 这是「觉得 bot 必须 @ 才回」那个反馈的根因。
+     * 写入后要立刻生效：调 BotHost.setGroupAutochat（Python 侧 _autochat 每条消息现读）。
+     */
+    var Context.groupAutochat: Boolean
         // 历史键是字符串（"0"/"1"），按字符串读，别用 getBoolean 撞 ClassCastException
         get() = sp(this).getString("group_autochat", "0").orEmpty().trim() == "1"
+        set(v) {
+            sp(this).edit().putString("group_autochat", if (v) "1" else "0").apply()
+        }
+
+    /**
+     * 按 bot 的「群里自动接话」覆盖（Bot 编辑页三态）："" = 跟随全局 / "1" = 开 / "0" = 关。
+     *
+     * 与全局键 [groupAutochat] 分开存（prefs 键 group_autochat_override，值是 {appid: "1"/"0"}）：
+     * 改某个 bot 的覆盖不动全局开关；生效优先级见 bot_runner._group_autochat_state
+     * （群配置显式值 > 该 bot 覆盖 > 全局）。
+     */
+    fun Context.groupAutochatOverride(appid: String): String {
+        val o = runCatching {
+            JSONObject(sp(this).getString(KEY_AUTOCHAT_OVERRIDE, "").orEmpty().ifBlank { "{}" })
+        }.getOrNull() ?: return ""
+        val v = o.optString(appid.trim(), "").trim()
+        return if (v == "1" || v == "0") v else ""
+    }
+
+    fun Context.setGroupAutochatOverride(appid: String, value: String) {
+        val key = appid.trim()
+        if (key.isBlank()) return
+        val o = runCatching {
+            JSONObject(sp(this).getString(KEY_AUTOCHAT_OVERRIDE, "").orEmpty().ifBlank { "{}" })
+        }.getOrNull() ?: JSONObject()
+        if (value == "1" || value == "0") o.put(key, value) else o.remove(key)
+        sp(this).edit().putString(KEY_AUTOCHAT_OVERRIDE, o.toString()).apply()
+    }
 
     /**
      * 把模型配置写到 localbot/llm.json 给 Python 读。

@@ -55,6 +55,7 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Notes
 import top.yukonga.miuix.kmp.icon.extended.Ok
 import com.wjljh.andbna.ui.component.PanelTokens
+import com.wjljh.andbna.ui.component.cardOutline
 import top.yukonga.miuix.kmp.basic.Button
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
@@ -179,7 +180,7 @@ fun SectionCard(
         cornerRadius = metrics.radiusCard,
         // spec §2.3 / §2.4：SukiSU 的组卡就是 Card { Column(padding(16.dp)) }
         insideMargin = PaddingValues(metrics.cardInside),
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().cardOutline(metrics.radiusCard),
     ) {
         if (title != null) {
             Text(
@@ -397,7 +398,7 @@ fun Note(text: String, ok: Boolean = true, mono: Boolean = false) {
     // spec 11 §4.5：这个文字色的 when 只判是否动态色，暗/亮同值，不要自己加暗色分支
     val fg = if (ok) PanelColors.onTertiaryContainer else Color(0xFFF72727)
     Card(
-        modifier = Modifier.fillMaxWidth(),
+        modifier = Modifier.fillMaxWidth().cardOutline(),
         cornerRadius = 16.dp,
         insideMargin = PaddingValues(16.dp),
         colors = CardDefaults.defaultColors(color = bg),
@@ -606,21 +607,21 @@ fun HeroCard(
                     showIndication = true,
                     // spec 15 §2.4：Tilt ±8°、spring(0.6, 400)、cameraDistance 12×density
                     pressFeedbackType = PressFeedbackType.Tilt,
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().cardOutline(),
                 ) {
                     HeroWorkingBody(title, subtitle, modeText, content, popup)
                 }
             } else {
                 Card(
                     colors = CardDefaults.defaultColors(color = bg),
-                    modifier = Modifier.fillMaxWidth(),
+                    modifier = Modifier.fillMaxWidth().cardOutline(),
                 ) {
                     HeroWorkingBody(title, subtitle, modeText, content, popup)
                 }
             }
         }
     } else {
-        Card(modifier = Modifier.fillMaxWidth()) {
+        Card(modifier = Modifier.fillMaxWidth().cardOutline()) {
             Row(
                 Modifier.fillMaxSize().padding(16.dp),
                 verticalAlignment = Alignment.CenterVertically,

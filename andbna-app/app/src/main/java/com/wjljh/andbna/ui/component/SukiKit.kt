@@ -5,6 +5,7 @@ import androidx.compose.animation.expandVertically
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.shrinkVertically
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -30,6 +31,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
+import androidx.compose.foundation.Indication
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
@@ -93,7 +95,7 @@ fun PanelGroupCard(
         if (onClick != null) {
             // 可点卡：material3 的 clickable Card（自带 ripple），不用 enabled=false 那种降透明度写法
             MaterialCard(
-                modifier = modifier.fillMaxWidth(),
+                modifier = modifier.fillMaxWidth().cardOutline(PanelTokens.CardRadius),
                 onClick = onClick,
                 shape = shape,
                 colors = colors,
@@ -103,7 +105,7 @@ fun PanelGroupCard(
             }
         } else {
             MaterialCard(
-                modifier = modifier.fillMaxWidth(),
+                modifier = modifier.fillMaxWidth().cardOutline(PanelTokens.CardRadius),
                 shape = shape,
                 colors = colors,
                 elevation = elevation,
@@ -113,7 +115,7 @@ fun PanelGroupCard(
         }
     } else {
         MiuixCard(
-            modifier = modifier.fillMaxWidth(),
+            modifier = modifier.fillMaxWidth().cardOutline(PanelTokens.CardRadius),
             cornerRadius = PanelTokens.CardRadius,
             insideMargin = PaddingValues(0.dp),
             pressFeedbackType = if (onClick != null) PressFeedbackType.Tilt else PressFeedbackType.None,
@@ -387,23 +389,42 @@ fun Modifier.modeClickable(
 ): Modifier {
     if (onClick == null && onLongClick == null) return this
     return if (LocalUiMode.current == UiMode.Material) {
-        materialClickable(onClick, enabled, onLongClick)
+        materialClickable(onClick, enabled, onLongClick, feedback)
     } else {
         tiltClickable(onClick, enabled, onLongClick, feedback)
     }
 }
 
+/**
+ * feedback = false：material 侧也把 ripple 摘掉（indication = null）——
+ * 「点一下不该有按下动画」的列表项两种模式表现一致。
+ */
 @Composable
 private fun Modifier.materialClickable(
     onClick: (() -> Unit)?,
     enabled: Boolean,
     onLongClick: (() -> Unit)?,
-): Modifier =
-    if (onLongClick == null) {
-        clickable(enabled = enabled, onClick = { onClick?.invoke() })
+    feedback: Boolean = true,
+): Modifier {
+    val source = remember { MutableInteractionSource() }
+    val indication: Indication? = if (feedback) LocalIndication.current else null
+    return if (onLongClick == null) {
+        clickable(
+            interactionSource = source,
+            indication = indication,
+            enabled = enabled,
+            onClick = { onClick?.invoke() },
+        )
     } else {
-        combinedClickable(enabled = enabled, onClick = { onClick?.invoke() }, onLongClick = onLongClick)
+        combinedClickable(
+            interactionSource = source,
+            indication = indication,
+            enabled = enabled,
+            onClick = { onClick?.invoke() },
+            onLongClick = onLongClick,
+        )
     }
+}
 
 /**
  * miuix 专属的 Tilt 按压：kit 的 Tilt 是 [TiltFeedback] 这个 IndicationNodeFactory，

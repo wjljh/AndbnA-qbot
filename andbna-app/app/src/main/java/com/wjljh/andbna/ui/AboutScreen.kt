@@ -20,6 +20,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBars
 import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
@@ -28,6 +29,7 @@ import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -42,14 +44,19 @@ import androidx.compose.ui.unit.sp
 import com.wjljh.andbna.BuildConfig
 import com.wjljh.andbna.R
 import com.wjljh.andbna.local.BotHost
+import com.wjljh.andbna.local.UpdateDownloadService
+import com.wjljh.andbna.local.Updater
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.Scaffold
+import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
+import top.yukonga.miuix.kmp.icon.extended.Settings
 
 /**
  * 「关于」二级页（设置页最后那一行进来）。
@@ -67,6 +74,10 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
     LaunchedEffect(Unit) {
         info = withContext(Dispatchers.IO) { readAbout(ctx) }
     }
+
+    // 自动检查更新：开关落盘（默认关）。打开后启动时最多每 24 小时查一次，
+    // 发现新版本在状态页 hero 下面出一张提示卡 —— 关于页这里不再有手动检查入口。
+    var autoCheck by remember { mutableStateOf(Updater.autoEnabled(ctx)) }
 
     BackHandler { onBack() }
 
@@ -105,7 +116,21 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
                     }
                 }
 
-                // ② 这是什么 App
+                // ② 自动检查更新：图标整体卡片的**下方**，独立一行（只一个开关，不放任何说明文字）
+                SectionCard(metrics) {
+                    SuperRow(
+                        icon = MiuixIcons.Settings,
+                        title = "自动检查更新",
+                        trailing = {
+                            Switch(checked = autoCheck, onCheckedChange = {
+                                autoCheck = it
+                                Updater.setAutoEnabled(ctx, it)
+                            })
+                        },
+                    )
+                }
+
+                // ③ 这是什么 App
                 SectionCard(metrics) {
                     Text(
                         text = "本机 QQ 机器人托管面板",
@@ -149,10 +174,25 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
                         color = PanelColors.onSurfaceVariantSummary,
                     )
                 }
+
+                // ⑥ 成本口径（hero 上只写「余额差值估算」，整句挂在页面最底部，10sp 小字）
+                Text(
+                    text = COST_NOTE,
+                    fontSize = 10.sp,
+                    lineHeight = 15.sp,
+                    color = PanelColors.onSurfaceVariantSummary.copy(alpha = 0.8f),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 4.dp, vertical = 6.dp),
+                )
             }
         }
     }
+
 }
+
+/** 成本金额的口径说明：hero 只写「约 ¥x.xx（余额差值估算）」，完整一句挂在这里。 */
+internal const val COST_NOTE = "金额按上游余额差值估算，含同一 Key 的其它端消耗"
 
 /** 顶栏：细线返回箭头一行，大标题「关于」独占下一行（与主题设置页同一套）。 */
 @Composable

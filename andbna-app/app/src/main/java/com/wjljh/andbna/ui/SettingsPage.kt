@@ -1,6 +1,10 @@
 package com.wjljh.andbna.ui
 
 import android.content.Context
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.fillMaxSize
@@ -32,6 +36,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -44,7 +49,10 @@ import com.wjljh.andbna.local.RunMode
 import com.wjljh.andbna.local.RunNotification
 import com.wjljh.andbna.local.SecureStore
 import com.wjljh.andbna.ui.component.PanelAnimatedNotice
+import com.wjljh.andbna.ui.component.PanelConfirmDialog
+import com.wjljh.andbna.ui.component.PanelMetrics
 import com.wjljh.andbna.ui.component.PanelNotice
+import com.wjljh.andbna.ui.component.PanelTokens
 import com.wjljh.andbna.ui.component.material.SegmentedArrowItem
 import com.wjljh.andbna.ui.component.material.SegmentedDropdownItem
 import com.wjljh.andbna.ui.component.material.SegmentedGroup
@@ -57,13 +65,16 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import top.yukonga.miuix.kmp.basic.ButtonDefaults
 import top.yukonga.miuix.kmp.basic.Card
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.preference.ArrowPreference
 import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import top.yukonga.miuix.kmp.window.WindowDialog
 
 /**
  * 设置页 —— 两种界面模式各写一套结构，都照 SukiSU 源码来：
@@ -110,16 +121,83 @@ fun SettingsPage(
     // 「备份与恢复」小面板：就地弹，不新开二级页（导出 / 导入都在面板里完成）
     var showBackup by remember { mutableStateOf(false) }
 
-    // 进设置页重算一次识图缓存占用（要过 Python / 读目录，放 IO，不在组合期做）
-    LaunchedEffect(visible) { if (visible) vm.refreshCache() }
+    // 「消息存档」：同一套就地弹面板（占用 + 导出 + 清空），清空再走一层二次确认
+    var showArchive by remember { mutableStateOf(false) }
+    var confirmClearArchive by remember { mutableStateOf(false) }
+
+    // 导出走系统文件选择器（SAF CreateDocument）：不申请存储权限，存哪儿由用户挑
+    val archiveExportLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.CreateDocument("text/plain")
+    ) { uri: Uri? ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val line = withContext(Dispatchers.IO) {
+                try {
+                    val text = BotHost.archiveExportText(ctx)
+                    if (text.isBlank()) {
+                        "存档里还没有消息，先聊几句再导出"
+                    } else {
+                        ctx.contentResolver.openOutputStream(uri)?.use { os ->
+                            os.write(text.toByteArray(Charsets.UTF_8))
+                        }
+                        "已导出（" + text.lineSequence().count() + " 行）"
+                    }
+                } catch (e: Exception) {
+                    "导出失败：" + (e.message ?: e.javaClass.simpleName)
+                }
+            }
+            vm.msg = line
+        }
+    }
+
+    // 进设置页重算一次识图缓存占用与存档占用（要过 Python / 读目录，放 IO，不在组合期做）
+    LaunchedEffect(visible) {
+        if (visible) {
+            vm.refreshCache()
+            vm.refreshArchive()
+        }
+    }
 
     if (LocalUiMode.current == UiMode.Material) {
-        MaterialSettingsBody(vm, actions, bottomInset, curMode, onOpenBackup = { showBackup = true })
+        MaterialSettingsBody(
+            vm, actions, bottomInset, curMode,
+            onOpenBackup = { showBackup = true },
+            onOpenArchive = { showArchive = true },
+        )
     } else {
-        MiuixSettingsBody(vm, actions, bottomInset, curMode, onOpenBackup = { showBackup = true })
+        MiuixSettingsBody(
+            vm, actions, bottomInset, curMode,
+            onOpenBackup = { showBackup = true },
+            onOpenArchive = { showArchive = true },
+        )
     }
 
     BackupPanel(show = showBackup, onDismiss = { showBackup = false })
+
+    ArchiveDialog(
+        show = showArchive,
+        summary = vm.archiveSummary,
+        onExport = {
+            showArchive = false
+            archiveExportLauncher.launch("andbna-messages.txt")
+        },
+        onClear = {
+            showArchive = false
+            confirmClearArchive = true
+        },
+        onDismiss = { showArchive = false },
+    )
+    PanelConfirmDialog(
+        show = confirmClearArchive,
+        title = "清空消息存档",
+        body = "确认清空本机的聊天存档？清空后不可恢复（记忆与配置不受影响）。",
+        confirmLabel = "清空",
+        onConfirm = {
+            confirmClearArchive = false
+            vm.clearArchive()
+        },
+        onDismiss = { confirmClearArchive = false },
+    )
 }
 
 /** 页面回调集合（两种结构共用，不重复拆参数）。 */
@@ -137,6 +215,8 @@ private class SettingsActions(
 private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
     var msg by mutableStateOf("")
     var judge by mutableStateOf(if (SettingsPrefs.ui(ctx, "reply_judge") == "random") 1 else 0)
+    // 群里自动接话：默认关（群里只有 @ 才回）。与 BotStore.groupAutochat 同一个落盘键
+    var autochat by mutableStateOf(SettingsPrefs.ui(ctx, "group_autochat").trim() == "1")
     var chatProb by mutableStateOf(SettingsPrefs.ui(ctx, "chat_prob").ifBlank { "0.3" })
     var dailyLimit by mutableStateOf(SettingsPrefs.ui(ctx, "daily_limit").ifBlank { "50" })
     var autoStart by mutableStateOf(SettingsPrefs.ui(ctx, "auto_start").ifBlank { "1" } == "1")
@@ -159,6 +239,19 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
             "当前：" + curModel + " · 识图：" + curVision.ifBlank { "同主模型" }
         }
 
+    /**
+     * 切「群里自动接话」：落盘 + 立刻推给 Python（_autochat 是每条消息现读的，不用重启 bot）。
+     * 关着时群里只有 @ 才回 —— 状态页那行小字也读这个落盘键。
+     */
+    fun switchAutochat(on: Boolean) {
+        autochat = on
+        SettingsPrefs.put(ctx, "group_autochat", if (on) "1" else "0")
+        scope.launch {
+            withContext(Dispatchers.IO) { BotHost.setGroupAutochat(on) }
+            msg = if (on) "群里自动接话已打开：它会自己判断要不要插话" else "群里自动接话已关闭：群里只有 @ 才回"
+        }
+    }
+
     fun pickJudge(index: Int) {
         judge = index
         SettingsPrefs.put(ctx, "reply_judge", if (index == 1) "random" else "llm")
@@ -180,6 +273,40 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
             val (files, bytes) = withContext(Dispatchers.IO) { BotHost.clearImageCache(ctx) }
             cacheBytes = withContext(Dispatchers.IO) { BotHost.imageCacheSize(ctx) }
             msg = if (files <= 0) "暂无缓存可清理" else "已清理 " + fmtSize(bytes)
+        }
+    }
+
+    // 消息存档：占用字节 + 条数（-1 = 还没读到 / 条数未知）
+    var archiveBytes by mutableStateOf(-1L)
+    var archiveRows by mutableStateOf(-1)
+
+    /** 一行里写清「占用 3.2 MB · 12,345 条」（条数要问 Python，没起来就写未知） */
+    val archiveSummary: String
+        get() = if (archiveBytes < 0L) {
+            "正在统计…"
+        } else {
+            "占用 " + fmtSize(archiveBytes) + " · " + (
+                if (archiveRows < 0) "条数未知"
+                else String.format(java.util.Locale.US, "%,d", archiveRows) + " 条"
+                )
+        }
+
+    fun refreshArchive() {
+        scope.launch {
+            val st = withContext(Dispatchers.IO) { BotHost.archiveStats(ctx) }
+            archiveBytes = st.first
+            archiveRows = st.second
+        }
+    }
+
+    /** 清空之后重算一遍占用，界面上的数立刻跟着掉下去 */
+    fun clearArchive() {
+        scope.launch {
+            val res = withContext(Dispatchers.IO) { BotHost.archiveClear(ctx) }
+            val st = withContext(Dispatchers.IO) { BotHost.archiveStats(ctx) }
+            archiveBytes = st.first
+            archiveRows = st.second
+            msg = if (res.first <= 0) "存档本来就是空的" else "已清空存档（" + res.first + " 条）"
         }
     }
 
@@ -219,6 +346,7 @@ private fun MiuixSettingsBody(
     bottomInset: Dp,
     curMode: RunMode,
     onOpenBackup: () -> Unit,
+    onOpenArchive: () -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier
@@ -266,9 +394,17 @@ private fun MiuixSettingsBody(
             }
         }
 
-        // ③ 回复节奏
+        // ③ 回复节奏（首行「群里自动接话」是全局默认；分组标题要对用户可见）
         item(key = "reply") {
+            SettingsGroupTitle("回复节奏")
             SettingsMiuixGroup {
+                SwitchPreference(
+                    title = "群里自动接话",
+                    summary = "关着时群里只有 @ 才会回；打开后它会自己判断要不要插话（默认关）",
+                    startAction = { SettingsRowIcon(Icons.Filled.Forum) },
+                    checked = vm.autochat,
+                    onCheckedChange = { vm.switchAutochat(it) },
+                )
                 OverlayDropdownPreference(
                     title = "回复判定",
                     summary = "非 @ 消息是否插话",
@@ -380,7 +516,36 @@ private fun MiuixSettingsBody(
                 }
             }
         }
+
+        // ⑧ 消息存档：整页最底下一行（占用 + 条数挂 summary，导出/清空在面板里）
+        item(key = "archive") {
+            SettingsMiuixGroup {
+                ArrowPreference(
+                    title = "消息存档",
+                    summary = vm.archiveSummary,
+                    startAction = { SettingsRowIcon(Icons.Filled.Forum) },
+                    onClick = onOpenArchive,
+                )
+            }
+        }
     }
+}
+
+/**
+ * 分组可见标题（17sp Medium）：设置页原先只有代码注释里的「③ 回复节奏」，
+ * 用户翻不到这个分组 —— 现在标题真的画出来，紧跟其后的卡片就是该组的第一行。
+ */
+@Composable
+private fun SettingsGroupTitle(text: String) {
+    Text(
+        text = text,
+        fontSize = PanelMetrics.CardTitleSize,
+        fontWeight = FontWeight.Medium,
+        color = PanelColors.onSurface,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(start = 4.dp, end = 4.dp, top = 12.dp, bottom = 6.dp),
+    )
 }
 
 /** miuix 的一组：一张卡，卡内不加任何自定义 padding（间距由 preference 自己的 insideMargin 给）。 */
@@ -421,6 +586,7 @@ private fun MaterialSettingsBody(
     bottomInset: Dp,
     curMode: RunMode,
     onOpenBackup: () -> Unit,
+    onOpenArchive: () -> Unit,
 ) {
     LazyColumn(
         modifier = Modifier.fillMaxSize(),
@@ -475,9 +641,19 @@ private fun MaterialSettingsBody(
             }
         }
 
-        // ③ 回复节奏
+        // ③ 回复节奏（首行「群里自动接话」是全局默认；分组标题要对用户可见）
         item(key = "reply") {
+            SettingsGroupTitle("回复节奏")
             SegmentedGroup(modifier = settingsGroupPadding()) {
+                item {
+                    SegmentedSwitchItem(
+                        title = "群里自动接话",
+                        summary = "关着时群里只有 @ 才会回；打开后它会自己判断要不要插话（默认关）",
+                        icon = Icons.Filled.Forum,
+                        checked = vm.autochat,
+                        onCheckedChange = { vm.switchAutochat(it) },
+                    )
+                }
                 item {
                     SegmentedDropdownItem(
                         title = "回复判定",
@@ -611,6 +787,20 @@ private fun MaterialSettingsBody(
                 }
             }
         }
+
+        // ⑧ 消息存档：整页最底下一行（占用 + 条数挂 summary，导出/清空在面板里）
+        item(key = "archive") {
+            SegmentedGroup(modifier = settingsGroupPadding()) {
+                item {
+                    SegmentedArrowItem(
+                        title = "消息存档",
+                        summary = vm.archiveSummary,
+                        icon = Icons.Filled.Forum,
+                        onClick = onOpenArchive,
+                    )
+                }
+            }
+        }
     }
 }
 
@@ -638,4 +828,59 @@ private object SettingsPrefs {
     fun put(ctx: Context, k: String, v: String) {
         SecureStore.put(sp(ctx), k, v)
     }
+}
+
+/**
+ * 「消息存档」小面板：一行占用 + 导出 / 清空 / 取消。
+ *
+ * 用 kit 的 WindowDialog（与 PanelConfirmDialog 同一个宿主），不引 material3；
+ * 清空不在这里直接干 —— 交给下一层 PanelConfirmDialog 做二次确认，免得手滑清掉。
+ */
+@Composable
+private fun ArchiveDialog(
+    show: Boolean,
+    summary: String,
+    onExport: () -> Unit,
+    onClear: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    WindowDialog(
+        show = show,
+        title = "消息存档",
+        onDismissRequest = onDismiss,
+        content = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(PanelTokens.RowSpacing),
+            ) {
+                Text(
+                    text = summary,
+                    style = MiuixTheme.textStyles.body2,
+                    color = MiuixTheme.colorScheme.onBackground,
+                )
+                Text(
+                    text = "每 20 条或 5 秒落一次盘；默认保留 30 天、每个会话最多 5000 条，"
+                        + "超出的自动删最旧的。导出是一行一条纯文本。",
+                    style = MiuixTheme.textStyles.footnote2,
+                    color = MiuixTheme.colorScheme.onBackground,
+                )
+                TextButton(
+                    text = "导出为文本",
+                    onClick = onExport,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                TextButton(
+                    text = "清空",
+                    onClick = onClear,
+                    modifier = Modifier.fillMaxWidth(),
+                    colors = ButtonDefaults.textButtonColorsPrimary(PanelTokens.ErrorColor),
+                )
+                TextButton(
+                    text = "取消",
+                    onClick = onDismiss,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+    )
 }

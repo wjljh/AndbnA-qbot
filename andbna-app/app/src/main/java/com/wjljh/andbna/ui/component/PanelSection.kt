@@ -107,7 +107,7 @@ fun PanelSectionCard(
     }
     if (LocalUiMode.current == UiMode.Material) {
         androidx.compose.material3.Card(
-            modifier = modifier.fillMaxWidth(),
+            modifier = modifier.fillMaxWidth().cardOutline(PanelMetrics.CardRadius),
             shape = RoundedCornerShape(PanelMetrics.CardRadius),
             colors = M3CardDefaults.cardColors(
                 containerColor = MaterialTheme.colorScheme.surfaceContainer,
@@ -118,7 +118,7 @@ fun PanelSectionCard(
         }
     } else {
         Card(
-            modifier = modifier.fillMaxWidth(),
+            modifier = modifier.fillMaxWidth().cardOutline(PanelMetrics.CardRadius),
             cornerRadius = PanelMetrics.CardRadius,
             insideMargin = PanelMetrics.CardInside,
         ) { body() }
@@ -205,20 +205,26 @@ fun PanelListRow(
     }
 }
 
-/** 带箭头的可点行（二级入口）。 */
+/**
+ * 带箭头的可点行（二级入口）。
+ *
+ * [feedback] = false：仍然可点，但**不挂按压反馈**（miuix 不歪、material 不留 ripple）——
+ * 群配置列表项与「按群单独设置」入口卡按用户要求就是这一种。
+ */
 @Composable
 fun PanelArrowRow(
     title: String,
     modifier: Modifier = Modifier,
     summary: String? = null,
     icon: ImageVector? = null,
+    feedback: Boolean = true,
     onClick: () -> Unit,
 ) {
     Row(
         modifier = modifier
             .fillMaxWidth()
             .heightIn(min = PanelMetrics.RowMinHeight)
-            .modeClickable(onClick),
+            .modeClickable(onClick, feedback = feedback),
         verticalAlignment = Alignment.CenterVertically,
     ) {
         if (icon != null) {
@@ -730,7 +736,7 @@ fun PanelStatCard(
     }
     if (LocalUiMode.current == UiMode.Material) {
         androidx.compose.material3.Card(
-            modifier = modifier,
+            modifier = modifier.cardOutline(PanelTokens.CardRadius),
             shape = RoundedCornerShape(PanelTokens.CardRadius),
             colors = M3CardDefaults.cardColors(
                 containerColor = MaterialTheme.colorScheme.surfaceContainer,
@@ -739,7 +745,7 @@ fun PanelStatCard(
         ) { body() }
     } else {
         Card(
-            modifier = modifier,
+            modifier = modifier.cardOutline(PanelTokens.CardRadius),
             cornerRadius = PanelTokens.CardRadius,
             insideMargin = PaddingValues(0.dp),
         ) { body() }
