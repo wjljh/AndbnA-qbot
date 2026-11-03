@@ -1,5 +1,6 @@
 package com.wjljh.andbna.ui
 
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -68,6 +69,7 @@ import com.wjljh.andbna.ui.component.PanelPrimaryButton
 import com.wjljh.andbna.ui.component.PanelSecondaryButton
 import com.wjljh.andbna.ui.component.SecretEyeButton
 import com.wjljh.andbna.ui.component.PanelTokens
+import com.wjljh.andbna.ui.component.panelStepTransition
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -107,12 +109,9 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    // 「群配置」二级页就地接管整屏（不新增 App 路由）：返回就回到本页，编辑页状态全在 remember 里
+    // 「群配置」二级页就地接管整屏（不新增 App 路由）：返回就回到本页，编辑页状态全在 remember 里。
+    // 进出这一层也用 panelStepTransition（与列表↔单群编辑、引导页同一份），在函数尾部渲染时切换。
     var showGroups by remember(appid) { mutableStateOf(false) }
-    if (showGroups) {
-        GroupConfigScreen(metrics = metrics, appid = appid, onBack = { showGroups = false })
-        return
-    }
     // 组合期一律不读盘、不读 prefs：bot 详情 / 模型三件套 / 人格清单 / 定时表 / openid 全在下面的
     // LaunchedEffect 里按 IO 读回来再填状态（这几行以前都是 remember { ... } 里同步读文件）。
     var bot by remember(appid) { mutableStateOf<LocalBot?>(null) }
@@ -601,46 +600,57 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
         }
     }
 
-    if (LocalUiMode.current == UiMode.Material) {
-        M3Scaffold(
-            containerColor = MaterialTheme.colorScheme.background,
-            topBar = {
-                M3TopAppBar(
-                    title = { M3Text(text = title, style = MaterialTheme.typography.titleLarge) },
-                    navigationIcon = {
-                        IconButton(onClick = onBack) {
-                            androidx.compose.material3.Icon(
-                                Icons.AutoMirrored.Filled.ArrowBack,
-                                contentDescription = "返回",
-                            )
-                        }
-                    },
-                )
-            },
-        ) { pad ->
-            Box(Modifier.fillMaxSize().padding(pad)) { body() }
-        }
-    } else {
-        Scaffold(
-            containerColor = MiuixTheme.colorScheme.surface,
-            topBar = {
-                TopAppBar(
-                    title = title,
-                    largeTitle = title,
-                    subtitle = "AppID " + appid,
-                    navigationIcon = {
-                        IconButton(onClick = onBack) {
-                            Icon(
-                                imageVector = MiuixIcons.Back,
-                                contentDescription = "返回",
-                                tint = MiuixTheme.colorScheme.onBackground,
-                            )
-                        }
-                    },
-                )
-            },
-        ) { pad ->
-            Box(Modifier.fillMaxSize().padding(pad)) { body() }
+    // 本页 ↔ 群配置：同一份 panelStepTransition
+    //   进入（showGroups=false → true）：forward = true，群配置从右进、本页往左出；
+    //   返回（true → false）：forward = false，本页从右进、群配置往左出 —— 与列表↔单群编辑完全一致。
+    AnimatedContent(
+        targetState = showGroups,
+        transitionSpec = { panelStepTransition(forward = targetState) },
+        label = "bot-edit-groups",
+    ) { groups ->
+        if (groups) {
+            GroupConfigScreen(metrics = metrics, appid = appid, onBack = { showGroups = false })
+        } else if (LocalUiMode.current == UiMode.Material) {
+            M3Scaffold(
+                containerColor = MaterialTheme.colorScheme.background,
+                topBar = {
+                    M3TopAppBar(
+                        title = { M3Text(text = title, style = MaterialTheme.typography.titleLarge) },
+                        navigationIcon = {
+                            IconButton(onClick = onBack) {
+                                androidx.compose.material3.Icon(
+                                    Icons.AutoMirrored.Filled.ArrowBack,
+                                    contentDescription = "返回",
+                                )
+                            }
+                        },
+                    )
+                },
+            ) { pad ->
+                Box(Modifier.fillMaxSize().padding(pad)) { body() }
+            }
+        } else {
+            Scaffold(
+                containerColor = MiuixTheme.colorScheme.surface,
+                topBar = {
+                    TopAppBar(
+                        title = title,
+                        largeTitle = title,
+                        subtitle = "AppID " + appid,
+                        navigationIcon = {
+                            IconButton(onClick = onBack) {
+                                Icon(
+                                    imageVector = MiuixIcons.Back,
+                                    contentDescription = "返回",
+                                    tint = MiuixTheme.colorScheme.onBackground,
+                                )
+                            }
+                        },
+                    )
+                },
+            ) { pad ->
+                Box(Modifier.fillMaxSize().padding(pad)) { body() }
+            }
         }
     }
 }
