@@ -48,6 +48,7 @@ import androidx.compose.ui.platform.LocalLayoutDirection
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.wjljh.andbna.BuildConfig
 import com.wjljh.andbna.data.OnboardStore
 import com.wjljh.andbna.data.PrefsWatch
 import com.wjljh.andbna.data.SettingsRepositoryImpl
@@ -151,10 +152,15 @@ private fun PanelAppContent() {
     val metrics = rememberMetrics()
     var mode by remember { mutableStateOf(ModeStore.initial(ctx)) }
 
-    // 首次使用引导按 versionCode 判定（见 OnboardStore.required）：记下的 onboard_seen_vc
-    // 比当前 BuildConfig.VERSION_CODE 小就拦在最前面 —— 首次安装（0）与每次升级各走一次；
-    // 同一版本第二次打开相等，不再出现。走完 / 跳过时 markDone() 写回当前版本。
-    var onboarding by remember { mutableStateOf(OnboardStore.required(ctx)) }
+    // 引导门控（分流在 OnboardStore 的落盘标记上）：
+    //  · 首次安装（onboarded 还是 false）→ 仍走原 6 步引导；
+    //  · 老用户（onboarded == true）且 onboard_seen_vc < VERSION_CODE → 只弹单页「本版更新说明」；
+    // 两边都靠 markDone() 写回当前 versionCode，所以同一版本只会出现一次。
+    val firstInstall = remember { !OnboardStore.done(ctx) }
+    var onboarding by remember { mutableStateOf(firstInstall) }
+    var whatsNew by remember {
+        mutableStateOf(!firstInstall && OnboardStore.seenVc(ctx) < BuildConfig.VERSION_CODE)
+    }
     // 每次进引导换一个 key：这个 if 分支在两段布局中间，不换 key 的话引导内部的 remember
     // 会按位置沿用上一次的值（重看引导会直接落在上次停的那一步）
     var onboardSession by remember { mutableIntStateOf(0) }
@@ -168,6 +174,15 @@ private fun PanelAppContent() {
                 PullBack.poke(ctx)
             })
         }
+        return
+    }
+
+    // 老用户升级：单页更新说明（不阻塞配置，点「知道了」才落盘 seen_vc）
+    if (whatsNew) {
+        WhatsNewScreen(onDismiss = {
+            OnboardStore.markDone(ctx)
+            whatsNew = false
+        })
         return
     }
 
