@@ -36,6 +36,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wjljh.andbna.ModelCatalog
 import com.wjljh.andbna.local.BotHost
+import com.wjljh.andbna.local.BotRestarts
 import com.wjljh.andbna.local.BotStore
 import com.wjljh.andbna.local.SecureStore
 import com.wjljh.andbna.ui.component.PanelAnimatedNotice
@@ -100,6 +101,13 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
     // 让模型自己判断该不该联网查：默认开（关掉 = 只认 #搜/#读 与触发词）
     var autoDecide by remember {
         mutableStateOf(ModelPrefs.read(ctx, "search_auto_decide").trim() != "0")
+    }
+    // 回复判定两件套（1.0.6）：主动程度三档 + 名字命中就当被叫
+    var judgeLevel by remember {
+        mutableStateOf(ModelPrefs.read(ctx, "llm_judge_level").trim().ifBlank { "normal" })
+    }
+    var nameHit by remember {
+        mutableStateOf(ModelPrefs.read(ctx, "name_hit_as_call").trim() != "0")
     }
     // 上下文窗口的「自定义…」：只是把输入框就地摊开，值仍由 contextWindow 持有
     var windowCustom by remember { mutableStateOf(false) }
@@ -175,15 +183,24 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
     }
 
     fun save() {
+        // 保存前后各取一次指纹：值真变了才重启 bot（点保存不看改动就把 bot 踢下线很烦）
+        val before = ModelPrefs.snapshot(ctx)
         ModelPrefs.save(
             ctx, api = api, key = key, model = mainModel, vision = visionModel,
             judge = judgeModel, summary = summaryModel, search = searchModel,
             window = contextWindow, web = webOn, personaStyle = personaStyle,
             autoDecide = autoDecide, effort = effort,
+            judgeLevel = judgeLevel, nameHit = nameHit,
             searchProvider = provider, searchBase = searchBase,
             searchAuth = authWire(authMode, authName, authValue, provider),
             searchFields = searchFields,
         )
+        val restarted = if (ModelPrefs.snapshot(ctx) != before) {
+            // 全局配置：所有启用中的 bot 都要重连（Key / 模型名只在进程内存里，光重启不够）
+            BotRestarts.requestAllEnabled(ctx, "模型配置保存")
+        } else {
+            0
+        }
         error = ""
         // 思考强度空串也存：等于「请求体不带该字段」，不是「没保存」
         val v = if (visionModel.isBlank()) "识图留空→主模型" else "识图 " + visionModel.trim()
@@ -196,7 +213,10 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
             "，" + (if (webOn) "联网开" else "联网关") +
             (if (personaStyle) "，人设化回答开" else "，人设化回答关") +
             (if (autoDecide) "，自判联网开" else "，自判联网关") +
-            "，搜索服务 " + providerLabel(provider) + "，" + e + "）"
+            "，判定 " + judgeLevelLabel(judgeLevel) +
+            (if (nameHit) "，名字命中即回" else "，名字不算被叫") +
+            "，搜索服务 " + providerLabel(provider) + "，" + e + "）" +
+            if (restarted > 0) "，正在重启 " + restarted + " 个 bot…" else ""
     }
 
     /** 验证思考强度：用当前配置发一次最小请求（留空也照发，那就是平台默认行为）。 */
@@ -467,6 +487,38 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                             "估算达到 " + (win * 75 / 100) + " tokens 才把旧对话压成摘要；" +
                             "真正发出去的只有 system + 摘要 + 最近 12 条原文，所以填大一点不会" +
                             "让每次请求变贵。压缩后如果没有真的变小，这次压缩会被放弃（不落盘）。",
+                        fontSize = 13.sp,
+                        color = PanelColors.onSurfaceVariantSummary,
+                        modifier = Modifier.padding(top = 6.dp),
+                    )
+                }
+
+                // ⑤' 回复判定：主动程度三档 + 名字命中就当被叫
+                SectionCard(metrics, title = "回复判定") {
+                    OverlayDropdownPreference(
+                        insideMargin = PanelTokens.PrefInside,
+                        title = "主动程度",
+                        summary = judgeLevelLabel(judgeLevel),
+                        items = JUDGE_LEVEL_LABELS,
+                        selectedIndex = JUDGE_LEVELS.indexOf(judgeLevel).coerceAtLeast(0),
+                        onSelectedIndexChange = { i ->
+                            judgeLevel = JUDGE_LEVELS[i]
+                            error = ""
+                            notice = "主动程度已选「" + JUDGE_LEVEL_LABELS[i] + "」，点保存才落盘"
+                        },
+                    )
+                    SwitchPreference(
+                        title = "名字命中就当被叫",
+                        summary = if (nameHit)
+                            "正文里出现人格名或称呼 → 跳过判定直接回"
+                        else "只在 @ 本 bot 时才回（或交给回复判定）",
+                        checked = nameHit,
+                        onCheckedChange = { nameHit = it },
+                    )
+                    Text(
+                        text = "主动程度只影响「没 @ 本 bot」的群消息：保守要求明确在叫你，偏积极" +
+                            "（默认）拿不准就接，积极几乎都接。判定模型答不出 1/0 时按「接」处理；" +
+                            "判定调用失败时只有在「保守」档才按「不接」。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 6.dp),
@@ -804,6 +856,15 @@ private fun authWire(mode: String, name: String, value: String, provider: String
 }
 private val EFFORT_ITEMS = listOf("不指定（用平台默认）") + EFFORT_DISPLAYS + listOf("自定义…")
 
+/** 回复判定的主动程度：落盘/落 llm.json 用小写标识串，页面显示中文。 */
+private val JUDGE_LEVELS = listOf("normal", "conservative", "eager")
+private val JUDGE_LEVEL_LABELS = listOf("偏积极（默认）", "保守", "积极")
+
+private fun judgeLevelLabel(wire: String): String {
+    val i = JUDGE_LEVELS.indexOf(wire.trim().lowercase())
+    return if (i >= 0) JUDGE_LEVEL_LABELS[i] else JUDGE_LEVEL_LABELS[0]
+}
+
 /** 显示项 → 发送值（小写）。 */
 private fun effortWire(display: String): String = display.lowercase()
 
@@ -814,6 +875,17 @@ private fun effortPresetIndex(wire: String): Int =
 /** 模型配置的读写：Key 走 SecureStore（密文落盘），其余字段是普通 prefs。 */
 private object ModelPrefs {
     private fun sp(ctx: Context) = ctx.getSharedPreferences("andbna_local", Context.MODE_PRIVATE)
+
+    /** 保存会写到的那些键：保存前后各取一次，值真变了才自动重启 bot。 */
+    private val SAVED_KEYS = listOf(
+        "llm_api", "llm_key", "llm_model", "llm_vision_model", "llm_judge_model",
+        "llm_summary_model", "llm_search_model", "llm_judge_level", "name_hit_as_call",
+        "llm_context_window", "web_search_enabled", "search_persona_style",
+        "search_auto_decide", "search_provider", "search_base", "search_auth",
+        "search_fields", "llm_reasoning_effort",
+    )
+
+    fun snapshot(ctx: Context): String = SAVED_KEYS.joinToString("\u0000") { read(ctx, it) }
 
     fun read(ctx: Context, k: String): String {
         val v = SecureStore.get(sp(ctx), k)
@@ -838,6 +910,8 @@ private object ModelPrefs {
         personaStyle: Boolean,
         autoDecide: Boolean,
         effort: String,
+        judgeLevel: String,
+        nameHit: Boolean,
         searchProvider: String,
         searchBase: String,
         searchAuth: String,
@@ -851,6 +925,8 @@ private object ModelPrefs {
             .putString("llm_judge_model", judge.trim())
             .putString("llm_summary_model", summary.trim())
             .putString("llm_search_model", search.trim())
+            .putString("llm_judge_level", judgeLevel.trim().ifBlank { "normal" })
+            .putString("name_hit_as_call", if (nameHit) "1" else "0")
             // 上下文窗口：留空就写默认 131072（Python 侧同一口径；老配置里的值不动）
             .putString("llm_context_window", window.trim().ifBlank { "131072" })
             .putString("web_search_enabled", if (web) "1" else "0")

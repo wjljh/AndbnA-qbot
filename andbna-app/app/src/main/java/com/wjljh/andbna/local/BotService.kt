@@ -193,23 +193,58 @@ object BotHost {
         return d
     }
 
-    /** 启动所有启用中的 bot，返回逐条结果 */
-    fun startAll(context: Context): String {
-        ctx = context.applicationContext
-        val m = ensure() ?: return lastError.ifBlank { "Python 未就绪" }
+    /**
+     * 把「只活在进程内存里的运行时配置」重推一遍：Key / 地址 / 主模型 + 四个槽位、回复判定、自动接话。
+     *
+     * startAll 之前必调；**保存了模型配置之后也必须再调一次** —— Python 的 _llm_conf 是
+     * 「内存值 or llm.json」，内存里那份不换，光重启 bot 读到的还是旧 Key / 旧模型名。
+     */
+    fun pushRuntimeConfig(context: Context): Boolean {
+        val c = context.applicationContext
+        ctx = c
+        val m = ensure() ?: return false
         return try {
-            // 模型配置与每个人格先落到各自的数据目录，Python 侧读得到
-            BotStore.writeLlmJson(context)
+            // 模型配置先落到数据目录，Python 侧读得到
+            BotStore.writeLlmJson(c)
             // Key 不落盘：明文只经这一行进 Python 进程内存（llm.json 里只有地址和四个槽位的模型名）
             // 四个槽位（识图/判定/摘要/搜索）留空 = 沿用主模型，由 Python 侧 _conf_for 回退
             m.callAttr(
-                "set_llm", context.llmKey, context.llmApi, context.llmModel, context.llmVisionModel,
-                context.llmJudgeModel, context.llmSummaryModel, context.llmSearchModel,
+                "set_llm", c.llmKey, c.llmApi, c.llmModel, c.llmVisionModel,
+                c.llmJudgeModel, c.llmSummaryModel, c.llmSearchModel,
             )
             // 「回复判定」：非 @ 消息由模型判要不要插话（random 则按「闲聊概率」掷骰子）
-            m.callAttr("set_reply_judge", context.replyJudge, context.chatProb)
+            m.callAttr("set_reply_judge", c.replyJudge, c.chatProb)
             // 「群里自动接话」三层：先交全局开关，再交每个 bot 的覆盖（"" = 跟随全局）
-            m.callAttr("set_group_autochat", "", "", context.groupAutochat)
+            m.callAttr("set_group_autochat", "", "", c.groupAutochat)
+            true
+        } catch (e: Throwable) {
+            lastError = "推送运行时配置失败：${e.message}"
+            false
+        }
+    }
+
+    /** 往「日志」页写一行（Python 侧的 log()）：Kotlin 这一侧的保存/重启动作也要留痕。 */
+    fun logNote(msg: String) {
+        try {
+            ensure()?.callAttr("log", msg)
+        } catch (_: Throwable) {
+        }
+    }
+
+    /** 这个 bot 现在连着没有；没起来就是「没在跑」（重启对它是空动作）。 */
+    fun isBotRunning(context: Context, appid: String): Boolean = try {
+        ctx = context.applicationContext
+        ensure()?.callAttr("is_running", appid)?.toBoolean() ?: false
+    } catch (e: Throwable) {
+        false
+    }
+
+    /** 启动所有启用中的 bot，返回逐条结果 */
+    fun startAll(context: Context): String {
+        val m = ensure() ?: return lastError.ifBlank { "Python 未就绪" }
+        if (!pushRuntimeConfig(context)) return lastError.ifBlank { "Python 未就绪" }
+        return try {
+            // 每个人格先落到各自的数据目录，Python 侧读得到
             BotStore.load(context).forEach { b ->
                 m.callAttr(
                     "set_group_autochat",
@@ -377,70 +412,11 @@ object BotHost {
         "清空失败：${e.message}"
     }
 
-    // ── 识图缓存（来源就是 <botdir>/images/，不另造目录）──
+    // ── bot 数据目录（存档等各功能共用）──
 
     /** 所有 bot 的数据目录：<dataDir>/<appid>/ */
     private fun botDirs(context: Context): List<File> =
         dataDir(context).listFiles()?.filter { it.isDirectory }.orEmpty()
-
-    /**
-     * 所有 bot 的识图缓存总字节数。
-     *
-     * Python 起来了就走 python 的 image_cache_size（与清理同一套口径）；
-     * 没起来 / 调不通时按同一个目录做本地统计，界面照样有数。
-     */
-    fun imageCacheSize(context: Context): Long {
-        val dirs = botDirs(context)
-        val m = try { ensure() } catch (e: Throwable) { null }
-        if (m != null) {
-            return dirs.sumOf { d ->
-                try {
-                    m.callAttr("image_cache_size", d.absolutePath).toLong()
-                } catch (e: Throwable) {
-                    0L
-                }
-            }
-        }
-        return dirs.sumOf { d -> imageBytes(File(d, "images")) }
-    }
-
-    /** 清掉所有 bot 的识图缓存，返回 (删除的文件数, 删除的字节数)。 */
-    fun clearImageCache(context: Context): Pair<Int, Long> {
-        val dirs = botDirs(context)
-        val m = try { ensure() } catch (e: Throwable) { null }
-        if (m == null) {
-            var f = 0
-            var b = 0L
-            dirs.forEach { d ->
-                File(d, "images").listFiles()?.forEach { x ->
-                    if (x.isFile) {
-                        val size = x.length()
-                        if (x.delete()) {
-                            f++
-                            b += size
-                        }
-                    }
-                }
-            }
-            return f to b
-        }
-        var files = 0
-        var bytes = 0L
-        dirs.forEach { d ->
-            val res = try {
-                m.callAttr("clear_image_cache", d.absolutePath).toString()
-            } catch (e: Throwable) {
-                ""
-            }
-            val o = try { org.json.JSONObject(res) } catch (e: Throwable) { null } ?: return@forEach
-            files += o.optInt("files", 0)
-            bytes += o.optLong("bytes", 0L)
-        }
-        return files to bytes
-    }
-
-    private fun imageBytes(dir: File): Long =
-        dir.listFiles()?.sumOf { if (it.isFile) it.length() else 0L } ?: 0L
 
     // ── 消息存档（<botdir>/messages.db，每个 bot 一个库）──
 

@@ -195,6 +195,25 @@ object BotStore {
             sp(this).edit().putString("llm_judge_model", v.trim()).apply()
         }
 
+    /**
+     * 回复判定的主动程度（1.0.6）：conservative / normal / eager。
+     *
+     * 只影响「没 @ 本 bot 的群消息」；Python 侧按这个值换提示词倾向，认不出就落回 normal。
+     */
+    var Context.llmJudgeLevel: String
+        get() = sp(this).getString("llm_judge_level", "normal").orEmpty().ifBlank { "normal" }
+        set(v) {
+            sp(this).edit().putString("llm_judge_level", v.trim().ifBlank { "normal" }).apply()
+        }
+
+    /** 名字命中就当被叫（默认开）：正文里出现人格名或称呼 → 跳过回复判定直接回。 */
+    var Context.nameHitAsCall: Boolean
+        // 历史/备份都按字符串存（"1"/"0"），别用 getBoolean 撞 ClassCastException
+        get() = sp(this).getString("name_hit_as_call", "1").orEmpty().trim() != "0"
+        set(v) {
+            sp(this).edit().putString("name_hit_as_call", if (v) "1" else "0").apply()
+        }
+
     /** 上下文摘要用的模型：留空 = 沿用主模型（压缩时才用一次）。 */
     var Context.llmSummaryModel: String
         get() = sp(this).getString("llm_summary_model", "").orEmpty()
@@ -368,6 +387,9 @@ object BotStore {
             .put("search_model", ctx.llmSearchModel)
             // 思考强度：空串也写（Python 侧按空 = 请求体不带该字段）
             .put("reasoning_effort", ctx.llmReasoningEffort)
+            // 回复判定两件套：主动程度三档 + 名字命中是否算被叫
+            .put("judge_level", ctx.llmJudgeLevel)
+            .put("name_hit_as_call", ctx.nameHitAsCall)
             // 上下文压缩阈值基数（token，默认 131072）与两个联网开关
             .put("context_window", ctx.llmContextWindow.toIntOrNull() ?: 131072)
             .put("web_search_enabled", ctx.webSearchEnabled)

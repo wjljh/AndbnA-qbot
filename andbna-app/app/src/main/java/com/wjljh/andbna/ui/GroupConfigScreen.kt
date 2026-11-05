@@ -36,6 +36,7 @@ import com.wjljh.andbna.ui.component.panelStepTransition
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import com.wjljh.andbna.local.BotRestarts
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.Scaffold
@@ -215,9 +216,12 @@ private fun GroupEditScreen(
     var limit by remember(gid) { mutableStateOf(0) }
     var custom by remember(gid) { mutableStateOf(false) }
     var error by remember(gid) { mutableStateOf("") }
+    // 读盘时的原值：保存时用它判断「真的改了」，改了才重启这个 bot
+    var baseline by remember(gid) { mutableStateOf<GroupConfig.Conf?>(null) }
 
     LaunchedEffect(gid) {
         val conf = withContext(Dispatchers.IO) { GroupConfig.load(ctx, appid, gid) }
+        baseline = conf
         autoReply = conf.autoReply
         webSearch = conf.webSearch
         enabled = conf.enabled
@@ -236,9 +240,13 @@ private fun GroupEditScreen(
         scope.launch {
             val err = withContext(Dispatchers.IO) { GroupConfig.save(ctx, appid, gid, conf) }
             if (err == null) {
+                // 群配置是按 mtime 热读的，但「保存完自动重启」统一走一遍更省心；
+                // 值没变就不重启（点开又关掉不该把 bot 踢下线）。
+                val restarted = conf != baseline && BotRestarts.requestOne(ctx, appid, "群配置保存")
                 onSaved(
-                    if (conf.isDefault) "已保存：所有项都是跟随，覆盖已删除（这个群回到 bot 全局）"
-                    else "已保存：" + groupTitle(gid, null) + " 的覆盖",
+                    (if (conf.isDefault) "已保存：所有项都是跟随，覆盖已删除（这个群回到 bot 全局）"
+                    else "已保存：" + groupTitle(gid, null) + " 的覆盖") +
+                        if (restarted) "，正在重启该 bot…" else "",
                 )
             } else {
                 error = err

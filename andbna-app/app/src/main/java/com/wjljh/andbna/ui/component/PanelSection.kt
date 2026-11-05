@@ -47,6 +47,7 @@ import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.text.input.VisualTransformation
@@ -875,6 +876,18 @@ fun PanelEllipsisField(
     val masked = secret && !revealed
     // 一个字符一颗点：跟明文同长度，超长时同样尾部省略
     val shown = if (masked) "•".repeat(value.length) else value
+    // 密钥框专用输入法选项：Password → TYPE_TEXT_VARIATION_PASSWORD，系统安全键盘
+    // （不进联想、不进词库）；点眼睛看明文时也照样用它 —— 内容仍然是密钥。
+    // 模型名 / 接口地址这类普通字段继续走 KeyboardOptions.Default。
+    val keys = if (secret) {
+        KeyboardOptions(
+            keyboardType = KeyboardType.Password,
+            imeAction = ImeAction.Done,
+            autoCorrectEnabled = false,
+        )
+    } else {
+        KeyboardOptions.Default
+    }
     Column(modifier.fillMaxWidth()) {
         if (label.isNotBlank()) {
             Text(
@@ -899,6 +912,7 @@ fun PanelEllipsisField(
                     value = value,
                     onValueChange = onValueChange,
                     singleLine = true,
+                    keyboardOptions = keys,
                     textStyle = style.copy(color = if (focused) PanelColors.onSurface else Color.Transparent),
                     visualTransformation = if (masked) PasswordVisualTransformation() else VisualTransformation.None,
                     cursorBrush = SolidColor(PanelColors.primary),

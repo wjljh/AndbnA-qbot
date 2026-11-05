@@ -15,7 +15,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Forum
-import androidx.compose.material.icons.filled.Delete
 import androidx.compose.material.icons.filled.Info
 import androidx.compose.material.icons.filled.Key
 import androidx.compose.material.icons.filled.Notifications
@@ -43,6 +42,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wjljh.andbna.data.OnboardStore
 import com.wjljh.andbna.local.BotHost
+import com.wjljh.andbna.local.BotRestarts
 import com.wjljh.andbna.local.ModeStore
 import com.wjljh.andbna.local.PullBack
 import com.wjljh.andbna.local.RunMode
@@ -150,10 +150,9 @@ fun SettingsPage(
         }
     }
 
-    // 进设置页重算一次识图缓存占用与存档占用（要过 Python / 读目录，放 IO，不在组合期做）
+    // 进设置页重算一次存档占用（要过 Python / 读目录，放 IO，不在组合期做）
     LaunchedEffect(visible) {
         if (visible) {
-            vm.refreshCache()
             vm.refreshArchive()
         }
     }
@@ -252,28 +251,19 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
         }
     }
 
+    /**
+     * 切「回复判定」：落盘 + 重推给 Python + 重启所有启用中的 bot。
+     *
+     * 判定模式只在进程内存里（bot_runner._judge），光改 prefs 运行中的 bot 不会变，
+     * 所以走和模型配置保存同一条路：推配置 + 重启（1.5 秒内连点只重启一次）。
+     */
     fun pickJudge(index: Int) {
+        val changed = judge != index
         judge = index
         SettingsPrefs.put(ctx, "reply_judge", if (index == 1) "random" else "llm")
-        msg = "已切到「" + judgeOptions.getOrElse(index) { "" } + "」"
-    }
-
-    /** 识图缓存占用（字节）；-1 = 还没读到 */
-    var cacheBytes by mutableStateOf(-1L)
-
-    fun refreshCache() {
-        scope.launch {
-            cacheBytes = withContext(Dispatchers.IO) { BotHost.imageCacheSize(ctx) }
-        }
-    }
-
-    /** 点一下直接清（不弹确认）：清完把占用重算一遍，再给一句提示。 */
-    fun clearCache() {
-        scope.launch {
-            val (files, bytes) = withContext(Dispatchers.IO) { BotHost.clearImageCache(ctx) }
-            cacheBytes = withContext(Dispatchers.IO) { BotHost.imageCacheSize(ctx) }
-            msg = if (files <= 0) "暂无缓存可清理" else "已清理 " + fmtSize(bytes)
-        }
+        val n = if (changed) BotRestarts.requestAllEnabled(ctx, "设置保存") else 0
+        msg = "已切到「" + judgeOptions.getOrElse(index) { "" } + "」" +
+            if (n > 0) "，正在重启 " + n + " 个 bot…" else ""
     }
 
     // 消息存档：占用字节 + 条数（-1 = 还没读到 / 条数未知）
@@ -366,18 +356,6 @@ private fun MiuixSettingsBody(
                     // 单行行（无副标题）：图标不要 -9dp 偏移，与标题同高
                     startAction = { SettingsRowIcon(Icons.Filled.Tune) },
                     onClick = actions.onOpenTheme,
-                )
-            }
-        }
-
-        // ② 识图缓存：副标题挂当前占用，点一下直接清（不弹确认）
-        item(key = "cache") {
-            SettingsMiuixGroup {
-                ArrowPreference(
-                    title = "清理识图缓存",
-                    summary = cacheSummary(vm.cacheBytes),
-                    startAction = { SettingsRowIcon(Icons.Filled.Delete) },
-                    onClick = { vm.clearCache() },
                 )
             }
         }
@@ -613,20 +591,6 @@ private fun MaterialSettingsBody(
             }
         }
 
-        // ② 识图缓存：副标题挂当前占用，点一下直接清（不弹确认）
-        item(key = "cache") {
-            SegmentedGroup(modifier = settingsGroupPadding()) {
-                item {
-                    SegmentedArrowItem(
-                        title = "清理识图缓存",
-                        summary = cacheSummary(vm.cacheBytes),
-                        icon = Icons.Filled.Delete,
-                        onClick = { vm.clearCache() },
-                    )
-                }
-            }
-        }
-
         // ② 模型配置：入口行（当前模型名挂在 summary），点进独立的二级页
         item(key = "llm") {
             SegmentedGroup(modifier = settingsGroupPadding()) {
@@ -806,10 +770,6 @@ private fun MaterialSettingsBody(
 
 /** 组间距照 SukiSU SettingsMaterial.kt：start 16 / end 16 / bottom 13dp。 */
 private fun settingsGroupPadding(): Modifier = Modifier.segmentedGroupInsets()
-
-/** 识图缓存占用的文案：「暂无缓存」/「当前 12.4 MB」/「当前 860 KB」 */
-private fun cacheSummary(bytes: Long): String =
-    if (bytes <= 0L) "暂无缓存" else "当前 " + fmtSize(bytes)
 
 private fun fmtSize(bytes: Long): String = when {
     bytes <= 0L -> "0 MB"

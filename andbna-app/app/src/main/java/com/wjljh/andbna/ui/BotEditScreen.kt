@@ -45,6 +45,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wjljh.andbna.ModelCatalog
 import com.wjljh.andbna.local.BotHost
+import com.wjljh.andbna.local.BotRestarts
 import com.wjljh.andbna.local.BotStore
 import com.wjljh.andbna.local.BotStore.groupAutochatOverride
 import com.wjljh.andbna.local.BotStore.setGroupAutochatOverride
@@ -235,6 +236,11 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
         scope.launch {
             val saved = withContext(Dispatchers.IO) {
                 val old = BotStore.load(ctx).firstOrNull { it.appid == appid }
+                // 保存前的现值：真变了才重启（并走 1.5 秒合并窗口），每次点保存都断线没人受得了
+                val prevKey = ctx.llmKey
+                val prevApi = ctx.llmApi
+                val prevModel = ctx.llmModel
+                val prevWords = WordsStore.loadBot(ctx, appid)
                 if (old != null) {
                     BotStore.upsert(
                         ctx,
@@ -278,14 +284,25 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                     WordsStore.saveBotSlots(ctx, appid, normalized.map { it.toWordsSlot() })
                 }
                 if (!okSlots) wordsErr = "时段没写进 greetings.json"
-                // 运行时只在启动时建调度循环、配置是每轮现读的，但 bot 有可能还没起过；
-                // 人格 / 时段真的变了才重连一次（一次重连，原因一起写清），别每次保存都断线。
+                // 运行时只在启动时建调度循环、配置是每轮现读的，所以改动要重连一次才生效；
+                // 但只有「值确实变了」才重连（人格 / 称呼 / 问候 / 模型三件套 / 启用 / 名字都算）。
                 val slotChanged = normalized != slotsBaseline
-                val reasons = ArrayList<String>()
-                if (old != null && old.persona != persona) reasons.add("人格变更")
-                if (slotChanged) reasons.add("问候时段变更")
-                val note = if (reasons.isEmpty()) "" else {
-                    BotHost.restartOne(ctx, appid, reasons.joinToString("、"))
+                val changed = slotChanged || old != null && old.let { o ->
+                    o.persona != persona ||
+                        o.name.trim() != name.trim() ||
+                        o.enabled != enabled ||
+                        o.useGlobalLlm != inherit ||
+                        o.secret != secret.trim().ifBlank { o.secret } ||
+                        (!inherit && (prevKey != llmK.trim() || prevApi != llmA.trim() ||
+                            prevModel != llmM.trim())) ||
+                        prevWords.master != aliasMaster ||
+                        prevWords.others != aliasOthers ||
+                        prevWords.enabled != greetOn ||
+                        prevWords.ownerTarget != greetOwner ||
+                        prevWords.groupsTarget != greetGroups
+                }
+                val note = if (!changed || !BotRestarts.requestOne(ctx, appid, "编辑保存")) "" else {
+                    "正在重启「" + name.trim().ifBlank { appid } + "」…"
                 }
                 SavedNote(note = note, wordsErr = wordsErr, slotChanged = slotChanged)
             }

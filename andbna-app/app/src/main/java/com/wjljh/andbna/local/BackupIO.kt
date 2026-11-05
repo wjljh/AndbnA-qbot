@@ -5,7 +5,9 @@ import android.net.Uri
 import android.util.Log
 import com.wjljh.andbna.local.BotStore.llmApi
 import com.wjljh.andbna.local.BotStore.llmContextWindow
+import com.wjljh.andbna.local.BotStore.llmJudgeLevel
 import com.wjljh.andbna.local.BotStore.llmJudgeModel
+import com.wjljh.andbna.local.BotStore.nameHitAsCall
 import com.wjljh.andbna.local.BotStore.llmModel
 import com.wjljh.andbna.local.BotStore.llmReasoningEffort
 import com.wjljh.andbna.local.BotStore.llmSummaryModel
@@ -110,6 +112,8 @@ object BackupIO {
             .put("model", ctx.llmModel)
             .put("vision_model", ctx.llmVisionModel)
             .put("reasoning_effort", ctx.llmReasoningEffort)
+            .put("judge_level", ctx.llmJudgeLevel)
+            .put("name_hit_as_call", if (ctx.nameHitAsCall) "1" else "0")
             // 三个槽位模型 / 上下文窗口 / 联网开关：与 llm.json 同名同值（字符串原样带走）
             .put("judge_model", ctx.llmJudgeModel)
             .put("summary_model", ctx.llmSummaryModel)
@@ -434,12 +438,17 @@ object BackupIO {
             ctx.llmJudgeModel = l.optString("judge_model", "")
             ctx.llmSummaryModel = l.optString("summary_model", "")
             ctx.llmContextWindow = l.optString("context_window", DEFAULT_CONTEXT_WINDOW)
+            // 旧备份没有这两个键：按默认值（偏积极 / 名字命中即回）写，不报错
+            ctx.llmJudgeLevel = l.optString("judge_level", "normal")
+            ctx.nameHitAsCall = l.optString("name_hit_as_call", "1").trim() != "0"
             ctx.webSearchEnabled = truthy(l.optString("web_search_enabled", "true"), true)
             BotStore.writeLlmJson(ctx)
             log(
                 "模型配置已写入：" + ctx.llmApi + " / " + ctx.llmModel +
                     "（判定 " + ctx.llmJudgeModel.ifBlank { "同主模型" } +
                     " / 摘要 " + ctx.llmSummaryModel.ifBlank { "同主模型" } +
+                    " / 判定 " + ctx.llmJudgeLevel +
+                    (if (ctx.nameHitAsCall) "（名字命中即回）" else "（名字不算被叫）") +
                     " / 窗口 " + ctx.llmContextWindow +
                     " / 联网 " + (if (ctx.webSearchEnabled) "开" else "关") +
                     (if (old) "；旧备份无这 4 个键，已按默认值写" else "") +

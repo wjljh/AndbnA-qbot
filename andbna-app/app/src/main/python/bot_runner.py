@@ -203,6 +203,14 @@ def _llm_conf(base_dir):
     style_on = True if style_on is None else bool(style_on)
     auto_decide = c.get("search_auto_decide")
     auto_decide = True if auto_decide is None else bool(auto_decide)
+    # 判定这边两个开关（1.0.6）：主动程度三档 + 名字命中就当被叫
+    judge_level = str(c.get("judge_level") or "").strip().lower()
+    if judge_level not in _JUDGE_LEVELS:
+        judge_level = _JUDGE_LEVEL_DEFAULT
+    nh = c.get("name_hit_as_call")
+    if isinstance(nh, str):
+        nh = nh.strip().lower() not in ("", "0", "false", "no", "off")
+    name_hit_as_call = True if nh is None else bool(nh)
     provider = str(c.get("search_provider") or "").strip().lower()
     if provider not in ("deepseek", "searxng", "custom", "off"):
         provider = "deepseek"        # 旧配置没这个键 → 仍按 DeepSeek 官方
@@ -220,6 +228,7 @@ def _llm_conf(base_dir):
             "judge_model": judge_model, "summary_model": summary_model,
             "search_model": search_model,
             "reasoning_effort": effort, "context_window": window,
+            "judge_level": judge_level, "name_hit_as_call": name_hit_as_call,
             "web_search_enabled": web_on, "search_persona_style": style_on,
             "search_auto_decide": auto_decide,
             "search_provider": provider, "search_base": s_base,
@@ -580,15 +589,113 @@ def _call_llm_sync(conf, messages, max_tokens=400, temperature=0.9):
 #
 # 设置页那一行：模型判断（llm）/ 随机（random，按「闲聊概率」掷骰子）。
 # 只影响「没 @ 本 bot 的群消息」，@ 的照旧必回。
+#
+# 1.0.6 重写：旧提示词只有一句「该你接就回 1」，模型默认保守 —— 实机连续 6 次全判 0
+# （连明确叫出角色名的那条也是 0）。现在给判断依据 + 6 条正反例 + 主动程度三档，
+# 并写明「拿不准时选择 1」；解析不出 1/0 也按「接」处理（宁可多接一句，不冷场）。
 
 _judge = {"mode": "llm", "prob": 0.3}
 
+# 主动程度三档：conservative 要求明确指向；normal（默认）偏积极；eager 几乎不拒。
+_JUDGE_LEVELS = ("conservative", "normal", "eager")
+_JUDGE_LEVEL_DEFAULT = "normal"
 
-async def _should_reply(conf, text):
+_JUDGE_BASIS = (
+    "你在一个 QQ 群里，正以角色身份和大家聊天。现在有人说了下面这一句，"
+    "你要判断：这句话该不该由你接一句。\n"
+    "\n"
+    "【该接，回 1】\n"
+    "- 有人在提问、求建议、征求意见（就算没点名）\n"
+    "- 有人在感慨、吐槽、自言自语，明显想找人搭话\n"
+    "- 有人叫了你的角色名、称呼，或者明显在跟你说话\n"
+    "- 群里正聊得热闹，你接一句能让话继续下去\n"
+    "\n"
+    "【不该接，回 0】\n"
+    "- 明显是冲着别人说的（有明确对象、在安排具体的事）\n"
+    "- 纯指令 / 纯操作：签到、报数、发链接、发文件、命令词\n"
+    "- 刷屏、复读、表情包、无意义的字符\n"
+    "- 两个人已经成对的连续对话，插进去只会打断\n"
+    "\n"
+    "【例子】\n"
+    "「这游戏有人玩过吗」→ 1\n"
+    "「今天好累啊」→ 1\n"
+    "「你们说晚上吃啥好」→ 1\n"
+    "「@张三 把文件发我一下」→ 0\n"
+    "「签到」→ 0\n"
+    "「哈哈哈哈哈哈哈」→ 0\n"
+)
+
+_JUDGE_LEAN = {
+    "conservative": "【倾向】保守：只有明确在叫你、明确在问你时才回 1，其它一律 0。",
+    "normal": "【倾向】偏积极：拿不准时选择 1 —— 宁可多接一句，也别让群里冷场。",
+    "eager": "【倾向】积极：几乎都回 1；只有刷屏、复读、纯指令或明显对别人说的才回 0。",
+}
+
+# 两个词表供 _parse_judge 用：先判「不接」（"不接" 里含「接」，顺序不能反）。
+# 拉丁词按词边界匹配 —— 否则 "Need decide." 里的 n 会被当成 "no"。
+_JUDGE_NO_WORDS = ("不接", "不该", "别接", "不要", "不用", "不回", "不是", "否")
+_JUDGE_YES_WORDS = ("接", "要", "回", "是")
+_JUDGE_NO_ASCII = ("no", "false", "n")
+_JUDGE_YES_ASCII = ("yes", "true", "y")
+
+
+def _judge_level(conf):
+    """主动程度：conservative / normal / eager，认不出就是 normal。"""
+    lv = str((conf or {}).get("judge_level") or "").strip().lower()
+    return lv if lv in _JUDGE_LEVELS else _JUDGE_LEVEL_DEFAULT
+
+
+def _judge_prompt(text, level):
+    """判定提示词：判断依据 + 正反例 + 该档的倾向 + 只回 1/0。"""
+    lean = _JUDGE_LEAN.get(level) or _JUDGE_LEAN[_JUDGE_LEVEL_DEFAULT]
+    return "%s\n%s\n\n只回一个 1 或 0，不要解释。\n\n这句话是：%s" % (
+        _JUDGE_BASIS, lean, str(text or "")[:200])
+
+
+def _parse_judge(raw):
+    """判定输出 → True（接）/ False（不接）/ None（看不懂）。
+
+    认 1/0、接/不接、yes/no、true/false、是/否（大小写不敏感，允许前后有标点）。
+    先找「不接」这类否定词（"不接" 里含「接」），再找肯定词；中文按子串、拉丁词按词边界；
+    都找不到给 None，调用方按「拿不准 = 接」处理。
+    """
+    s = str(raw or "").strip().lower()
+    s = s.strip(" \t\r\n.:：,，。！!？?；;、\"'“”‘’()（）[]【】")
+    if not s:
+        return None
+    if s in ("1", "1.0"):
+        return True
+    if s in ("0", "0.0"):
+        return False
+    hits = []
+    for words, val in ((_JUDGE_NO_WORDS, False), (_JUDGE_YES_WORDS, True)):
+        for w in words:
+            i = s.find(w)
+            if i >= 0:
+                hits.append((i, -len(w), val))
+    for words, val in ((_JUDGE_NO_ASCII, False), (_JUDGE_YES_ASCII, True)):
+        for w in words:
+            m = re.search(r"(?<![a-z])" + w + r"(?![a-z])", s)
+            if m:
+                hits.append((m.start(), -len(w), val))
+    if hits:
+        hits.sort()
+        return hits[0][2]
+    # 推理模型的结论常落在头或尾（"Need decide. … 1"）
+    for ch in (s[:1], s[-1:]):
+        if ch == "1":
+            return True
+        if ch == "0":
+            return False
+    return None
+
+
+async def _should_reply(conf, text, level=""):
     """这条没 @ 的消息要不要接一句。
 
     conf 传主模型配置即可：判定槽位（judge_model，留空 = 主模型）在这里现取，
     所以日志里的「判定（模型 X）」永远是真正发出去的那个 model 字段。
+    level 留空 = 用 llm.json 里的 judge_level（默认 normal）。
     """
     if _judge["mode"] != "llm":
         import random as _random
@@ -598,25 +705,26 @@ async def _should_reply(conf, text):
     if not conf:
         log("判定跳过：模型配置没填（llm.json 缺 key / 地址）")
         return False
+    lv = level if level in _JUDGE_LEVELS else _judge_level(conf)
     jconf = _conf_for("judge") or conf
-    prompt = (
-        "群里有人说：%s\n\n"
-        "如果你觉得这句话该由你接一句，只回 1；不该插话只回 0。\n"
-        "只回一个字符，不要解释。" % str(text or "")[:200]
-    )
+    prompt = _judge_prompt(text, lv)
     try:
         raw = await asyncio.to_thread(
             _call_llm_sync, jconf, [{"role": "user", "content": prompt}], 200, 0.2,
         )
-        raw = (raw or "").strip()
-        # 推理模型的正文可能只有「1」落在开头或结尾，两头都看一眼
-        hit = ("1" in raw[:4]) or (raw[-1:] == "1") or (raw[:1] == "1")
-        log("判定（模型 %s）：%s → %s" % (jconf["model"], (raw[:20] or "(空)").replace(chr(10), " "),
-                                        "接" if hit else "不接"))
+        brief = (str(raw or "").strip() or "(空)").replace(chr(10), " ")[:80]
+        hit = _parse_judge(raw)
+        if hit is None:
+            log("判定（模型 %s｜%s 档）：解析不出 1/0，原文前 80 字：%s → 按「接」处理"
+                % (jconf["model"], lv, brief))
+            return True
+        log("判定（模型 %s｜%s 档）：%s → %s" % (jconf["model"], lv, brief, "接" if hit else "不接"))
         return hit
     except Exception as e:
-        log("判定失败（按不接处理）：%r" % e)
-        return False
+        # 判定挂了不该等于沉默：eager / normal 按「接」，只有 conservative 按「不接」
+        hit = lv != "conservative"
+        log("判定失败（%s 档按「%s」处理）：%r" % (lv, "接" if hit else "不接", e))
+        return hit
 
 
 # ── 识图 ────────────────────────────────────────────────
@@ -1100,6 +1208,46 @@ def _aliases(botdir):
             if v:
                 out[k] = v
     return out
+
+
+def _name_words(botdir):
+    """被叫就能直回的名字：人格名 + phrases.json 的 aliases（master / others）。
+
+    人格名取 persona_name.txt（自定义人格已去掉「自定义：」前缀与 -完整 一类的后缀）；
+    aliases 里可能写了一串（主人、老板），按顿号/逗号/斜杠/空白拆开。
+    单字不算：你、是 这类写法会把每句话都判成在叫本 bot。
+    """
+    out = []
+    n = _persona_name(botdir)
+    if n:
+        out.append(n)
+    a = _aliases(botdir)
+    for k in ("master", "others"):
+        for w in re.split(r"[、,，/／\s]+", str(a.get(k) or "")):
+            w = w.strip()
+            if w:
+                out.append(w)
+    seen, words = set(), []
+    for w in out:
+        if len(w) < 2 or w.lower() in seen:
+            continue
+        seen.add(w.lower())
+        words.append(w)
+    return words
+
+
+def _name_hit(botdir, text):
+    """消息里出现人格名或某个称呼 → 返回命中的那个词（空串 = 没命中）。
+
+    命中就视为被叫了：跳过回复判定直接回，日志写「名字命中（X）→ 直回」。
+    """
+    low = str(text or "").lower()
+    if not low:
+        return ""
+    for w in _name_words(botdir):
+        if w.lower() in low:
+            return w
+    return ""
 
 
 def _aliases_sentence(a):
@@ -4306,6 +4454,135 @@ def _learn_from_mentions(botdir, mentions):
     return added
 
 
+def _author_label(botdir, oid):
+    """作者的称呼：known_chats.json 里存的昵称 > 主人 > openid 前 8 位。
+
+    提示词里绝不出现完整 openid（省 token，也不把别人的 id 抖给模型）。
+    """
+    oid = str(oid or "").strip()
+    if not oid:
+        return "某人"
+    d = _load_json(os.path.join(_bot_root(botdir), "known_chats.json"), {})
+    chats = d.get("chats") if isinstance(d, dict) else None
+    if isinstance(chats, list):
+        for c in chats:
+            if isinstance(c, dict) and str(c.get("openid") or "") == oid:
+                nm = str(c.get("name") or c.get("nick") or c.get("nickname") or "").strip()
+                if nm:
+                    return nm
+    if _owner_openid(botdir) == oid:
+        return "主人"
+    return _oid8(oid) or "某人"
+
+
+def _own_mention_ids(appid, botdir, mentions):
+    """本 bot 自己的 @ id：候选集合 + mentions 里 is_you=true 的那个。"""
+    own = set(str(c).upper() for c in _candidates(appid, botdir))
+    for e in mentions:
+        if _mention_flag(e, "is_you", "isYou") is True:
+            mid = _mention_id(e)
+            if mid:
+                own.add(mid.upper())
+    return own
+
+
+def _at_semantics(appid, botdir, message):
+    """把正文里的 <@id> 换成人能懂的称呼，并给出一行 @ 元信息。
+
+    返回 (正文, 元信息行, 日志行)：
+      · 与本 bot 自己的 id 相同 -> @你
+      · 与作者 openid 相同     -> @作者本人
+      · 其它                   -> @用户 加 openid 前 8 位
+    元信息：[作者 X ｜ 本条 @ 了：你、作者本人、用户xxxxxxxx]，没有 @ 就是「无人」。
+    """
+    text = str(getattr(message, "content", "") or "")
+    mentions = _mentions_of(message)
+    own = _own_mention_ids(appid, botdir, mentions)
+    author_ids = [str(i).upper() for i in _author_ids(message)]
+    author = (_author_ids(message) or [""])[0]
+    labels, kinds, seen = [], [], set()
+
+    def _label(tok):
+        t = str(tok or "").upper()
+        if t and t in own:
+            return "你", "你"
+        if t and t in author_ids:
+            return "作者本人", "作者"
+        tag = "用户" + str(tok or "")[:8]
+        return tag, tag
+
+    def _one(m):
+        tok = m.group(1)
+        lab, _kind = _label(tok)
+        key = str(tok or "").upper() or lab
+        if key not in seen:
+            seen.add(key)
+            labels.append(lab)
+            kinds.append(_kind)
+        return "@" + lab
+
+    body = _AT_ANY_RE.sub(_one, text)
+    for e in mentions:
+        mid = _mention_id(e)
+        if not mid or mid.upper() in seen:
+            continue
+        lab, kind = _label(mid)
+        seen.add(mid.upper())
+        labels.append(lab)
+        kinds.append(kind)
+    body = _WS_RE.sub(" ", _TAG_RE.sub("", body)).strip()
+    shown = "、".join(labels) if labels else "无人"
+    who = _author_label(botdir, author)
+    meta = "[作者 %s｜本条 @ 了：%s]" % (who, shown)
+    line = "@ 语义：作者=%s｜提及=%s（%d 个）" % (
+        who, "/".join(kinds) if kinds else "无人", len(kinds))
+    return body, meta, line
+
+
+_AT_ANY_RE = re.compile(r"<@!?([^>]*)>")    # 正文里任意 <@…>（openid 不必是纯 hex）
+_AT_OUT_RE = re.compile(r"<at>(.*?)</at>", re.I | re.S)
+_AT_SLOT = "⟦AT%d⟧"
+
+
+def _resolve_at_tags(text, mentions):
+    """模型输出 <at>openid 前 8 位或全量</at> -> (文本, 要 @ 的 openid 列表)。
+
+    只认本条消息 mentions 里的 id（模型瞎编的 id 一律剥掉，防乱 @ 人）：
+    全量相等，或至少 4 位的唯一前缀匹配。解析不出来的标签直接删掉。
+    """
+    ids = []
+    for e in mentions:
+        for k in ("id", "member_openid", "user_openid"):
+            v = e.get(k) if isinstance(e, dict) else getattr(e, k, None)
+            v = str(v or "").strip()
+            if v and v not in ids:
+                ids.append(v)
+    hits = []
+
+    def _one(m):
+        tok = str(m.group(1) or "").strip()
+        if not tok:
+            return ""
+        cand = [i for i in ids if i == tok]
+        if not cand:
+            cand = [i for i in ids if len(tok) >= 4 and i.startswith(tok)]
+        if len(cand) != 1:
+            return ""
+        hits.append(cand[0])
+        return _AT_SLOT % (len(hits) - 1)
+
+    plain = _AT_OUT_RE.sub(_one, str(text or ""))
+    return plain, hits
+
+
+def _at_markdown(plain, ids):
+    """占位符换成平台语法：群聊 markdown 消息里的 qqbot-at-user 标签。"""
+    out = str(plain or "")
+    for i, oid in enumerate(ids or []):
+        out = out.replace(_AT_SLOT % i, '<qqbot-at-user id="%s"/>' % oid)
+    return out
+
+
 def _strip_mentions(text):
     """去掉正文里的 <@…> —— 模型不该看到一堆 hex。"""
     return _WS_RE.sub(" ", _TAG_RE.sub("", str(text or ""))).strip()
@@ -4508,20 +4785,30 @@ async def _handle_group(appid, botdir, message, tag):
             log("跳过：判不出是否 @ 本 bot（%s｜%s）" % (why_at, brief), appid)
             return
         if state == "no":
-            # 三层判定：群配置显式值 > 该 bot 覆盖 > 全局（日志写清是哪一层判的）
-            auto_on, auto_src = _group_autochat_state(appid, gc)
-            if not auto_on:
-                log("跳过：未 @ 本 bot（%s），且「群里自动接话」关闭（判定来源：%s）"
-                    "→ 默认只回 @（%s）" % (why_at, auto_src, brief), appid)
-                return
-            # 开着也写清是哪一层判的（群配置 / 该 bot 覆盖 / 全局），便于核对三态
-            log("自动接话开（判定来源：%s）｜%s" % (auto_src, brief), appid)
-            # 自动接话开着：交给「回复判定」（设置页那一行）决定要不要插话
             conf_j = _llm_conf(_base_dir) if _base_dir else None
-            if not await _should_reply(conf_j, text):
-                log("跳过：回复判定不接这句（%s）" % brief, appid)
-                return
-            log("回复判定接这句（%s）" % brief, appid)
+            jlv = _judge_level(conf_j)
+            # 名字命中前置（name_hit_as_call，默认开）：正文里出现人格名或称呼 = 被叫，
+            # 不看「群里自动接话」也不问判定模型，直接回 —— 实机里「沃雅妮莎在干啥呢」
+            # 被判成 0 的那类句子就是从这里救回来的。
+            called = ""
+            if conf_j is None or conf_j.get("name_hit_as_call", True):
+                called = _name_hit(botdir, text)
+            if called:
+                log("名字命中（%s）→ 直回（%s）" % (called, brief), appid)
+            else:
+                # 三层判定：群配置显式值 > 该 bot 覆盖 > 全局（日志写清是哪一层判的）
+                auto_on, auto_src = _group_autochat_state(appid, gc)
+                if not auto_on:
+                    log("跳过：未 @ 本 bot（%s），且「群里自动接话」关闭（判定来源：%s）"
+                        "→ 默认只回 @（%s）" % (why_at, auto_src, brief), appid)
+                    return
+                # 开着也写清是哪一层判的（群配置 / 该 bot 覆盖 / 全局），便于核对三态
+                log("自动接话开（判定来源：%s）｜%s" % (auto_src, brief), appid)
+                # 自动接话开着：交给「回复判定」（设置页那一行）决定要不要插话
+                if not await _should_reply(conf_j, text, jlv):
+                    log("跳过：回复判定不接这句（%s）" % brief, appid)
+                    return
+                log("回复判定接这句（%s）" % brief, appid)
 
     # 闸 4 · 限流 + 熔断（只有真要回才占额度）
     ok, why_rate = _gate_rate(appid, gid)
@@ -4557,6 +4844,11 @@ async def _handle_group(appid, botdir, message, tag):
         log("收到 %d 张图片附件（%s）" % (
             len(images), "，".join([a.get("filename") or "未命名" for a in images])[:60]), appid)
     clean = _strip_mentions(text)
+    # @ 语义：<@hex> 换成「你 / 作者本人 / 用户xxxxxxxx」，再在消息前加一行元信息。
+    # 模型靠这两样才分得清「@的是我」「@的是说话的人」「@的是别人」。
+    at_body, at_meta, at_line = _at_semantics(appid, botdir, message)
+    log(at_line, appid)
+    model_in = (at_meta + chr(10) + at_body) if at_body else at_meta
     # 本地指令先判：过了四道闸就算「该回这条」，回时间不必打扰模型
     if await _local_time_reply(appid, message, clean, group_openid=gid):
         return
@@ -4564,12 +4856,28 @@ async def _handle_group(appid, botdir, message, tag):
     if await _local_web_cmd(appid, message, clean, group_openid=gid, botdir=botdir):
         return
     try:
-        # 模型不该看到 <@hex>：先去掉 @ 标签再进模型/记忆
-        reply = await _reply(appid, botdir, "g" + gid, "", clean, images=images)
-        _note_sent(appid, gid, reply)
-        await message._api.post_group_message(
-            group_openid=gid, msg_type=0, msg_id=mid, content=reply,
-        )
+        reply = await _reply(appid, botdir, "g" + gid, "", model_in, images=images)
+        # 模型可以 @ 别人（<at>openid 前 8 位或全量</at>）：只认本条消息的 mentions，
+        # 平台侧群聊只有 markdown 消息（msg_type=2）认 @ 标签，所以带 @ 时换一种发法，
+        # 发不出去就退回纯文本（标签已剥）—— 回复本身不能因此丢掉。
+        plain, at_ids = _resolve_at_tags(reply, _mentions_of(message))
+        _note_sent(appid, gid, plain)
+        if at_ids:
+            log("@ 发出：%d 个（群聊 markdown 消息）" % len(at_ids), appid)
+            try:
+                await message._api.post_group_message(
+                    group_openid=gid, msg_type=2, msg_id=mid,
+                    markdown={"content": _at_markdown(plain, at_ids)},
+                )
+            except Exception as e_at:
+                log("@ 消息发送失败（%r）→ 退回纯文本" % e_at, appid)
+                await message._api.post_group_message(
+                    group_openid=gid, msg_type=0, msg_id=mid, msg_seq=2, content=plain,
+                )
+        else:
+            await message._api.post_group_message(
+                group_openid=gid, msg_type=0, msg_id=mid, content=plain,
+            )
     except Exception as e:
         log("回群失败：%r" % e, appid)
 
