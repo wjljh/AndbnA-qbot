@@ -68,6 +68,7 @@ import com.wjljh.andbna.ui.component.rememberPersonaImporter
 import com.wjljh.andbna.ui.component.PanelArrowRow
 import com.wjljh.andbna.ui.component.PanelGroupCard
 import com.wjljh.andbna.ui.component.PanelIconPillButton
+import com.wjljh.andbna.ui.component.PanelListRow
 import com.wjljh.andbna.ui.component.PanelPillRow
 import com.wjljh.andbna.ui.component.PanelPrimaryButton
 import com.wjljh.andbna.ui.component.PanelSecondaryButton
@@ -153,6 +154,8 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     var judgeOverride by remember(appid) { mutableStateOf("") }
     /** 全局判定档（"跟随全局（正常）" 括号里那两个字用） */
     var globalJudge by remember { mutableStateOf("normal") }
+    /** 全局判定模式（设置页那一行）：随机 = 按闲聊概率掷骰子，三态覆盖不生效 */
+    val judgeRandom = ReplyJudgeMode.isRandom(ctx)
     // 本 bot 的回复延迟（localbots.json 的 reply_delay_min_ms/max_ms）：0/0=跟随全局、1/1=不延迟
     var delayMinMs by remember(appid) { mutableStateOf(0) }
     var delayMaxMs by remember(appid) { mutableStateOf(0) }
@@ -626,17 +629,27 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
             // 回复判定 + 回复延迟：都是**按 bot 的覆盖**（跟随全局 = 落盘 "" 与 0,0），
             // 改这里只影响本 bot，保存时跟其它字段一起写 localbots.json（沿用「保存即重启该 bot」）。
             BotFormSection(title = "回复判定与延迟") {
-                OverlayDropdownPreference(
-                    insideMargin = PanelTokens.PrefInside,
-                    title = "回复判定",
-                    summary = "没被 @ 时多主动才插话；右侧括号里是实际生效的那一档",
-                    items = judgeLabels(globalJudge),
-                    selectedIndex = judgeIndex(judgeOverride),
-                    onSelectedIndexChange = { i ->
-                        judgeOverride = judgeValue(i)
-                        msg = "回复判定：" + judgeLabels(globalJudge)[i] + "（保存后生效）"
-                    },
-                )
+                if (judgeRandom) {
+                    // 随机判定：三档覆盖不生效（真正生效的是设置页的「闲聊概率」），
+                    // 这一行只留灰字说明、不给下拉 —— 点了也改不了任何东西。
+                    PanelListRow(
+                        title = "回复判定",
+                        meta = "跟随全局（随机模式）",
+                        enabled = false,
+                    )
+                } else {
+                    OverlayDropdownPreference(
+                        insideMargin = PanelTokens.PrefInside,
+                        title = "回复判定",
+                        summary = "没被 @ 时多主动才插话；右侧括号里是实际生效的那一档",
+                        items = judgeLabels(globalJudge),
+                        selectedIndex = judgeIndex(judgeOverride),
+                        onSelectedIndexChange = { i ->
+                            judgeOverride = judgeValue(i)
+                            msg = "回复判定：" + judgeLabels(globalJudge)[i] + "（保存后生效）"
+                        },
+                    )
+                }
                 HorizontalDivider(
                     modifier = Modifier.padding(vertical = 6.dp),
                     thickness = PanelTokens.Divider,
@@ -1137,33 +1150,20 @@ private fun autochatValue(index: Int): String = when (index) {
  * 判定三档的下拉文案：第 0 项把**全局实际档**写进括号里。
  *
  * 右侧显示的就是 items[selectedIndex]，所以「跟随全局」这一档天然显示成
- * 「跟随全局（正常）」—— 不用另开一行小字。
+ * 「跟随全局（当前：标准）」—— 不用另开一行小字。叫法与顺序统一取 [JudgeLabels]。
  */
 private fun judgeLabels(globalLevel: String): List<String> =
-    listOf("跟随全局（" + judgeLevelText(globalLevel) + "）", "保守", "正常", "积极")
+    listOf("跟随全局（当前：" + JudgeLabels.labelOf(globalLevel) + "）") + JudgeLabels.labels
 
-/** conservative / normal / eager → 界面上的两个字（脏值按 normal）。 */
-private fun judgeLevelText(raw: String): String = when (raw.trim().lowercase()) {
-    "conservative" -> "保守"
-    "eager" -> "积极"
-    else -> "正常"
-}
-
-/** 落盘值（judge_level_override）→ 下拉下标：""=跟随全局。 */
-private fun judgeIndex(value: String): Int = when (value.trim().lowercase()) {
-    "conservative" -> 1
-    "normal" -> 2
-    "eager" -> 3
-    else -> 0
+/** 落盘值（judge_level_override）→ 下拉下标：""=跟随全局，其余按 [JudgeLabels] 的强度顺序顺延。 */
+private fun judgeIndex(value: String): Int {
+    val raw = value.trim().lowercase()
+    val i = JudgeLabels.values.indexOf(raw)
+    return if (raw.isNotEmpty() && i >= 0) i + 1 else 0
 }
 
 /** 下拉下标 → 落盘值（"" 就是跟随全局，键照样写，值为空串）。 */
-private fun judgeValue(index: Int): String = when (index) {
-    1 -> "conservative"
-    2 -> "normal"
-    3 -> "eager"
-    else -> ""
-}
+private fun judgeValue(index: Int): String = JudgeLabels.values.getOrNull(index - 1).orEmpty()
 
 /**
  * 每 bot 的延迟预设。

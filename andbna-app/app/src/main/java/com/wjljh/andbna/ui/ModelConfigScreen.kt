@@ -102,13 +102,6 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
     var autoDecide by remember {
         mutableStateOf(ModelPrefs.read(ctx, "search_auto_decide").trim() != "0")
     }
-    // 回复判定两件套（1.0.6）：主动程度三档 + 名字命中就当被叫
-    var judgeLevel by remember {
-        mutableStateOf(ModelPrefs.read(ctx, "llm_judge_level").trim().ifBlank { "normal" })
-    }
-    var nameHit by remember {
-        mutableStateOf(ModelPrefs.read(ctx, "name_hit_as_call").trim() != "0")
-    }
     // 上下文窗口的「自定义…」：只是把输入框就地摊开，值仍由 contextWindow 持有
     var windowCustom by remember { mutableStateOf(false) }
     // 搜索后端（deepseek / searxng / custom / off）与它的三个字段
@@ -190,7 +183,6 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
             judge = judgeModel, summary = summaryModel, search = searchModel,
             window = contextWindow, web = webOn, personaStyle = personaStyle,
             autoDecide = autoDecide, effort = effort,
-            judgeLevel = judgeLevel, nameHit = nameHit,
             searchProvider = provider, searchBase = searchBase,
             searchAuth = authWire(authMode, authName, authValue, provider),
             searchFields = searchFields,
@@ -213,8 +205,6 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
             "，" + (if (webOn) "联网开" else "联网关") +
             (if (personaStyle) "，人设化回答开" else "，人设化回答关") +
             (if (autoDecide) "，自判联网开" else "，自判联网关") +
-            "，判定 " + judgeLevelLabel(judgeLevel) +
-            (if (nameHit) "，名字命中即回" else "，名字不算被叫") +
             "，搜索服务 " + providerLabel(provider) + "，" + e + "）" +
             if (restarted > 0) "，正在重启 " + restarted + " 个 bot…" else ""
     }
@@ -354,7 +344,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 )
 
                 // ④ 思考强度：点一行 → 弹列表面板（与人格选择器同一个 miuix 下拉）→ 选中回填
-                SectionCard(metrics, title = "思考强度", gap = 10.dp) {
+                SectionCard(metrics, title = "思考强度", gap = 10.dp, titleOutside = true) {
                     OverlayDropdownPreference(
                         insideMargin = PanelTokens.PrefInside,
                         title = "取值",
@@ -449,7 +439,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 // ⑤ 上下文窗口（token）：与思考强度同一套「点一行 → 弹列表」样式
                 val winPreset = WINDOW_PRESETS.indexOfFirst { it.second == contextWindow.trim() }
                 val winCustomShown = windowCustom || winPreset < 0
-                SectionCard(metrics, title = "上下文窗口") {
+                SectionCard(metrics, title = "上下文窗口", titleOutside = true) {
                     OverlayDropdownPreference(
                         insideMargin = PanelTokens.PrefInside,
                         title = "取值",
@@ -493,40 +483,8 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                     )
                 }
 
-                // ⑤' 回复判定：主动程度三档 + 名字命中就当被叫
-                SectionCard(metrics, title = "回复判定") {
-                    OverlayDropdownPreference(
-                        insideMargin = PanelTokens.PrefInside,
-                        title = "主动程度",
-                        summary = judgeLevelLabel(judgeLevel),
-                        items = JUDGE_LEVEL_LABELS,
-                        selectedIndex = JUDGE_LEVELS.indexOf(judgeLevel).coerceAtLeast(0),
-                        onSelectedIndexChange = { i ->
-                            judgeLevel = JUDGE_LEVELS[i]
-                            error = ""
-                            notice = "主动程度已选「" + JUDGE_LEVEL_LABELS[i] + "」，点保存才落盘"
-                        },
-                    )
-                    SwitchPreference(
-                        title = "名字命中就当被叫",
-                        summary = if (nameHit)
-                            "正文里出现人格名或称呼 → 跳过判定直接回"
-                        else "只在 @ 本 bot 时才回（或交给回复判定）",
-                        checked = nameHit,
-                        onCheckedChange = { nameHit = it },
-                    )
-                    Text(
-                        text = "主动程度只影响「没 @ 本 bot」的群消息：保守要求明确在叫你，偏积极" +
-                            "（默认）拿不准就接，积极几乎都接。判定模型答不出 1/0 时按「接」处理；" +
-                            "判定调用失败时只有在「保守」档才按「不接」。",
-                        fontSize = 13.sp,
-                        color = PanelColors.onSurfaceVariantSummary,
-                        modifier = Modifier.padding(top = 6.dp),
-                    )
-                }
-
                 // ⑥ 联网：搜索后端可换（DeepSeek 官方 / SearXNG / 自定义 JSON / 关）
-                SectionCard(metrics, title = "联网搜索") {
+                SectionCard(metrics, title = "联网搜索", titleOutside = true) {
                     SwitchPreference(
                         title = "联网搜索",
                         summary = if (webOn) "已开启 · #搜 / #读 与自动搜索都可用"
@@ -856,15 +814,6 @@ private fun authWire(mode: String, name: String, value: String, provider: String
 }
 private val EFFORT_ITEMS = listOf("不指定（用平台默认）") + EFFORT_DISPLAYS + listOf("自定义…")
 
-/** 回复判定的主动程度：落盘/落 llm.json 用小写标识串，页面显示中文。 */
-private val JUDGE_LEVELS = listOf("normal", "conservative", "eager")
-private val JUDGE_LEVEL_LABELS = listOf("偏积极（默认）", "保守", "积极")
-
-private fun judgeLevelLabel(wire: String): String {
-    val i = JUDGE_LEVELS.indexOf(wire.trim().lowercase())
-    return if (i >= 0) JUDGE_LEVEL_LABELS[i] else JUDGE_LEVEL_LABELS[0]
-}
-
 /** 显示项 → 发送值（小写）。 */
 private fun effortWire(display: String): String = display.lowercase()
 
@@ -879,7 +828,7 @@ private object ModelPrefs {
     /** 保存会写到的那些键：保存前后各取一次，值真变了才自动重启 bot。 */
     private val SAVED_KEYS = listOf(
         "llm_api", "llm_key", "llm_model", "llm_vision_model", "llm_judge_model",
-        "llm_summary_model", "llm_search_model", "llm_judge_level", "name_hit_as_call",
+        "llm_summary_model", "llm_search_model",
         "llm_context_window", "web_search_enabled", "search_persona_style",
         "search_auto_decide", "search_provider", "search_base", "search_auth",
         "search_fields", "llm_reasoning_effort",
@@ -910,8 +859,6 @@ private object ModelPrefs {
         personaStyle: Boolean,
         autoDecide: Boolean,
         effort: String,
-        judgeLevel: String,
-        nameHit: Boolean,
         searchProvider: String,
         searchBase: String,
         searchAuth: String,
@@ -925,8 +872,6 @@ private object ModelPrefs {
             .putString("llm_judge_model", judge.trim())
             .putString("llm_summary_model", summary.trim())
             .putString("llm_search_model", search.trim())
-            .putString("llm_judge_level", judgeLevel.trim().ifBlank { "normal" })
-            .putString("name_hit_as_call", if (nameHit) "1" else "0")
             // 上下文窗口：留空就写默认 131072（Python 侧同一口径；老配置里的值不动）
             .putString("llm_context_window", window.trim().ifBlank { "131072" })
             .putString("web_search_enabled", if (web) "1" else "0")

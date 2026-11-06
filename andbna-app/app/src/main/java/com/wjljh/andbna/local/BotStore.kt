@@ -379,6 +379,19 @@ object BotStore {
             sp(this).edit().putString("human_hourly_limit", v.coerceAtLeast(1).toString()).apply()
         }
 
+    /**
+     * 设置页「每日上限」：0 = 无上限（落盘就是字符串 "0"），默认 50 条/天。
+     *
+     * 这是**全局**那一档：群配置里的「跟随全局」就是读它（llm.json 的 daily_limit，Python 侧同一口径）。
+     * 历史值（"50" / 空白 / 脏值）一律按默认 50 处理，不报错。
+     */
+    var Context.dailyLimit: Int
+        get() = sp(this).getString("daily_limit", "").orEmpty().trim().toIntOrNull()
+            ?.coerceAtLeast(0) ?: 50
+        set(v) {
+            sp(this).edit().putString("daily_limit", v.coerceAtLeast(0).toString()).apply()
+        }
+
     /** 全局回复延迟（毫秒，默认 3000 / 7000）：0 = 不延迟。 */
     var Context.replyDelayMinMs: Int
         get() = sp(this).getString("reply_delay_min_ms", "").orEmpty().trim().toIntOrNull()
@@ -480,6 +493,8 @@ object BotStore {
             .put("human_hourly_limit", ctx.humanHourlyLimit)
             .put("reply_delay_min_ms", ctx.replyDelayMinMs)
             .put("reply_delay_max_ms", ctx.replyDelayMaxMs)
+            // 全局每日上限：群配置「跟随全局」时 Python 侧读这一档（0 = 无上限）
+            .put("daily_limit", ctx.dailyLimit)
         try {
             val f = File(ctx.filesDir, "localbot/llm.json")
             f.parentFile?.mkdirs()

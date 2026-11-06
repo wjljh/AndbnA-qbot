@@ -6908,3 +6908,85 @@ def python_version():
     import platform
     return platform.python_version()
 
+
+
+# ── 内存自检（诊断用，生产路径不会调用）──────────────────
+#
+# 为什么放在这里：Python 侧的内存只有在解释器里量才准（tracemalloc 只认自己的
+# 分配器，gc.get_objects 只认活对象），Java 侧 dumpsys 只能看到 native heap 总数。
+# 这个函数只读不写：不建线程、不碰网络、不清缓存，跑完进程状态和跑之前一样。
+# 唯一调用方是 delivery/tools 里的离线脚本，App 正常运行时永远走不到这里。
+def debug_selfcheck(base=None, limit=10):
+    """→ str。'内存自检：…' 多行报告（tracemalloc top / 对象数 top / 各 bot 缓冲）。"""
+    import gc
+    import collections
+    out = []
+    td = base if base else _base_dir
+
+    # 1) tracemalloc：只看 Python 分配器的账（含 json 临时串、prompt 拼装）
+    try:
+        import tracemalloc
+        started_here = False
+        if not tracemalloc.is_tracing():
+            tracemalloc.start(10)
+            started_here = True
+        snap = tracemalloc.take_snapshot()
+        cur, peak = tracemalloc.get_traced_memory()
+        out.append("内存自检：tracemalloc 当前 %.1f MB / 峰值 %.1f MB"
+                   % (cur / 1048576.0, peak / 1048576.0))
+        top = snap.statistics("lineno")[:limit]
+        out.append("内存自检：tracemalloc top%d = %s" % (limit, " | ".join(
+            "%s:%d %.0f KB" % (str(s.traceback[0].filename).split("/")[-1],
+                               s.traceback[0].lineno, s.size / 1024.0) for s in top)))
+        if started_here:
+            tracemalloc.stop()
+    except Exception as e:
+        out.append("内存自检：tracemalloc 不可用（%r）" % (e,))
+
+    # 2) 活对象按类型计数（条数；字节由 tracemalloc 负责）
+    try:
+        cnt = collections.Counter()
+        for o in gc.get_objects():
+            cnt[type(o).__name__] += 1
+        out.append("内存自检：对象数 top%d = %s" % (limit, " | ".join(
+            "%s=%d" % (k, v) for k, v in cnt.most_common(limit))))
+        out.append("内存自检：gc 对象总数 %d（gc.isenabled=%s）"
+                   % (sum(cnt.values()), gc.isenabled()))
+    except Exception as e:
+        out.append("内存自检：gc.get_objects 失败（%r）" % (e,))
+
+    # 3) 进程级常驻缓存（这些不该随 bot 数量线性涨）
+    try:
+        out.append("内存自检：常驻缓存 log=%d 条 seen=%d dedup=%s 群配置缓存=%d 存档连接=%d 待落库=%d"
+                   % (len(_state.get("log") or []), len(_seen_ids),
+                      ",".join("%s:%d" % (k, len(v)) for k, v in list(_dedup.items())[:6]) or "-",
+                      len(_group_cache), len(_arc_db), len(_arc_buf)))
+    except Exception as e:
+        out.append("内存自检：常驻缓存统计失败（%r）" % (e,))
+
+    # 4) 每个 bot 的历史缓冲：内存里存了几条、盘上多大
+    try:
+        rows = []
+        for name in sorted(os.listdir(str(td or "."))):
+            bd = os.path.join(str(td or "."), name)
+            if not os.path.isdir(bd):
+                continue
+            mem = _memory(bd)
+            keys = [k for k, v in mem.items() if isinstance(v, list)]
+            total = sum(len(mem[k]) for k in keys)
+            biggest = max([len(mem[k]) for k in keys], default=0)
+            mp = _memory_path(bd)
+            dbp = _arc_path(bd)
+            lg = os.path.join(bd, "local_bot.log")
+            rows.append("%s 会话%d 条%d(最多一档%d) memory.json %.0fKB messages.db %.0fKB log %.0fKB"
+                        % (name, len(keys), total, biggest,
+                           (os.path.getsize(mp) if os.path.exists(mp) else 0) / 1024.0,
+                           (os.path.getsize(dbp) if os.path.exists(dbp) else 0) / 1024.0,
+                           (os.path.getsize(lg) if os.path.exists(lg) else 0) / 1024.0))
+        out.append("内存自检：各 bot 历史缓冲 %d 个" % len(rows))
+        out.extend("内存自检：  " + r for r in rows)
+        out.append("内存自检：拼 prompt 用最近 %d 条原文 + 一段摘要（_build_messages）"
+                   % _SUMMARY_KEEP)
+    except Exception as e:
+        out.append("内存自检：各 bot 缓冲统计失败（%r）" % (e,))
+    return "\n".join(out)

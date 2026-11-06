@@ -66,6 +66,7 @@ import com.wjljh.andbna.ui.theme.LocalEnableBlur
 import com.wjljh.andbna.ui.theme.LocalEnableFloatingBottomBar
 import com.wjljh.andbna.ui.theme.LocalEnableFloatingBottomBarBlur
 import com.wjljh.andbna.ui.design.Size as DesignSize
+import android.os.Build
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
@@ -74,6 +75,7 @@ import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.MiuixScrollBehavior
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.TopAppBar
+import top.yukonga.miuix.kmp.blur.LayerBackdrop
 import top.yukonga.miuix.kmp.blur.layerBackdrop
 import top.yukonga.miuix.kmp.blur.rememberLayerBackdrop
 import top.yukonga.miuix.kmp.icon.MiuixIcons
@@ -404,8 +406,9 @@ private fun MainTabs(
     val subtitle = modeText(mode) + " · " + enabledBotCount + " 个 bot"
 
     // 顶栏小标题跟着当前 tab 走（largeTitle 保留 AndbnA 作展开态大标题）
-    val tabTitle = listOf("状态", "记忆", "Bot", "设置")
-        .getOrElse(pagerState.currentPage) { "状态" }
+    // 状态页的标题带产品名前缀（其它页不动）
+    val tabTitle = listOf("AndbnA-状态", "记忆", "Bot", "设置")
+        .getOrElse(pagerState.currentPage) { "AndbnA-状态" }
 
     // 顶栏的折叠状态：TopAppBar 与内容各自挂在 scaffold 的两侧，nestedScroll 只能手动接
     // （SukiSU 也是这么接的：scrollBehavior 建在页面级，TopAppBar 收它，列表 .nestedScroll 它）
@@ -415,10 +418,20 @@ private fun MainTabs(
 
     // 液体玻璃要「取到身后的内容」，所以内容树画进这个 backdrop 层
     // 页面底色走 PanelColors：浅色下它比卡片暗一档（卡片边界才立得住），深色仍是主题 surface
+    // 玻璃关掉时这一层没有任何消费者：layerBackdrop 会把整棵内容树画进一张离屏 layer
+    // （1280x2772 一张 RGBA ≈ 13.5MB 显存 + 每帧多画一遍），所以按开关决定建不建。
+    // 判据与 BottomBarMiuix 里的 isBlurEnabled 完全一致（悬浮底栏 + 液态玻璃 + API33+）。
+    val glassEnabled = LocalEnableFloatingBottomBar.current &&
+        LocalEnableFloatingBottomBarBlur.current &&
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU
     val surfaceColor = PanelColors.pageBackground
-    val backdrop = rememberLayerBackdrop {
-        drawRect(surfaceColor)
-        drawContent()
+    val backdrop: LayerBackdrop? = if (glassEnabled) {
+        rememberLayerBackdrop {
+            drawRect(surfaceColor)
+            drawContent()
+        }
+    } else {
+        null
     }
 
     // 悬浮底栏：量一次它的真实占位（含导航条 inset），再 +12dp 安全距，
@@ -444,8 +457,9 @@ private fun MainTabs(
         val contentModifier = if (materialMode) {
             Modifier.fillMaxSize().nestedScroll(materialScroll.nestedScrollConnection)
         } else {
+            val bd = backdrop
             Modifier.fillMaxSize()
-                .layerBackdrop(backdrop)
+                .then(if (bd != null) Modifier.layerBackdrop(bd) else Modifier)
                 .nestedScroll(appBarScroll.nestedScrollConnection)
         }
         Box(contentModifier) {

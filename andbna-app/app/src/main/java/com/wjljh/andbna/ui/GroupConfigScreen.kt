@@ -22,6 +22,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
+import com.wjljh.andbna.local.BotStore.dailyLimit
 import com.wjljh.andbna.local.GroupConfig
 import com.wjljh.andbna.local.GroupNames
 import com.wjljh.andbna.ui.component.PanelArrowRow
@@ -212,8 +213,9 @@ private fun GroupEditScreen(
     var autoReply by remember(gid) { mutableStateOf<Boolean?>(null) }
     var webSearch by remember(gid) { mutableStateOf<Boolean?>(null) }
     var enabled by remember(gid) { mutableStateOf(true) }
-    // 每日额度：0 = 不限；custom = 选的是「自定义…」（就地输入数字）
-    var limit by remember(gid) { mutableStateOf(0) }
+    // 每日额度三态：null = 跟随全局（设置页「每日上限」）、0 = 本群不限、>0 = 本群额度；
+    // custom = 选的是「自定义…」（就地输入数字）
+    var limit by remember(gid) { mutableStateOf<Int?>(null) }
     var custom by remember(gid) { mutableStateOf(false) }
     var error by remember(gid) { mutableStateOf("") }
     // 读盘时的原值：保存时用它判断「真的改了」，改了才重启这个 bot
@@ -226,14 +228,14 @@ private fun GroupEditScreen(
         webSearch = conf.webSearch
         enabled = conf.enabled
         limit = conf.dailyLimit
-        custom = limitPresetIndex(conf.dailyLimit) == LIMIT_CUSTOM
+        custom = conf.dailyLimit?.let { limitPresetIndex(it) == LIMIT_CUSTOM } ?: false
     }
     BackHandler { onBack() }
 
     fun save() {
         val conf = GroupConfig.Conf(
             autoReply = autoReply,
-            dailyLimit = limit.coerceAtLeast(0),
+            dailyLimit = limit?.coerceAtLeast(0),
             webSearch = webSearch,
             enabled = enabled,
         )
@@ -254,7 +256,13 @@ private fun GroupEditScreen(
         }
     }
 
-    val limitIndex = if (custom) LIMIT_CUSTOM else limitPresetIndex(limit)
+    // 「跟随全局」括号里显示设置页当前那一档（0 = 无上限），下拉文案与设置页同一套叫法
+    val globalLimit = ctx.dailyLimit
+    val limitIndex = if (custom) LIMIT_CUSTOM else limitIndexOf(limit)
+    val limitLabels = limitItems(
+        globalLimit,
+        if (limitIndex == LIMIT_CUSTOM && (limit ?: 0) > 0) limit else null,
+    )
 
     Scaffold(
         containerColor = PanelColors.surface,
@@ -315,26 +323,35 @@ private fun GroupEditScreen(
                             }
                         },
                     )
-                    // 每日额度：弹出列表（不限 / 5 / 10 / 20 / 50 / 自定义…），选「自定义…」就地输入数字
+                    // 每日额度：弹出列表（跟随全局 / 不限 / 5 / 10 / 20 / 50 / 自定义…）；
+                    // 「跟随全局」不写自己的覆盖值，读设置页「每日上限」那一档
                     OverlayDropdownPreference(
                         insideMargin = PanelTokens.PrefInside,
                         title = "每日额度",
-                        summary = "超过后该群当天不再回复",
+                        summary = when (limitIndex) {
+                            LIMIT_FOLLOW -> "跟设置页「每日上限」走，本群不单独设"
+                            LIMIT_UNLIMITED -> "这个群不限每日条数"
+                            else -> "超过后该群当天不再回复"
+                        },
                         startAction = { RowIcon(Icons.Filled.Speed, PanelColors.onSurfaceVariantSummary) },
-                        items = LIMIT_LABELS,
+                        items = limitLabels,
                         selectedIndex = limitIndex,
                         onSelectedIndexChange = { i ->
                             if (i == LIMIT_CUSTOM) {
                                 custom = true          // 就地输入：下面立刻出现输入框，数字沿用当前值
                             } else {
                                 custom = false
-                                limit = LIMIT_PRESETS[i]
+                                limit = when (i) {
+                                    LIMIT_FOLLOW -> null
+                                    LIMIT_UNLIMITED -> 0
+                                    else -> LIMIT_PRESETS[i - 2]
+                                }
                             }
                         },
                     )
                     if (limitIndex == LIMIT_CUSTOM) {
                         PanelTextField(
-                            value = if (limit > 0) limit.toString() else "",
+                            value = (limit ?: 0).let { if (it > 0) it.toString() else "" },
                             onValueChange = { v ->
                                 limit = v.filter { c -> c.isDigit() }.take(4).toIntOrNull() ?: 0
                             },
@@ -384,19 +401,40 @@ private fun GroupConfigHeader(appid: String, onBack: () -> Unit) {
     )
 }
 
-/** 每日额度的预设档（下标与 [LIMIT_LABELS] 前五项一一对应）。 */
-private val LIMIT_PRESETS = listOf(0, 5, 10, 20, 50)
+/** 「跟随全局」在每日额度列表里的下标：不写覆盖值，读设置页「每日上限」那一档。 */
+private const val LIMIT_FOLLOW = 0
 
-/** 「自定义…」在 [LIMIT_LABELS] 里的下标 */
-private const val LIMIT_CUSTOM = 5
+/** 「不限」：这个群自己不限（落盘 0），与「跟随全局」是两件事。 */
+private const val LIMIT_UNLIMITED = 1
 
-private val LIMIT_LABELS = listOf("不限", "5 条", "10 条", "20 条", "50 条", "自定义…")
+/** 具体数字档（列表下标从 2 起，与 [limitItems] 一一对应）。 */
+private val LIMIT_PRESETS = listOf(5, 10, 20, 50)
 
-/** 当前额度 → 下拉下标（预设档就落在前五项，其它数值一律算「自定义…」）。 */
-private fun limitPresetIndex(value: Int): Int {
-    val i = LIMIT_PRESETS.indexOf(value)
-    return if (i >= 0) i else LIMIT_CUSTOM
+/** 「自定义…」在列表里的下标：跟随 + 不限 + 四个预设之后。 */
+private const val LIMIT_CUSTOM = 2 + 4
+
+/** 额度文案：与设置页「每日上限」同一套叫法。 */
+private fun limitText(v: Int?): String = when {
+    v == null -> "跟随全局"
+    v <= 0 -> "无上限"
+    else -> v.toString() + " 条/天"
 }
+
+/** 下拉文案：首项括号里是**设置页当前那一档**，一眼看出跟随的是多少。 */
+private fun limitItems(global: Int, customValue: Int?): List<String> =
+    listOf("跟随全局（" + limitText(global) + "）", "不限") +
+        LIMIT_PRESETS.map { it.toString() + " 条/天" } +
+        listOf(if (customValue != null) "自定义（" + limitText(customValue) + "）" else "自定义…")
+
+/** 落盘值 → 下拉下标（null = 跟随全局，0 = 不限，预设档落在 2..5，其它算「自定义…」）。 */
+private fun limitIndexOf(value: Int?): Int = when {
+    value == null -> LIMIT_FOLLOW
+    value <= 0 -> LIMIT_UNLIMITED
+    else -> LIMIT_PRESETS.indexOf(value).takeIf { it >= 0 }?.plus(2) ?: LIMIT_CUSTOM
+}
+
+/** 预设之外的数字 = 停在「自定义…」那行（读盘时决定输入框摊不摊开）。 */
+private fun limitPresetIndex(value: Int): Int = limitIndexOf(value)
 
 private val AUTO_LABELS = listOf("跟随 bot 设置", "开（该群自动接话）", "关（只回 @）")
 private val AUTO_SUMMARIES = listOf(

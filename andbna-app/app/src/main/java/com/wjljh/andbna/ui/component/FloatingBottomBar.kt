@@ -179,7 +179,7 @@ fun FloatingBottomBar(
     modifier: Modifier = Modifier,
     selectedIndex: () -> Int,
     onSelected: (index: Int) -> Unit,
-    backdrop: Backdrop,
+    backdrop: Backdrop?,
     tabsCount: Int,
     isBlurEnabled: Boolean = true,
     content: @Composable RowScope.() -> Unit
@@ -292,7 +292,10 @@ fun FloatingBottomBar(
     val baseHighlight = rememberGravityRotatedHighlight(iosIndicatorSpecular, extraDegrees = -45f)
     val pillHighlight = rememberGravityRotatedHighlight(iosIndicatorSpecular, extraDegrees = 90f)
 
-    val combinedBackdrop = rememberCombinedBackdrop(backdrop, tabsBackdrop)
+    // 玻璃关闭时上层不再提供 backdrop（那一层离屏 layer 很贵）：这里一律走不模糊的分支
+    val liquidBackdrop = backdrop.takeIf { isBlurEnabled }
+    val combinedBackdrop: Backdrop? =
+        liquidBackdrop?.let { rememberCombinedBackdrop(it, tabsBackdrop) }
 
     Box(
         modifier = modifier.width(IntrinsicSize.Min),
@@ -320,9 +323,9 @@ fun FloatingBottomBar(
                     onClick = {}
                 )
                 .then(
-                    if (isBlurEnabled) {
+                    if (liquidBackdrop != null) {
                         Modifier.drawBackdrop(
-                            backdrop = backdrop,
+                            backdrop = liquidBackdrop,
                             shape = { pillShape },
                             effects = {
                                 vibrancy()
@@ -352,7 +355,7 @@ fun FloatingBottomBar(
             content = content
         )
 
-        if (isBlurEnabled) {
+        if (liquidBackdrop != null) {
             CompositionLocalProvider(
                 LocalFloatingBottomBarTabScale provides {
                     lerp(1f, 1.2f, dampedDragAnimation.pressProgress)
@@ -365,7 +368,7 @@ fun FloatingBottomBar(
                         .layerBackdrop(tabsBackdrop)
                         .graphicsLayer { translationX = panelOffset }
                         .drawBackdrop(
-                            backdrop = backdrop,
+                            backdrop = liquidBackdrop,
                             shape = { pillShape },
                             effects = {
                                 vibrancy()
@@ -389,7 +392,8 @@ fun FloatingBottomBar(
 
         if (tabWidthPx > 0f) {
             val tabWidthDp = with(density) { tabWidthPx.toDp() }
-            if (isBlurEnabled) {
+            val combined = combinedBackdrop
+            if (liquidBackdrop != null && combined != null) {
                 Box(
                     Modifier
                         .padding(horizontal = 4.dp)
@@ -400,7 +404,7 @@ fun FloatingBottomBar(
                         .then(interactiveHighlight.gestureModifier)
                         .then(dampedDragAnimation.modifier)
                         .drawBackdrop(
-                            backdrop = combinedBackdrop,
+                            backdrop = combined,
                             shape = { pillShape },
                             effects = {
                                 val progress = dampedDragAnimation.pressProgress

@@ -35,7 +35,6 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -47,7 +46,10 @@ import com.wjljh.andbna.local.BotStore
 import com.wjljh.andbna.local.BotStore.botGateEnabled
 import com.wjljh.andbna.local.BotStore.botMaxTurns
 import com.wjljh.andbna.local.BotStore.botSilenceMinutes
+import com.wjljh.andbna.local.BotStore.dailyLimit
 import com.wjljh.andbna.local.BotStore.humanHourlyLimit
+import com.wjljh.andbna.local.BotStore.llmJudgeLevel
+import com.wjljh.andbna.local.BotStore.nameHitAsCall
 import com.wjljh.andbna.local.BotStore.replyDelayMaxMs
 import com.wjljh.andbna.local.BotStore.replyDelayMinMs
 import com.wjljh.andbna.local.ModeStore
@@ -57,10 +59,11 @@ import com.wjljh.andbna.local.RunNotification
 import com.wjljh.andbna.local.SecureStore
 import com.wjljh.andbna.ui.component.PanelAnimatedNotice
 import com.wjljh.andbna.ui.component.PanelConfirmDialog
-import com.wjljh.andbna.ui.component.PanelMetrics
 import com.wjljh.andbna.ui.component.PanelNotice
+import com.wjljh.andbna.ui.component.PanelSectionTitle
 import com.wjljh.andbna.ui.component.PanelTokens
 import com.wjljh.andbna.ui.component.material.SegmentedArrowItem
+import com.wjljh.andbna.ui.component.material.SegmentedContentItem
 import com.wjljh.andbna.ui.component.material.SegmentedDropdownItem
 import com.wjljh.andbna.ui.component.material.SegmentedGroup
 import com.wjljh.andbna.ui.component.material.SegmentedMetrics
@@ -237,11 +240,14 @@ private class SettingsActions(
 /** 设置项的可变状态 + 落盘动作（两种结构共用同一份，切模式不会丢已填内容）。 */
 private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
     var msg by mutableStateOf("")
-    var judge by mutableStateOf(if (SettingsPrefs.ui(ctx, "reply_judge") == "random") 1 else 0)
+    var judge by mutableStateOf(if (ReplyJudgeMode.read(ctx) == ReplyJudgeMode.RANDOM) 1 else 0)
     // 群里自动接话：默认关（群里只有 @ 才回）。与 BotStore.groupAutochat 同一个落盘键
     var autochat by mutableStateOf(SettingsPrefs.ui(ctx, "group_autochat").trim() == "1")
     var chatProb by mutableStateOf(SettingsPrefs.ui(ctx, "chat_prob").ifBlank { "0.3" })
-    var dailyLimit by mutableStateOf(SettingsPrefs.ui(ctx, "daily_limit").ifBlank { "50" })
+    // 每日上限（弹出列表）：落盘键 daily_limit，"0" = 无上限（与 BotStore.dailyLimit 同一口径）。
+    // 改完顺手写 llm.json —— 群配置里选「跟随全局」的群读的就是这一档。
+    var dailyLimit by mutableStateOf(ctx.dailyLimit)
+    var dailyCustom by mutableStateOf(false)
     var autoStart by mutableStateOf(SettingsPrefs.ui(ctx, "auto_start").ifBlank { "1" } == "1")
     // 运行中的通知栏提醒：默认开（与 RunNotification / BotService 同一份落盘值）
     var runNotif by mutableStateOf(RunNotification.enabled(ctx))
@@ -284,10 +290,84 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
     fun pickJudge(index: Int) {
         val changed = judge != index
         judge = index
-        SettingsPrefs.put(ctx, "reply_judge", if (index == 1) "random" else "llm")
+        // 落盘同一个 reply_judge 键，并通知「模型配置 / Bot 编辑」两页立刻重组（不用重启）
+        ReplyJudgeMode.set(ctx, if (index == 1) ReplyJudgeMode.RANDOM else ReplyJudgeMode.LLM)
         val n = if (changed) BotRestarts.requestAllEnabled(ctx, "设置保存") else 0
         msg = "已切到「" + judgeOptions.getOrElse(index) { "" } + "」" +
             if (n > 0) "，正在重启 " + n + " 个 bot…" else ""
+    }
+
+    // ── 回复判定-模型判断配置（1.0.8 从模型配置页最底下搬进「回复节奏」组）──
+    // 两个键与 Python 侧同名：llm_judge_level / name_hit_as_call。判定走 _llm_conf 每次重读
+    // llm.json，所以改完写文件即可，不用重启 bot（也不必重启 App）。
+    var judgeLevel by mutableStateOf(ctx.llmJudgeLevel)
+    var nameHit by mutableStateOf(ctx.nameHitAsCall)
+
+    val judgeLevelLabels = JudgeLabels.labelsWithDefault
+    val judgeLevelIndex: Int get() = JudgeLabels.indexOf(judgeLevel)
+
+    fun pickJudgeLevel(index: Int) {
+        val wire = JudgeLabels.values.getOrElse(index) { JudgeLabels.NORMAL }
+        judgeLevel = wire
+        ctx.llmJudgeLevel = wire
+        BotStore.writeLlmJson(ctx)
+        msg = "主动程度已切到「" + JudgeLabels.labelOf(wire) + "」"
+    }
+
+    fun switchNameHit(on: Boolean) {
+        nameHit = on
+        ctx.nameHitAsCall = on
+        BotStore.writeLlmJson(ctx)
+        msg = "名字命中就当被叫：" + if (on) "已开启" else "已关闭"
+    }
+
+    // ── 每日上限：5 个预设 +「无上限」+「自定义…」（选自定义就地输入数字）──
+    private val dailyLimitPresets = listOf(50, 80, 120, 180, 200)
+
+    /** 「自定义…」在列表里的下标：5 个预设 + 1 个「无上限」之后。 */
+    private val dailyLimitCustomIndex: Int get() = dailyLimitPresets.size + 1
+
+    /** 值是预设之外的数字（含选过自定义后手输的值）。 */
+    private val dailyLimitIsCustom: Boolean
+        get() = dailyLimit > 0 && dailyLimit !in dailyLimitPresets
+
+    /** 自定义那一行（输入框）是否摊开。 */
+    val dailyLimitCustomShown: Boolean get() = dailyCustom || dailyLimitIsCustom
+
+    fun dailyLimitText(v: Int = dailyLimit): String = if (v <= 0) "无上限" else "$v 条/天"
+
+    val dailyLimitItems: List<String>
+        get() = dailyLimitPresets.map { "$it 条/天" } +
+            listOf("无上限") +
+            listOf(
+                when {
+                    !dailyLimitCustomShown -> "自定义…"
+                    dailyLimit > 0 -> "自定义（" + dailyLimitText() + "）"
+                    else -> "自定义（留空 = 无上限）"
+                },
+            )
+
+    val dailyLimitIndex: Int
+        get() = when {
+            dailyLimitCustomShown -> dailyLimitCustomIndex
+            dailyLimit <= 0 -> dailyLimitPresets.size
+            else -> dailyLimitPresets.indexOf(dailyLimit).takeIf { it >= 0 } ?: dailyLimitCustomIndex
+        }
+
+    fun pickDailyLimit(index: Int) {
+        if (index == dailyLimitCustomIndex) {
+            dailyCustom = true          // 就地输入：下面立刻摊开输入框，数字沿用当前值
+            return
+        }
+        dailyCustom = false
+        putDailyLimit(dailyLimitPresets.getOrNull(index) ?: 0)
+    }
+
+    /** 落盘 prefs + llm.json：判定是每条消息现读的，改完不用重启 bot。 */
+    fun putDailyLimit(v: Int) {
+        dailyLimit = v.coerceAtLeast(0)
+        ctx.dailyLimit = dailyLimit
+        BotStore.writeLlmJson(ctx)
     }
 
     // 消息存档：占用字节 + 条数（-1 = 还没读到 / 条数未知）
@@ -508,7 +588,7 @@ private fun MiuixSettingsBody(
         // human_hourly_limit / reply_delay_min_ms+max_ms。
         item(key = "botchat") {
             SettingsGroupTitle("Bot 互聊")
-            SettingsMiuixGroup {
+            SettingsMiuixGroup(topPadding = 0.dp) {
                 SwitchPreference(
                     title = "多 bot 由总模型决定谁回",
                     summary = "开启后同一句话只让最合适的一个 bot 回；只有一个 bot 时不生效",
@@ -554,17 +634,11 @@ private fun MiuixSettingsBody(
             }
         }
 
-        // ③ 回复节奏（首行「群里自动接话」是全局默认；分组标题要对用户可见）
+        // ③ 回复节奏（分组标题要对用户可见）：回复判定（模型判断/随机）→ 回复判定-模型判断配置
+        //   → 群里自动接话。子卡原是模型配置页最底下那一段，1.0.8 搬到这儿，只留一处维护。
         item(key = "reply") {
             SettingsGroupTitle("回复节奏")
-            SettingsMiuixGroup {
-                SwitchPreference(
-                    title = "群里自动接话",
-                    summary = "关着时群里只有 @ 才会回；打开后它会自己判断要不要插话（默认关）",
-                    startAction = { SettingsRowIcon(Icons.Filled.Forum) },
-                    checked = vm.autochat,
-                    onCheckedChange = { vm.switchAutochat(it) },
-                )
+            SettingsMiuixGroup(topPadding = 0.dp) {
                 OverlayDropdownPreference(
                     title = "回复判定",
                     summary = "非 @ 消息是否插话",
@@ -584,15 +658,35 @@ private fun MiuixSettingsBody(
                         SettingsPrefs.put(vm.ctx, "chat_prob", it)
                     },
                 )
-                EditText(
+                OverlayDropdownPreference(
                     title = "每日上限",
-                    value = vm.dailyLimit,
-                    keyboardOptions = vm.numberKeys,
-                    leadingIcon = Icons.Filled.Speed,
-                    onValueChange = {
-                        vm.dailyLimit = it
-                        SettingsPrefs.put(vm.ctx, "daily_limit", it)
-                    },
+                    summary = "每天最多回多少条；到点当天就不再回（群配置可以按群覆盖）",
+                    startAction = { SettingsRowIcon(Icons.Filled.Speed) },
+                    items = vm.dailyLimitItems,
+                    selectedIndex = vm.dailyLimitIndex,
+                    onSelectedIndexChange = { vm.pickDailyLimit(it) },
+                )
+                // 「自定义…」：就地摊开数字输入框（与群配置那一条同一个交互）
+                if (vm.dailyLimitCustomShown) {
+                    EditText(
+                        title = "自定义上限（条/天）",
+                        value = if (vm.dailyLimit > 0) vm.dailyLimit.toString() else "",
+                        keyboardOptions = vm.numberKeys,
+                        leadingIcon = Icons.Filled.Notes,
+                        onValueChange = { v ->
+                            vm.putDailyLimit(v.filter { c -> c.isDigit() }.take(4).toIntOrNull() ?: 0)
+                        },
+                    )
+                }
+            }
+            JudgeConfigCardMiuix(vm)
+            SettingsMiuixGroup {
+                SwitchPreference(
+                    title = "群里自动接话",
+                    summary = "关着时群里只有 @ 才会回；打开后它会自己判断要不要插话（默认关）",
+                    startAction = { SettingsRowIcon(Icons.Filled.Forum) },
+                    checked = vm.autochat,
+                    onCheckedChange = { vm.switchAutochat(it) },
                 )
             }
         }
@@ -697,24 +791,115 @@ private fun MiuixSettingsBody(
  */
 @Composable
 private fun SettingsGroupTitle(text: String) {
-    Text(
-        text = text,
-        fontSize = PanelMetrics.CardTitleSize,
-        fontWeight = FontWeight.Medium,
-        color = PanelColors.onSurface,
-        modifier = Modifier
-            .fillMaxWidth()
-            .padding(start = 4.dp, end = 4.dp, top = 12.dp, bottom = 6.dp),
-    )
+    // 与其它页共用同一份「卡片外标题」（17sp Medium + onSurface，距卡 8dp）
+    PanelSectionTitle(text, modifier = Modifier.padding(top = 12.dp))
 }
 
-/** miuix 的一组：一张卡，卡内不加任何自定义 padding（间距由 preference 自己的 insideMargin 给）。 */
+// ── 回复判定-模型判断配置（设置页「回复节奏」组的子卡）────────────────────
+
+/** 子卡标题：两套结构共用同一份文案（原来是模型配置页那张卡的标题）。 */
+private const val JUDGE_CARD_TITLE = "回复判定-模型判断配置"
+
+/** 随机模式下卡里唯一的一行灰字。 */
+private const val JUDGE_CARD_RANDOM = "当前为随机模式，模型判定配置不生效"
+
+/** 卡片底部的说明（原模型配置页那段，只把档位名换成 [JudgeLabels] 的叫法）。 */
+private const val JUDGE_CARD_NOTE =
+    "主动程度只影响「没 @ 本 bot」的群消息：保守要求明确在叫你，标准（默认）拿不准就接，" +
+        "积极几乎都接。判定模型答不出 1/0 时按「接」处理；判定调用失败时只有在「保守」档才按「不接」。"
+
+/** 卡内说明小字：13sp + 次要色（两套结构同一份字号与颜色）。 */
 @Composable
-private fun SettingsMiuixGroup(content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit) {
+private fun JudgeCardText(text: String) {
+    Text(text = text, fontSize = 13.sp, color = PanelColors.onSurfaceVariantSummary)
+}
+
+/**
+ * 子卡（miuix）：模型判断模式下是「主动程度 + 名字命中就当被叫 + 说明」三块。
+ *
+ * 随机模式下整卡收起，只留一格灰字 —— 那时真正生效的是上面的「闲聊概率」，
+ * 主动程度与名字命中都不参与判定（与搬过来之前的模型配置页同一行为）。
+ */
+@Composable
+private fun JudgeConfigCardMiuix(vm: SettingsVm) {
+    SettingsGroupTitle(JUDGE_CARD_TITLE)
+    SettingsMiuixGroup(topPadding = 0.dp) {
+        if (vm.judge == 1) {
+            Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 12.dp)) {
+                JudgeCardText(JUDGE_CARD_RANDOM)
+            }
+        } else {
+            OverlayDropdownPreference(
+                title = "主动程度",
+                summary = "没 @ 本 bot 时多主动才插话",
+                startAction = { SettingsRowIcon(Icons.Filled.Tune) },
+                items = vm.judgeLevelLabels,
+                selectedIndex = vm.judgeLevelIndex,
+                onSelectedIndexChange = { vm.pickJudgeLevel(it) },
+            )
+            SwitchPreference(
+                title = "名字命中就当被叫",
+                summary = if (vm.nameHit) "正文里出现人格名或称呼 → 跳过判定直接回"
+                else "只在 @ 本 bot 时才回（或交给回复判定）",
+                startAction = { SettingsRowIcon(Icons.Filled.Person) },
+                checked = vm.nameHit,
+                onCheckedChange = { vm.switchNameHit(it) },
+            )
+            Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 4.dp, bottom = 12.dp)) {
+                JudgeCardText(JUDGE_CARD_NOTE)
+            }
+        }
+    }
+}
+
+/** 子卡（material）：同一份文案与同一套收起逻辑，行换成 Segmented*Item。 */
+@Composable
+private fun JudgeConfigCardMaterial(vm: SettingsVm) {
+    SettingsGroupTitle(JUDGE_CARD_TITLE)
+    SegmentedGroup(modifier = settingsGroupPadding()) {
+        if (vm.judge == 1) {
+            item { SegmentedContentItem { JudgeCardText(JUDGE_CARD_RANDOM) } }
+        } else {
+            item {
+                SegmentedDropdownItem(
+                    title = "主动程度",
+                    summary = "没 @ 本 bot 时多主动才插话",
+                    icon = Icons.Filled.Tune,
+                    items = vm.judgeLevelLabels,
+                    selectedIndex = vm.judgeLevelIndex,
+                    onSelectedIndexChange = { vm.pickJudgeLevel(it) },
+                )
+            }
+            item {
+                SegmentedSwitchItem(
+                    title = "名字命中就当被叫",
+                    summary = if (vm.nameHit) "正文里出现人格名或称呼 → 跳过判定直接回"
+                    else "只在 @ 本 bot 时才回（或交给回复判定）",
+                    icon = Icons.Filled.Person,
+                    checked = vm.nameHit,
+                    onCheckedChange = { vm.switchNameHit(it) },
+                )
+            }
+            item { SegmentedContentItem { JudgeCardText(JUDGE_CARD_NOTE) } }
+        }
+    }
+}
+
+/**
+ * miuix 的一组：一张卡，卡内不加任何自定义 padding（间距由 preference 自己的 insideMargin 给）。
+ *
+ * [topPadding] 默认 12dp 是「无标题组」与上一张卡的间距；有分组标题的组传 0dp ——
+ * 标题自己带着 8dp 下间距，卡再顶 12dp 就成了 20dp，比别处松一截。
+ */
+@Composable
+private fun SettingsMiuixGroup(
+    topPadding: Dp = 12.dp,
+    content: @Composable androidx.compose.foundation.layout.ColumnScope.() -> Unit,
+) {
     Card(
         modifier = Modifier
             .fillMaxWidth()
-            .padding(top = 12.dp),
+            .padding(top = topPadding),
     ) {
         content()
     }
@@ -845,19 +1030,10 @@ private fun MaterialSettingsBody(
             }
         }
 
-        // ③ 回复节奏（首行「群里自动接话」是全局默认；分组标题要对用户可见）
+        // ③ 回复节奏（顺序与 miuix 一致：回复判定 → 回复判定-模型判断配置 → 群里自动接话）
         item(key = "reply") {
             SettingsGroupTitle("回复节奏")
             SegmentedGroup(modifier = settingsGroupPadding()) {
-                item {
-                    SegmentedSwitchItem(
-                        title = "群里自动接话",
-                        summary = "关着时群里只有 @ 才会回；打开后它会自己判断要不要插话（默认关）",
-                        icon = Icons.Filled.Forum,
-                        checked = vm.autochat,
-                        onCheckedChange = { vm.switchAutochat(it) },
-                    )
-                }
                 item {
                     SegmentedDropdownItem(
                         title = "回复判定",
@@ -882,15 +1058,39 @@ private fun MaterialSettingsBody(
                     )
                 }
                 item {
-                    SegmentedValueItem(
+                    SegmentedDropdownItem(
                         title = "每日上限",
-                        value = vm.dailyLimit,
-                        onValueChange = {
-                            vm.dailyLimit = it
-                            SettingsPrefs.put(vm.ctx, "daily_limit", it)
-                        },
+                        summary = "每天最多回多少条；到点当天就不再回（群配置可以按群覆盖）",
                         icon = Icons.Filled.Speed,
-                        numeric = true,
+                        items = vm.dailyLimitItems,
+                        selectedIndex = vm.dailyLimitIndex,
+                        onSelectedIndexChange = { vm.pickDailyLimit(it) },
+                    )
+                }
+                if (vm.dailyLimitCustomShown) {
+                    item {
+                        SegmentedValueItem(
+                            title = "自定义上限（条/天）",
+                            value = if (vm.dailyLimit > 0) vm.dailyLimit.toString() else "",
+                            onValueChange = { v ->
+                                vm.putDailyLimit(v.filter { c -> c.isDigit() }.take(4).toIntOrNull() ?: 0)
+                            },
+                            icon = Icons.Filled.Notes,
+                            summary = "留空 = 无上限",
+                            numeric = true,
+                        )
+                    }
+                }
+            }
+            JudgeConfigCardMaterial(vm)
+            SegmentedGroup(modifier = settingsGroupPadding()) {
+                item {
+                    SegmentedSwitchItem(
+                        title = "群里自动接话",
+                        summary = "关着时群里只有 @ 才会回；打开后它会自己判断要不要插话（默认关）",
+                        icon = Icons.Filled.Forum,
+                        checked = vm.autochat,
+                        onCheckedChange = { vm.switchAutochat(it) },
                     )
                 }
             }

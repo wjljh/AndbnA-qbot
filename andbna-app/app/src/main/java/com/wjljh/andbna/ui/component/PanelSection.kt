@@ -75,6 +75,25 @@ import top.yukonga.miuix.kmp.basic.TextField
  * 颜色一律走 [PanelColors]；尺寸与字号一律走 [PanelMetrics] / [PanelTokens]。
  */
 
+/**
+ * 卡片**外面**的分组标题：17sp Medium + onSurface，与卡片相隔 8dp，左边 4dp 与行文字对齐。
+ *
+ * 与 Bot 编辑页「模型」「群配置」那类组标题同一口径；[PanelSectionCard] /
+ * [PanelGroupCard] 的 title / titleOutside 参数内部就是调它 —— 页面不用各拼一份 Text。
+ */
+@Composable
+fun PanelSectionTitle(text: String, modifier: Modifier = Modifier) {
+    Text(
+        text = text,
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(start = 4.dp, bottom = 8.dp),
+        fontSize = PanelMetrics.CardTitleSize,
+        fontWeight = FontWeight.Medium,
+        color = PanelColors.onSurface,
+    )
+}
+
 /** 分组卡：标题 17sp Medium + 可选说明 + 内容。圆角 16dp、内边距 16dp。 */
 @Composable
 fun PanelSectionCard(

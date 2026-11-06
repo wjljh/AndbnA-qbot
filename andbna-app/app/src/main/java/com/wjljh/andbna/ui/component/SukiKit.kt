@@ -84,8 +84,12 @@ import top.yukonga.miuix.kmp.utils.pressable
 fun PanelGroupCard(
     modifier: Modifier = Modifier,
     onClick: (() -> Unit)? = null,
+    // 传了就画在卡片**外面**（卡上方 8dp，见 [PanelSectionTitle]）：miuix / material 两套外壳
+    // 都走同一份标题，卡内不留标题
+    title: String? = null,
     content: @Composable ColumnScope.() -> Unit,
 ) {
+    if (title != null) PanelSectionTitle(title)
     if (LocalUiMode.current == UiMode.Material) {
         val shape = RoundedCornerShape(PanelTokens.CardRadius)
         val colors = CardDefaults.cardColors(

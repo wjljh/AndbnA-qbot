@@ -8,7 +8,7 @@ import java.io.File
  * 群级配置：<botdir>/groups/<group_openid>.json。
  *
  * 一个群一个文件，字段与 Python 侧 _group_conf 一一对应：
- *   {"auto_reply": true|null, "daily_limit": 0, "web_search": true|null, "enabled": true}
+ *   {"auto_reply": true|null, "daily_limit": null, "web_search": true|null, "enabled": true}
  *
  * 三条硬约定（Python 侧就是照这个读的，改格式要两边一起改）：
  *  · null = 跟随（该 bot 的覆盖 / 全局），**不是 false**（所以三态值在 Kotlin 里是 Boolean?）；
@@ -19,16 +19,21 @@ import java.io.File
  */
 object GroupConfig {
 
-    /** 一个群的覆盖配置（缺项 = 跟随）。 */
+    /**
+     * 一个群的覆盖配置（缺项 = 跟随）。
+     *
+     * [dailyLimit] 是三态：**null = 跟随全局**（设置页「每日上限」那一档，llm.json 的 daily_limit）、
+     * 0 = 这个群不限、>0 = 这个群自己的额度。老版本写下的 "daily_limit": 0 就是「不限」，行为不变。
+     */
     data class Conf(
         val autoReply: Boolean? = null,
-        val dailyLimit: Int = 0,
+        val dailyLimit: Int? = null,
         val webSearch: Boolean? = null,
         val enabled: Boolean = true,
     ) {
         /** 全部跟随 + 未静音：与「没有这份文件」等价。 */
         val isDefault: Boolean
-            get() = autoReply == null && dailyLimit <= 0 && webSearch == null && enabled
+            get() = autoReply == null && dailyLimit == null && webSearch == null && enabled
     }
 
     /** 群配置页一行：一个群 + 它的运行记录（最后一次活跃时间 / 条数）+ 有没有覆盖。 */
@@ -58,7 +63,9 @@ object GroupConfig {
 
         return Conf(
             autoReply = tri("auto_reply"),
-            dailyLimit = o.optInt("daily_limit", 0).coerceAtLeast(0),
+            // 缺项 / null = 跟随全局；显式 0 = 本群不限（老文件里的 0 就是这个意思）
+            dailyLimit = if (o.isNull("daily_limit")) null
+            else o.optInt("daily_limit", 0).coerceAtLeast(0),
             webSearch = tri("web_search"),
             enabled = if (o.isNull("enabled")) true else o.optBoolean("enabled", true),
         )
@@ -78,7 +85,7 @@ object GroupConfig {
             dir(ctx, appid).mkdirs()
             val o = JSONObject()
                 .put("auto_reply", conf.autoReply ?: JSONObject.NULL)
-                .put("daily_limit", conf.dailyLimit.coerceAtLeast(0))
+                .put("daily_limit", conf.dailyLimit?.coerceAtLeast(0) ?: JSONObject.NULL)
                 .put("web_search", conf.webSearch ?: JSONObject.NULL)
                 .put("enabled", conf.enabled)
             file(ctx, appid, gid).writeText(o.toString(1), Charsets.UTF_8)

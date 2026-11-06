@@ -54,6 +54,7 @@ import top.yukonga.miuix.kmp.basic.CardDefaults
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Notes
 import top.yukonga.miuix.kmp.icon.extended.Ok
+import com.wjljh.andbna.ui.component.PanelSectionTitle
 import com.wjljh.andbna.ui.component.PanelTokens
 import com.wjljh.andbna.ui.component.cardOutline
 import top.yukonga.miuix.kmp.basic.Button
@@ -174,37 +175,50 @@ fun SectionCard(
     // 子元素之间的间距。信息行卡片要传 0：行自带 24dp 下间距（spec §6 #8），
     // 两者一起加行距会翻倍。
     gap: Dp = Dp.Unspecified,
+    // true = 标题画在卡片**外面**（卡上方 8dp 一行小标题，见 [PanelSectionTitle]）；
+    // false = 老样子画在卡内。两种都只画一份标题，卡内绝不重复。
+    titleOutside: Boolean = false,
     content: @Composable ColumnScope.() -> Unit,
 ) {
-    Card(
-        cornerRadius = metrics.radiusCard,
-        // spec §2.3 / §2.4：SukiSU 的组卡就是 Card { Column(padding(16.dp)) }
-        insideMargin = PaddingValues(metrics.cardInside),
-        modifier = Modifier.fillMaxWidth().cardOutline(metrics.radiusCard),
-    ) {
-        if (title != null) {
-            Text(
-                title,
-                // spec 90 §2.2：组内标题 17sp / Medium / onBackground
-                fontSize = 17.sp,
-                fontWeight = FontWeight.Medium,
-                color = PanelColors.onBackground,
-            )
-        }
-        if (hint != null) {
-            Text(
-                hint,
-                fontSize = 14.sp,
-                color = PanelColors.onSurfaceVariantSummary,
-            )
-        }
-        Column(
-            verticalArrangement = Arrangement.spacedBy(
-                if (gap == Dp.Unspecified) metrics.innerGap else gap
-            ),
+    val card: @Composable () -> Unit = {
+        Card(
+            cornerRadius = metrics.radiusCard,
+            // spec §2.3 / §2.4：SukiSU 的组卡就是 Card { Column(padding(16.dp)) }
+            insideMargin = PaddingValues(metrics.cardInside),
+            modifier = Modifier.fillMaxWidth().cardOutline(metrics.radiusCard),
         ) {
-            content()
+            if (title != null && !titleOutside) {
+                Text(
+                    title,
+                    // spec 90 §2.2：组内标题 17sp / Medium / onBackground
+                    fontSize = 17.sp,
+                    fontWeight = FontWeight.Medium,
+                    color = PanelColors.onBackground,
+                )
+            }
+            if (hint != null) {
+                Text(
+                    hint,
+                    fontSize = 14.sp,
+                    color = PanelColors.onSurfaceVariantSummary,
+                )
+            }
+            Column(
+                verticalArrangement = Arrangement.spacedBy(
+                    if (gap == Dp.Unspecified) metrics.innerGap else gap
+                ),
+            ) {
+                content()
+            }
         }
+    }
+    if (title != null && titleOutside) {
+        Column {
+            PanelSectionTitle(title)
+            card()
+        }
+    } else {
+        card()
     }
 }
 
