@@ -33,5 +33,3 @@ __pycache__/
 andbna-app/.kotlin/
 1.jpg
 
-# 工作流文件需要 workflow scope 的 token 才能推送，暂由用户在网页添加
-.github/
