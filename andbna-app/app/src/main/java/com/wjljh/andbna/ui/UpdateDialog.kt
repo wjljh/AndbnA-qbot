@@ -13,14 +13,14 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wjljh.andbna.local.Updater
-import com.wjljh.andbna.ui.component.MarkdownWebView
+import com.wjljh.andbna.ui.component.MarkdownText
 import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.window.WindowDialog
 
 /**
  * 更新详情对话框：标题写清「发现新版本 X（当前 Y）」，正文是 release body 的 Markdown 渲染
- * （WebView，见 [MarkdownWebView]；body 为空就退化成一行说明，不建 WebView）。
+ * （原生，见 [MarkdownText]；body 为空就退化成一行说明）。
  *
  * 三个动作：更新（进前台服务下载）/ 忽略此版本（同一版本不再提示）/ 取消。
  * 更新源地址不在这页出现：默认硬编码官方 GitHub，要换只走隐藏 prefs 键 update_api。
@@ -50,7 +50,7 @@ fun UpdateDialog(
                         color = PanelColors.onSurfaceVariantSummary,
                     )
                 } else {
-                    MarkdownWebView(markdown = body, modifier = Modifier.fillMaxWidth())
+                    MarkdownText(markdown = body, modifier = Modifier.fillMaxWidth())
                 }
 
                 Text(

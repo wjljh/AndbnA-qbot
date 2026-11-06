@@ -7,7 +7,7 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.wjljh.andbna.BuildConfig
-import com.wjljh.andbna.ui.component.MarkdownWebView
+import com.wjljh.andbna.ui.component.MarkdownText
 import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.window.WindowDialog
 
@@ -18,10 +18,83 @@ import top.yukonga.miuix.kmp.window.WindowDialog
  * 老用户 seenVc < VERSION_CODE 时弹这一页。点「知道了」→ [onDismiss]（App.kt 里 markDone 写回
  * onboard_seen_vc，同一版本只弹一次）。
  *
- * 正文是编译期常量（[BODY]），走已有的 [MarkdownWebView]（WebView 内联 HTML），全程不发网络请求；
- * 深/浅色由 MarkdownWebView 自己按系统主题换配色。内容超出屏高时 WebView 内部滚动。
+ * 正文按版本号取（[WHATS_NEW]）：弹窗标题已经写了版本，所以正文里不放 `# 标题` 那一行。
+ * 没登记的版本按最新一条兜底 —— 新版本忘记写正文时宁可显示上一版内容，也不要空弹窗。
+ *
+ * 渲染由 [MarkdownText] 原生完成（Column + Text，不再起 WebView）。正文很长，
+ * 高度上限是屏高的 55%（与旧 WebView 版同一视口），超出部分**滚动**看，不做截断。
  */
-private const val BODY = """
+private val WHATS_NEW: Map<String, String> = mapOf(
+    "1.0.8" to """
+> 这一版解决「多个 bot 抢答、各说各话」的问题：群里由**一个总模型统一决定谁来回**，bot 之间能看见彼此的发言，也能自己把话题聊到一个体面的收尾。
+
+## 新增
+
+### 多 bot 群聊：由总模型决定谁回
+- 群里同时启用 2 个以上 bot 时，新增「总模型」统一判断：**这条消息由哪一个 bot 回**，或者都不回；不再出现多个 bot 同时抢答、各说各话。
+- 同一条消息**只调用一次**总模型（跨 bot 共享结果），成本不会随 bot 数量翻倍，理论上更节省token。
+- 明确的点名仍然优先：真人 @ 了某个 bot 时跳过总模型，直接由被点名的 bot 回；私聊不经过总模型。
+- 总模型失败或答不出时，退回「各 bot 自行判断」，并保留互斥：本群 3 秒内已有 bot 发言，本轮放弃。
+- 总模型使用的模型沿用**判定模型**（模型配置页可指定，留空用主模型），不额外增加槽位。
+
+### bot 之间能看见彼此
+- 群内上下文会给其它 bot 的发言打上名字标签（`[桑多涅] 我觉得…`），真人发言保留 `[作者 名字]`。
+- bot 能分辨「谁被 @ 了」：`@你` / `@作者本人` / `@用户xxxxxxxx`。
+- 可以点名回应某个 bot；只做**同群可见**，不跨群。
+- 身份判定保守：只有确认是 bot 的发言才带 bot 标签。
+
+### 不会无限聊下去
+- 每个 bot 在连续的 bot 对话里最多说 **6 句**；到上限时，由它自己组织一句符合人格的收尾，更加节省token。
+- 收尾之后，该 bot 对**刚才那个对话方**静默 10 分钟；对其他 bot 不受影响（可配置）。
+- 静默结束自动解除，重启后清空，不会长期积累。
+
+### 真人优先
+- 静默期**只针对 bot**：真人说话、真人 @ 都照常回应。
+- 真人每小时有软上限（默认 40 条）：超过之后不会拒答，只是让判定更保守，避免话痨。
+
+### 每个 bot 可以单独设判定与延迟
+- Bot 编辑页新增「回复判定」：跟随全局 / 保守 / 标准 / 积极。
+- Bot 编辑页新增「回复延迟」：跟随全局 / 不延迟 / 1~3 秒 / 3~7 秒 / 6~10 秒 / 自定义。
+- 延迟默认全局 **3~7 秒随机**，更像真人在打字；指令类（`#搜`、`#读`、回时间）不吃延迟，即时返回。
+
+### 设置页新增「Bot 互聊」分组
+位于模型配置卡片下方，包含：
+- 多 bot 由总模型决定谁回（默认开）
+- 每个 bot 连续发言上限（默认 6 句）
+- 到上限后静默（默认 10 分钟）
+- 真人每小时上限（默认 40 条）
+- 全局回复延迟（默认 3~7 秒）
+
+### 启停立即生效
+- Bot 页的启用/停用开关不再需要重启 App：3 秒内该 bot 上下线。
+- 总模型是否生效取决于「启用中的 bot 数」，启停后立即切换。
+
+## 修复
+- **去重键用错字段**：原先日志里的「重复 id」其实是 id 被截断到 12 个字符造成的错觉；现改为取完整 `msg_id` / `event_id` / `id` + 正文哈希，并增加「同内容 3 秒内只处理一次」的短窗保护。
+
+## 优化
+
+### 内存与渲染
+- **更新说明改为原生渲染**：不再用 WebView 绘制 Markdown，改由 Compose 直接排版（标题、列表、粗体、行内代码、引用、链接样式全部保留，链接仍可点击跳转）。打开更新说明时不再额外申请 WebView 的图形缓冲区，关闭后立即释放。
+- **WebView 用完即销毁**：关闭弹窗后 2 秒内释放图形内存（改动前要等约 28 秒的垃圾回收才回落）。
+
+### 占用实测（5 个 bot 常驻，供参考）
+- 进程总体约 **227 MB**（PSS）；任务管理器里显示的数值会更高，因为它把共享库也算进每个进程（RSS）。
+- 其中 **Python 运行时 + 全部 bot 数据 ≈ 24 MB（11%）**：5 个 bot 的对话不常驻内存（memory.json 每次现读，拼上下文只取最近 12 条 + 摘要）。
+
+### 界面调整
+- 「主动程度 + 名字命中就当被叫」从模型配置页移到设置页「回复节奏」组，卡片改名 **回复判定-模型判断配置**；切到「随机」模式时整卡收起，避免误以为生效。
+- 判定文案统一为 **保守 / 标准 / 积极**。
+- 「每日上限」改为可选档位：50 / 80 / 120 / 180 / 200 条/天、无上限、自定义。
+- 群配置「每日额度」改为三态：**跟随全局 / 不限 / 指定条数**；括号里的全局值实时显示（例如「跟随全局（无上限）」）。
+- 设置页各组标题移到卡片外，与其它页面保持一致。
+- 状态页标题改为 **AndbnA-状态**。
+
+## 提示
+- 升级后首次启动会显示本页「更新说明」。
+""",
+    // 兜底：1.0.7 及更早版本（升级说明统一弹最新一条，这条只在回滚时才会读到）
+    "1.0.7" to """
 ## 本次更新
 
 - **判定更主动**：叫它名字不再需要 @，直接回；判定默认 `normal` 档，拿不准时倾向于接话（模型配置页可改 conservative / eager）
@@ -30,10 +103,15 @@ private const val BODY = """
 - **模型可以 @ 人**：群聊里回复需要点名时会真的 @ 到对方
 - **@ 语义更清楚**：它现在能分辨「@你」「@作者本人」「@其他人」
 - **移除**：设置页「清理识图缓存」（识图不落盘，本来就没有缓存）
-"""
+""",
+)
+
+/** 兜底正文：版本号没登记时用最新一条。 */
+private const val LATEST_VERSION = "1.0.8"
 
 @Composable
 fun WhatsNewScreen(onDismiss: () -> Unit) {
+    val body = WHATS_NEW[BuildConfig.VERSION_NAME] ?: WHATS_NEW.getValue(LATEST_VERSION)
     WindowDialog(
         show = true,
         title = "AndbnA " + BuildConfig.VERSION_NAME + " 更新说明",
@@ -43,7 +121,7 @@ fun WhatsNewScreen(onDismiss: () -> Unit) {
                 modifier = Modifier.fillMaxWidth(),
                 verticalArrangement = Arrangement.spacedBy(10.dp),
             ) {
-                MarkdownWebView(markdown = BODY.trim(), modifier = Modifier.fillMaxWidth())
+                MarkdownText(markdown = body.trim(), modifier = Modifier.fillMaxWidth())
                 TextButton(
                     text = "知道了",
                     onClick = onDismiss,
