@@ -92,6 +92,13 @@ fun MarkdownWebView(markdown: String, modifier: Modifier = Modifier) {
                 tag = html
             }
         },
+        // 离开组合就把 WebView 销毁：不销毁的话 attach 的 renderer / GL 表面
+        // 要等 GC 才回收（实测：关闭后 8s 仍占着 1 个 WebView + 一张 GL 表面）。
+        onRelease = { view ->
+            view.stopLoading()
+            view.removeAllViews()
+            view.destroy()
+        },
         // 深浅色切换会换一份 html（配色不同）：这里必须真的重载，否则文字还是旧配色
         update = { view ->
             if ((view.tag as? String) != html) {
