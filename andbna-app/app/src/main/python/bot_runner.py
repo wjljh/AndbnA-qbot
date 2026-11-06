@@ -3703,22 +3703,83 @@ def _author_ids(message):
 _DEDUP_LIMIT = 300
 _DEDUP_TTL = 600          # msg_id 的去重窗口（秒）
 _DEDUP_HASH_TTL = 30      # 没有 msg_id 时的兜底窗口（秒）
+_DEDUP_CONTENT_TTL = 3.0  # 同作者 + 同内容的短窗去重（秒）：平台偶尔把同一条投两遍
 _dedup = {}               # appid -> OrderedDict{key: ts}
+
+# 「哪个字段才是唯一消息 id」的答案（见 _unique_msg_id 的注释），按优先级试。
+_MSG_ID_FIELDS = ("msg_id", "event_id", "id")
+
+
+def _unique_msg_id(message):
+    """→ (字段名, 值)；拿不到 → ("", "")。
+
+    payload 形状看 _GroupMsg：一条群消息只有 d.id（就是回消息时传给
+    post_group_message 的 msg_id），没有单独的 event_id / msg_id 字段。
+    而「同一 id 对应过完全不同的内容」这个观察，光看日志证不了：旧实现写日志时把 id
+    **截到 12 个字符**（id=ROBOT1.0_u0I 正好 12 个字），所有 ROBOT1.0_ 开头的 id
+    前 12 位一模一样 —— 那是截断造成的错觉，不是 id 复用。
+    现在的做法：① 日志打**完整**去重键，下次真机一看就知道；② 去重键带上正文哈希，
+    id 万一真被复用也不会把一条不同的消息吃掉；③ 另加一层「同时间戳 + 同内容 + 3 秒」
+    的短窗去重（时间戳不同就只可能是「又说了同样一句」，不吃）。
+    """
+    raw = getattr(message, "raw", None)
+    holders = [message]
+    if isinstance(raw, dict):
+        holders.append(raw)
+        d = raw.get("d")
+        if isinstance(d, dict):
+            holders.append(d)
+            inner = d.get("message")
+            if isinstance(inner, dict):
+                holders.append(inner)
+    for field in _MSG_ID_FIELDS:
+        for h in holders:
+            v = h.get(field) if isinstance(h, dict) else getattr(h, field, None)
+            v = str(v or "").strip()
+            if v:
+                return field, v
+    return "", ""
+
+
+def _msg_ts(message):
+    """这条消息**自己**的时间戳（payload 的 d.timestamp / d.message.timestamp）；拿不到 → ""。
+
+    内容短窗去重只在时间戳相同时才认「同一条投了两遍」：否则「同一个人 3 秒内把同一句
+    说了两遍」会被误吃（真机上很常见，老用例也会因此挂）。没有时间戳就不做内容短窗，
+    只靠 id 键 + 正文哈希的兜底键。
+    """
+    raw = getattr(message, "raw", None)
+    holders = [message]
+    if isinstance(raw, dict):
+        holders.append(raw)
+        d = raw.get("d")
+        if isinstance(d, dict):
+            holders.append(d)
+            inner = d.get("message")
+            if isinstance(inner, dict):
+                holders.append(inner)
+    for field in ("timestamp", "ts", "time"):
+        for h in holders:
+            v = h.get(field) if isinstance(h, dict) else getattr(h, field, None)
+            v = str(v or "").strip()
+            if v:
+                return v
+    return ""
 
 
 def _dedup_key(message):
-    """→ (键, msg_id, 是否用 msg_id)。"""
-    mid = str(getattr(message, "id", "") or getattr(message, "msg_id", "") or "").strip()
-    if mid:
-        return "id:" + mid, mid, True
+    """→ (去重键, 用于日志的 id, 是否用真 id)。键里带正文哈希：id 复用也不误吃不同消息。"""
+    field, mid = _unique_msg_id(message)
+    body = _hash_text(getattr(message, "content", "") or "")[:12]
     author = ""
     try:
         ids = _author_ids(message)
         author = ids[0] if ids else ""
     except Exception:
         author = ""
-    txt = str(getattr(message, "content", "") or "").strip()[:40]
-    return "h:" + author + "|" + txt, "", False
+    if mid:
+        return "%s:%s|%s" % (field, mid, body), mid, True
+    return "h:" + author + "|" + body, "", False
 
 
 def _msg_dup(appid, message):
@@ -3740,16 +3801,37 @@ def _msg_dup(appid, message):
             d.move_to_end(key)
             return True, (mid or "(无 msg_id)")
         d[key] = now
+        # 同一时间戳 + 同作者 + 同内容 + 3 秒内又出现一条 = 平台把同一条消息投了两遍
+        # （时间戳不同就只可能是「同一个人又说了同样一句」，那是两条消息，不能吃）
+        stamp = _msg_ts(message)
+        if stamp:
+            akey = "c:%s|%s|%s" % (stamp, "|".join(_author_ids(message) or [""]),
+                                   _hash_text(getattr(message, "content", "") or ""))
+            ats = d.get(akey)
+            if ats is not None and (now - ats) <= _DEDUP_CONTENT_TTL:
+                d.move_to_end(akey)
+                while len(d) > _DEDUP_LIMIT:
+                    d.popitem(last=False)
+                return True, "同一时间戳同内容 %.0f 秒内重复（内容短窗）" % _DEDUP_CONTENT_TTL
+            d[akey] = now
         while len(d) > _DEDUP_LIMIT:
             d.popitem(last=False)
     return False, (mid or "(无 msg_id)")
 
 
 def _dedupe_message(appid, message, source):
-    """重复消息的统一 choke point：True = 这条已经处理过，调用方直接 return。"""
+    """重复消息的统一 choke point：True = 这条已经处理过，调用方直接 return。
+
+    日志把**完整**去重键和前 40 字正文一起打出来 —— 旧实现只打 id 前 12 个字符，
+    ROBOT1.0_ 前缀撞在一起，才让人误以为「同一 id 对应不同内容」。
+    """
     dup, mid = _msg_dup(appid, message)
+    key = _dedup_key(message)[0]
+    field = _unique_msg_id(message)[0] or "无"
     if dup:
-        log("去重：msg_id=%s 已处理过，跳过（来源=%s）" % (mid, source), appid)
+        log("去重：去重键=%s（%s）已处理过，跳过（来源=%s）" % (mid, key, source), appid)
+    else:
+        log("去重键=%s（字段=%s）" % (key, field), appid)
     return dup
 
 
@@ -4733,6 +4815,1057 @@ def _gate_rate(appid, gid):
     return True, ""
 
 
+
+# ── 群聊人格摘要（总模型只读这一段，不读全文人格）──────────────
+#
+# 总模型要认识群里每个角色，但不能把每个人格正文都塞进提示词（一份 2000+ 字，
+# 四个角色就上万 token，每条消息烧一遍）。所以摘要单独存一份：
+#   · 内置人格：摘要写死在代码里，不联网、不花 token（_PERSONA_SUMMARIES）
+#   · 导入人格：<botdir>/persona_summary.txt + persona_summary_hash.txt
+#     只在「导入人格 / 编辑人格保存」时生成（start_one / restart_one 的钩子），
+#     人格正文 hash 没变就一个字都不重生成；生成失败先用原文前 300 字兜底，
+#     不写 hash → 下次进来自动补生成。
+
+_SUMMARY_MAX = 200          # 提示词要求的摘要字数上限
+_SUMMARY_FALLBACK = 300     # 生成失败时兜底的原文长度
+
+_PERSONA_SUMMARIES = {
+    "桑多涅": (
+        "语气冷、短、干脆，带点居高临下的骄傲，动不动就「哼」「啧」「烦人」，几乎不讲客套，也从不软声哄人。"
+        "说话像在下结论而不是聊天：喜欢把话题拽回「这做得对不对」「效率划不划算」，擅长机械、傀儡、结构拆解"
+        "和无意义的完美主义，习惯挑别人话里的漏洞，被夸会别扭地转移话题、把功劳推给「本来就是这么设计的」。"
+        "群聊里常用半句话噎人，损完人却顺手丢一个实用建议，算是别扭的关心；对认真做事的人会罕见地给一句认可。"
+        "她话不多，可一旦有人问技术上的对错，会认真拆到最细，然后不耐烦地收一句「就这样，别问了」；"
+        "别人夸她做的傀儡精巧，她嘴上说「废话」，回头却会把图纸悄悄改一遍。"
+        "忌讳：被当成温柔体贴的软角色、被要求卖萌撒娇、被外行指点专业、被催着说好听话。"
+        "不爱长篇大论，不用表情包，句子常以句号收尾。"
+    ),
+    "哥伦比娅": (
+        "语气轻、慢、含糊，像刚醒着说话，句尾常带「…」「嗯」「唔」「呢」，声音低、情绪淡，很少提高音量。"
+        "注意力总落在月亮、夜色、风、光的冷暖，还有别人的疲惫上，擅长安慰、陪坐、说些不解决实际问题"
+        "但让人松下来的话。不太主动给方案，更喜欢先反问一句「你还好吗」，等对方说完再轻轻接一句。"
+        "被追问会先有短暂的迟钝，然后给出很轻但认真的回答；难受的人在她这儿不会被催着振作。"
+        "夜里话会多一点，白天常常只回半句；被道谢会安静一小会儿，然后说「不用谢…我也没做什么」。"
+        "她记得别人怕什么、不愿提什么，会主动避开那些话题；遇到争执就退到一边，等人冷静了才轻轻开口。"
+        "忌讳：被逼着快速下判断、被要求热血或大声、被当作工具使唤、被说「你说话太绕」。"
+        "不聊技术细节，不用感叹号，也不说教，回复通常两三句就停。"
+    ),
+    "奥黛塔": (
+        "语气端、稳、有礼，像受过训练的舞者：句子完整，节奏清楚，不抢话也不含糊，几乎没有口语化的省略。"
+        "习惯用「定点」「重心」「呼吸」这类身体感觉打比方，擅长把情绪问题拆成可以练的小步骤，"
+        "总先劝人把背挺直、把气喘匀，再谈事情怎么办；鼓励休息多过鼓励硬撑。"
+        "对迟到、敷衍、半途而废会认真地不高兴，但仍是讲道理的那一种，会指出具体哪一步没做到。"
+        "教人时会先把动作拆到最慢，再让对方自己走一遍，做对了只轻轻点一下头；她自己累了也会直说累，不装硬气。"
+        "遇到不讲理的人会站直了把话说完，声音不大但不退让；对努力的人不吝惜肯定，克制却听得出来真心。"
+        "忌讳：被起哄表演、被当成只会说漂亮话的人、被轻浮地调情。"
+        "不用网络用语，不喊口号，回复两三句，收尾干净。"
+    ),
+    "沃雅妮莎": (
+        "语气直接、爽利、带点江湖气的豪爽，敢说敢认，句子短而有力，常用命令句和反问句。"
+        "擅长装备、路线、野外和「出了事怎么办」，遇到问题先问「现在什么情况」，再问「谁跟你一起」。"
+        "夸人直白，骂人也直白，情绪上来会大声，但转头就替人把事办了，从不记仇。"
+        "不喜欢把事情说得绕，讨厌拖延和推卸，会当场把话掰开讲清楚。"
+        "她说话总带着现场感，喜欢用「先这样、再那样」把事拆开；听人说计划太空，会直接问「什么时候动手」。"
+        "对新人凶归凶，实际护得紧，会把自己的做法直接教一遍；别人真心道谢，她反倒不知道怎么接，只哼一声。"
+        "忌讳：被当成什么都不懂的花瓶、被拐弯抹角地试探、被敷衍和拖延。"
+        "不写排比句，也不做温柔安慰，最多拍拍肩膀式的一句「行了，别想了」。"
+    ),
+    "鲸鱼娘": (
+        "语气软、慢、温吞，像在水里说话，常用「呀」「啦」「~」这类语气词，句子短，偶尔把半句重复一遍。"
+        "喜欢用海、潮汐、泡泡、深水来打比方，擅长听人倒苦水、陪着发呆、把复杂的事说得很简单。"
+        "不擅长吵架，被凶了会先安静一下，再小声说自己的想法；心里在意的事会绕两圈才讲出来。"
+        "对别人的坏情绪很耐受，不急着劝，先陪着；她会记住别人上次说累不累，隔一天再问一遍。"
+        "遇到听不懂的话题就安静听着，偶尔冒一句「这样呀」，然后继续听。被夸奖会开心很久，但只说一句「嘿嘿…」。"
+        "她不喜欢替人做决定，喜欢问「你想怎么弄」，然后照着陪。"
+        "忌讳：被嫌吵、被要求讲技术方案、被逼着立刻表态。"
+        "很少用感叹号连发，也不用冷嘲热讽，回复很轻，像随口接的一句，说完还留一点空。"
+    ),
+    "猫娘": (
+        "语气黏、懒、跳，带一点自我中心的可爱，爱用「喵」「嘛」，会突然换个话题，句子常断成几截。"
+        "擅长撒娇式地讨要东西、装傻、把气氛弄软，也擅长在别人难受时用很奇怪的方式把人逗笑，"
+        "比如忽然认真地问一句不相干的小事，反而让人松下来。"
+        "注意力短，被追问逻辑会理直气壮地赖掉，或者把话题拐回吃的和睡觉；被戳穿也不生气，只换个说法。"
+        "对熟的人黏得厉害，会记着谁给过她吃的，隔天还提一句；心情好会连着发好几句短的，心情不好就只回一个「喵」。"
+        "有人吵架她会插一句不相干的话把气氛岔开；被表扬明显得意，嘴上却说「也没什么嘛」。"
+        "忌讳：被认真追问道理、被说幼稚、被命令不许撒娇。"
+        "不聊沉重话题，遇到太严肃的就装听不懂，或者把话题拐回吃的和睡觉。"
+    ),
+}
+
+def _summary_paths(botdir):
+    root = _bot_root(botdir)
+    return (os.path.join(root, "persona_summary.txt"),
+            os.path.join(root, "persona_summary_hash.txt"))
+
+
+def _persona_hash(text):
+    import hashlib
+    return hashlib.sha256(str(text or "").encode("utf-8")).hexdigest()
+
+
+def persona_summary(botdir):
+    """总模型读的那份摘要：**只读**，不生成、不联网（生成时机不在这里）。
+
+    内置人格 → 写死的固定摘要；导入人格 → persona_summary.txt；
+    都拿不到 → 原文前 300 字（宁可长一点，也不能让总模型瞎猜这个人是谁）。
+    """
+    name = _persona_name(botdir)
+    if name in _PERSONA_SUMMARIES:
+        return _PERSONA_SUMMARIES[name]
+    spath, _hpath = _summary_paths(botdir)
+    try:
+        with open(spath, encoding="utf-8") as f:
+            text = f.read().strip()
+        if text:
+            return text
+    except OSError:
+        pass
+    return (_persona(botdir) or "")[:_SUMMARY_FALLBACK]
+
+
+def _summary_call(conf, persona_text, appid=""):
+    """调主模型生成摘要（同步）。单测替换这一个函数就不用联网。"""
+    prompt = ("下面是一个 QQ 群角色的人格设定。请用 %d 字以内概括它：语气、说话习惯、"
+              "擅长的话题、忌讳。只输出概括本身，不要标题，不要复述原文，不要分点列举。"
+              "%s%s" % (_SUMMARY_MAX, chr(10) + chr(10), persona_text[:6000]))
+    return _call_llm_sync(conf, [{"role": "user", "content": prompt}], 500, 0.3)
+
+
+def persona_summary_sync(botdir, appid="", force=False):
+    """人格摘要（同步、会联网）：内置人格直接返回写死的那份；导入人格比 hash 再决定。
+
+    生成时机只有「导入人格 / 编辑人格保存」（调用方：start_one / restart_one 的后台预热）。
+    hash 没变 → 直接用盘上那份，**不重生成**（省 token 也是这一条的验收点）。
+    失败重试 3 次、退避 1s / 3s；仍失败 → 原文前 300 字兜底并记日志，不写 hash 以便下次补生成。
+    """
+    name = _persona_name(botdir)
+    if name in _PERSONA_SUMMARIES:
+        return _PERSONA_SUMMARIES[name]
+    text = _persona(botdir)
+    if not text:
+        return ""
+    spath, hpath = _summary_paths(botdir)
+    want = _persona_hash(text)
+    have, cached = "", ""
+    try:
+        with open(hpath, encoding="utf-8") as f:
+            have = f.read().strip()
+    except OSError:
+        have = ""
+    try:
+        with open(spath, encoding="utf-8") as f:
+            cached = f.read().strip()
+    except OSError:
+        cached = ""
+    if cached and have == want and not force:
+        return cached
+    conf = _llm_conf(_base_dir) if _base_dir else None
+    if conf is None:
+        log("人格摘要跳过生成：模型配置没填（llm.json 缺 key / 地址）→ 先用原文兜底", appid)
+        return cached or text[:_SUMMARY_FALLBACK]
+    for i in range(3):
+        out = ""
+        try:
+            out = str(_summary_call(conf, text, appid) or "").strip()
+        except Exception as e:
+            log("人格摘要生成失败（第 %d/3 次）：%r" % (i + 1, e), appid)
+        if out:
+            try:
+                with open(spath, "w", encoding="utf-8") as f:
+                    f.write(out)
+                with open(hpath, "w", encoding="utf-8") as f:
+                    f.write(want)
+            except OSError as e:
+                log("人格摘要写盘失败（忽略）：%r" % e, appid)
+            log("人格摘要已生成：%d 字（人格 %d 字，hash %s）" % (len(out), len(text), want[:8]), appid)
+            return out
+        if i < 2:
+            time.sleep(1.0 if i == 0 else 3.0)      # 指数退避 1s / 3s
+    fb = cached or text[:_SUMMARY_FALLBACK]
+    log("人格摘要 3 次都失败 → 先用原文前 %d 字兜底（不写 hash，下次有网再补生成）"
+        % _SUMMARY_FALLBACK, appid)
+    if not cached:
+        try:
+            with open(spath, "w", encoding="utf-8") as f:
+                f.write(fb)
+        except OSError:
+            pass
+    return fb
+
+
+def _summary_warm(botdir, appid=""):
+    """后台补生成（不阻塞启动 / 保存）。进程退出无所谓：没写完下次还会再来一次。"""
+    def _run():
+        try:
+            persona_summary_sync(botdir, appid)
+        except Exception as e:
+            log("人格摘要后台生成出错（忽略）：%r" % e, appid)
+    threading.Thread(target=_run, daemon=True).start()
+    return "OK"
+
+
+# ── 多 bot 群聊总模型（gatekeeper）────────────────────────────
+#
+# 为什么要有这一层：群里同时挂几个 bot 时，每个 bot 各自「自判要不要接话」，
+# 同一条消息就被几个 bot 抢答 —— 老的四道闸只能限流，不能分工。
+# 这一层只回答一个问题：**这一轮谁说**（或者说谁都不说），外加连续 bot 链的
+# 句数上限、成对静默、群内互相可见。
+#
+# 线程模型：每个 bot 一条线程 + 一个独立事件循环（见文件头）。同一条群消息会被
+# **每个** bot 各收到一次，所以「谁来说」这个决定必须跨 bot 共享；跨线程不能 await
+# 别的 loop 的 Future，只靠 threading 原语：
+#   · 先到的 bot 认领这条消息 → 跑一次总模型 → 结果放进共享记录
+#   · 后到的 bot 轮询共享记录（asyncio.sleep，不阻塞任何 loop）→ 拿到同一个决定
+#   · 只有被点名的那个 bot 发言，其余安静退出 → 一条消息只烧一次总模型的钱
+#
+# 全部只放内存：静默、句数、群上下文、最后一次发言都随进程重启清空（不落盘）。
+# 落盘的只有两样：bot_ids.json（作者 openid → appid，只记 bot）与人格摘要。
+
+_GATE_DEFAULTS = {
+    "gate_enabled": True,
+    "bot_max_turns": 6,
+    "bot_silence_minutes": 10,
+    "human_hourly_limit": 40,
+    "reply_delay_min_ms": 3000,
+    "reply_delay_max_ms": 7000,
+}
+
+_GATE_REC_TTL = 8.0          # 同一 (群, 正文) 的共享决定保留多久（秒）
+_GATE_WAIT_MAX = 20.0        # 后到的 bot 最多等多久（总模型 30s 超时 + 余量）
+_GATE_PROMPT_CTX = 8         # 拼给总模型的最近消息条数
+_HUMAN_WINDOW = 3600.0       # 真人每小时软上限的窗口（秒）
+
+_gate_rec = {}               # (gid, 正文哈希) -> {owner, done, ev, dec, ts, used}
+_gate_state = {
+    "ctx": {},        # (appid, gid) -> [{"who","text","bot","ts"}]
+    "turns": {},      # gid -> {bot 名字: 句数}     连续 bot 链里各自说了几句
+    "chain": {},      # gid -> [bot 名字, ...]      连续 bot 链（真人发言清空）
+    "silence": {},    # (gid, 发言方, 目标) -> 截止 ts
+    "human": {},      # gid -> [ts, ...]            真人消息时间戳
+    "spoken": {},     # gid -> {"appid","name","text","ts"}  本群最后一次 bot 发言
+    "counted": {},    # (gid, 正文哈希) -> ts        这句话是否已经计过数（跨 bot 只计一次）
+    "downgrade": {},  # gid -> (小时桶, 上次写日志的时间)
+    "who_log": 6,     # 「发言人识别」日志还剩几条额度（前几条打印，避免刷屏）
+}
+_roster_cache = {"stamp": None, "rows": []}
+
+
+def _int_or(v, default, lo=0, hi=10 ** 6):
+    """宽松取整数：认不出 / 越界就回到默认值（配置是外部写的，不能信）。"""
+    try:
+        n = int(float(str(v).strip()))
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
+def _gate_conf(base_dir=""):
+    """群聊总模型的全局开关（llm.json 的 6 个键，键名由 Kotlin 侧写）。
+
+    每条消息现读、不缓存：启停 bot、改开关之后，下一条消息就要按新配置走。
+    """
+    c = _load_json(os.path.join(str(base_dir or _base_dir or ""), "llm.json"), {}) or {}
+    out = dict(_GATE_DEFAULTS)
+    v = c.get("gate_enabled")
+    if isinstance(v, bool):
+        out["gate_enabled"] = v
+    elif isinstance(v, str) and v.strip():
+        out["gate_enabled"] = v.strip().lower() not in ("0", "false", "no", "off")
+    elif isinstance(v, (int, float)):
+        out["gate_enabled"] = bool(v)
+    out["bot_max_turns"] = _int_or(c.get("bot_max_turns"), 6, 1, 50)
+    out["bot_silence_minutes"] = _int_or(c.get("bot_silence_minutes"), 10, 0, 1440)
+    out["human_hourly_limit"] = _int_or(c.get("human_hourly_limit"), 40, 0, 10000)
+    dmin = _int_or(c.get("reply_delay_min_ms"), 3000, 0, 600000)
+    dmax = _int_or(c.get("reply_delay_max_ms"), 7000, 0, 600000)
+    if dmax < dmin:
+        dmin, dmax = dmax, dmin
+    out["reply_delay_min_ms"], out["reply_delay_max_ms"] = dmin, dmax
+    return out
+
+
+def _localbots_path(base=""):
+    """localbots.json 由 Kotlin 写在 filesDir，而 base_dir = filesDir/localbot —— 两边都看一眼。"""
+    b = os.path.abspath(str(base or _base_dir or "."))
+    for p in (os.path.join(os.path.dirname(b), "localbots.json"),
+              os.path.join(b, "localbots.json")):
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def _roster(base=""):
+    """本机 bot 清单（**实时**：localbots.json 变了立刻生效，没变才吃 mtime 缓存）。
+
+    → [{"appid","name","botdir","enabled","judge_level_override","dmin","dmax"}]
+    · 名字只从 localbots.json 的 name 取（空则退回人格名、再退回 AppID 前 8 位）
+    · 重名补 AppID 前 4 位 —— 总模型的输出是按名字点人的，重名等于点不清
+    · localbots.json 不在（老版本 / 测试）→ 退回 start_all 拿到的那份 enabledJson
+    """
+    base = str(base or _base_dir or "")
+    path = _localbots_path(base)
+    stamp = _file_stamp(path) if path else None
+    if stamp is not None:
+        with _gate_lock:
+            if _roster_cache["stamp"] == stamp:
+                return [dict(r) for r in _roster_cache["rows"]]
+    rows = _load_json(path, []) if path else []
+    if not isinstance(rows, list) or not rows:
+        rows = list(_state.get("bots_json") or [])
+    out = []
+    for e in rows:
+        if not isinstance(e, dict):
+            continue
+        appid = str(e.get("appid") or "").strip()
+        if not appid:
+            continue
+        botdir = _bot_dir(base, appid) if base else ""
+        nm = str(e.get("name") or "").strip()
+        if not nm or nm == appid:
+            nm = (_persona_name(botdir) if botdir else "") or (appid[:8] or "未命名")
+        out.append({
+            "appid": appid,
+            "name": nm,
+            "botdir": botdir,
+            "enabled": bool(e.get("enabled", True)),
+            "judge_level_override": str(e.get("judge_level_override") or "").strip().lower(),
+            "dmin": _int_or(e.get("reply_delay_min_ms"), 0, 0, 600000),
+            "dmax": _int_or(e.get("reply_delay_max_ms"), 0, 0, 600000),
+        })
+    seen = {}
+    for r in out:
+        n = r["name"]
+        if n in seen:
+            r["name"] = "%s#%s" % (n, r["appid"][:4])
+        seen[r["name"]] = r["appid"]
+    with _gate_lock:
+        if stamp is not None:
+            _roster_cache["stamp"] = stamp
+            _roster_cache["rows"] = [dict(r) for r in out]
+    return out
+
+
+def _enabled_roster(base=""):
+    return [r for r in _roster(base) if r["enabled"]]
+
+
+def _my_entry(appid, roster=None):
+    for r in (roster if roster is not None else _roster()):
+        if r["appid"] == str(appid or ""):
+            return r
+    return None
+
+
+def _my_name(appid, roster=None):
+    r = _my_entry(appid, roster)
+    if r:
+        return r["name"]
+    botdir = _bot_dir(_base_dir, appid) if _base_dir else ""
+    return ((_persona_name(botdir) if botdir else "") or str(appid or "")[:8] or "本 bot")
+
+
+def _level_override(appid, roster=None):
+    r = _my_entry(appid, roster)
+    lv = str((r or {}).get("judge_level_override") or "")
+    return lv if lv in _JUDGE_LEVELS else ""
+
+
+def _delay_of(appid, gconf, entry=None):
+    """这一轮的延迟区间（毫秒）。**三态**（Kotlin 侧约定）：
+
+    0 / 0 → 跟随全局；1 / 1 → 本 bot 不延迟；其它 → 真实毫秒区间。
+    0/0 不是「不延迟」—— 那是跟随全局，写成不延迟会错。
+    """
+    e = entry if entry is not None else _my_entry(appid)
+    mn, mx = gconf["reply_delay_min_ms"], gconf["reply_delay_max_ms"]
+    if e:
+        emn, emx = int(e.get("dmin") or 0), int(e.get("dmax") or 0)
+        if not (emn <= 0 and emx <= 0):          # 不是 0/0 → 本 bot 自己说了算
+            mn, mx = emn, emx
+    if mx < mn:
+        mn, mx = mx, mn
+    return max(0, mn), max(0, mx)
+
+
+def _text_hash(text):
+    import hashlib
+    return hashlib.sha1(_norm_text(text).encode("utf-8")).hexdigest()[:16]
+
+
+# ── 群内互相可见：上下文、bot_ids、发言人识别 ──────────────────
+
+def _bot_ids_paths(botdir):
+    """(本 bot 自己那份, 全进程共享那份)。
+
+    openid 按 bot 分配，所以「我看到的是谁」天然是每个 bot 一份；共享那份只在
+    base_dir 里，放各 bot 自己登记的那一条（自己 → 自己），不起推断别人的作用。
+    """
+    root = _bot_root(botdir)
+    out = [os.path.join(root, "bot_ids.json")]
+    parent = os.path.dirname(root)
+    if parent and os.path.abspath(parent) != os.path.abspath(root):
+        out.append(os.path.join(parent, "bot_ids.json"))
+    return out
+
+
+def _bot_ids(botdir):
+    """作者 openid → appid。**只收 bot 的 id**，真人 openid 绝不进这张表。"""
+    out = {}
+    for path in _bot_ids_paths(botdir):
+        d = _load_json(path, {})
+        src = d.get("ids") if isinstance(d, dict) and isinstance(d.get("ids"), dict) else d
+        if not isinstance(src, dict):
+            continue
+        for k, v in src.items():
+            k, v = str(k or "").strip(), str(v or "").strip()
+            if k and v and k not in out:
+                out[k] = v
+    return out
+
+
+def _note_own_bot_id(botdir, ids, appid):
+    """记「自己的 author id → 自己的 appid」。只有确认是自己的消息（回声）才调。
+
+    这是 bot_ids.json 唯一的写入点：只写自己，不推断别人，更不写真人。
+    """
+    appid = str(appid or "").strip()
+    vals = [str(x or "").strip() for x in (ids or [])]
+    vals = [x for x in vals if x]
+    if not appid or not vals:
+        return 0
+    added = 0
+    # 自己那份 + 同进程共享那份都写：openid 若是全局的，共享那份就能让别的 bot 认出我；
+    # 若不是全局的，读不到就按 [其他bot] 兜底 —— 绝不靠猜别人身份来补
+    for path in _bot_ids_paths(botdir):
+        old = _load_json(path, {})
+        table = dict(old) if isinstance(old, dict) else {}
+        if isinstance(table.get("ids"), dict):
+            table = dict(table["ids"])
+        diff = [oid for oid in vals if table.get(oid) != appid]
+        if not diff:
+            continue
+        for oid in diff:
+            table[oid] = appid
+        _save_json(path, table)
+        added += len(diff)
+        log("学到自己的 author id：%s（来源：本 bot 内容的回声，已写入 %s）"
+            % (",".join(diff)[:80], os.path.basename(path)), appid)
+    return added
+
+
+def _sender_of(botdir, message, roster=None):
+    """这条消息是谁发的？→ (名字, appid, 作者 openid, 是否 bot)。
+
+    规则（对方明确要求过，别改宽松）：
+      1) openid 命中 bot_ids.json（只收 bot）→ 名字标签（localbots.json 的 name）
+      2) author.bot=true（或 known_bots.json 认得）但不在表里 → "其他bot"
+      3) 其余一律真人 → 名字留空，标签用 [作者 名字]
+    绝不因为「发了消息」就把真人 openid 记进 bot_ids.json。
+    """
+    ids = _author_ids(message)
+    oid = ids[0] if ids else ""
+    flag = _attr(getattr(message, "author", None), "bot", "is_bot", "isBot")
+    table = _bot_ids(botdir)
+    hit = ""
+    for i in ids:
+        if i in table:
+            hit = table[i]
+            break
+    if hit:
+        name = ""
+        for r in (roster if roster is not None else _roster()):
+            if r["appid"] == hit:
+                name = r["name"]
+                break
+        out = (name or "其他bot"), hit, oid, True
+    elif flag is True or any(i in _known_bots(botdir) for i in ids):
+        out = "其他bot", "", oid, True
+    else:
+        out = "", "", oid, False
+    with _gate_lock:
+        left = _gate_state["who_log"]
+        if left > 0:
+            _gate_state["who_log"] = left - 1
+    if left > 0:
+        log("发言人识别：author=%s → %s" % (
+            _oid8(oid) or "(无)",
+            ("bot(%s)" % out[0]) if out[3] else "真人"), "")
+    return out
+
+
+def _ctx_note(appid, gid, who, text, bot=False):
+    """群上下文：真人 [作者 名字]、bot [名字]，每群只留最近 8 条给总模型。
+
+    同一条消息会被同群的每个 bot 各收一次，这里按 (谁, 正文) 3 秒内去重一次，
+    免得一句话在上下文里出现好几遍。
+    """
+    gid = str(gid or "")
+    box = _gate_state["ctx"].setdefault((str(appid), gid), [])
+    now = time.time()
+    if box and box[-1]["who"] == who and box[-1]["text"] == text and now - box[-1]["ts"] <= 3.0:
+        return
+    box.append({"who": who, "text": text, "bot": bool(bot), "ts": now})
+    del box[:-_GATE_PROMPT_CTX * 2]
+
+
+def _ctx_rows(appid, gid, drop_last=False):
+    rows = list((_gate_state["ctx"].get((str(appid), str(gid or ""))) or [])[-_GATE_PROMPT_CTX:])
+    if drop_last and rows:
+        rows = rows[:-1]
+    return rows
+
+
+def _ctx_text(rows):
+    if not rows:
+        return "（还没有上下文）"
+    return chr(10).join("%s %s" % (r["who"], r["text"]) for r in rows)
+
+
+def _ctx_system(appid, gid):
+    """回复时拼进 system 的「群内最近消息」（带名字标签，谁说的写得明明白白）。"""
+    rows = _ctx_rows(appid, gid, drop_last=True)
+    if len(rows) < 1:
+        return ""
+    return ("【群内最近消息】（同群可见，越靠后越新；[名字] 是别的角色，[作者 名字] 是人）"
+            + chr(10) + _ctx_text(rows))
+
+
+# ── 句数计数 / 成对静默 / 真人每小时软上限 ──────────────────────
+
+def _msg_counted(gid, text):
+    """(群, 正文) 是否已经计过数 —— 同一条消息每个 bot 各收一次，只能算一句。"""
+    key = (str(gid or ""), _text_hash(text))
+    now = time.time()
+    with _gate_lock:
+        d = _gate_state["counted"]
+        for k in [k for k, ts in d.items() if now - ts > 30.0]:
+            d.pop(k, None)
+        if key in d:
+            return True
+        d[key] = now
+        return False
+
+
+def _turn_add(gid, name):
+    gid = str(gid or "")
+    with _gate_lock:
+        turns = _gate_state["turns"].setdefault(gid, {})
+        turns[name] = turns.get(name, 0) + 1
+        _gate_state["chain"].setdefault(gid, []).append(name)
+
+
+def _turn_reset(gid):
+    gid = str(gid or "")
+    with _gate_lock:
+        _gate_state["turns"].pop(gid, None)
+        _gate_state["chain"][gid] = []
+
+
+def _turn_of(gid, name):
+    with _gate_lock:
+        return (_gate_state["turns"].get(str(gid or "")) or {}).get(str(name or ""), 0)
+
+
+def _chain_of(gid):
+    with _gate_lock:
+        return list(_gate_state["chain"].get(str(gid or "")) or [])
+
+
+def _counterpart(gid, me):
+    """成对静默的「目标」：链上最近一个不是我的 bot。"""
+    for name in reversed(_chain_of(gid)):
+        if name and name != me:
+            return name
+    return ""
+
+
+def _silence_set(gid, speaker, target, minutes):
+    if not speaker or not target or speaker == target or minutes <= 0:
+        return 0.0
+    until = time.time() + float(minutes) * 60.0
+    with _gate_lock:
+        _gate_state["silence"][(str(gid or ""), speaker, target)] = until
+    return until
+
+
+def _silenced(gid, speaker, target):
+    """(发言方 → 目标) 是否还在静默期？到时间自动解除（读的时候顺手清）。"""
+    if not speaker or not target or speaker == target:
+        return False
+    key = (str(gid or ""), speaker, target)
+    now = time.time()
+    with _gate_lock:
+        until = _gate_state["silence"].get(key) or 0.0
+        if until and until <= now:
+            _gate_state["silence"].pop(key, None)
+            return False
+    return until > now
+
+
+def _silence_list(gid):
+    now = time.time()
+    out = []
+    with _gate_lock:
+        for k, until in list(_gate_state["silence"].items()):
+            if k[0] != str(gid or ""):
+                continue
+            if until <= now:
+                _gate_state["silence"].pop(k, None)
+                continue
+            out.append("%s→%s（剩 %d 分钟）" % (k[1], k[2], int((until - now) / 60) + 1))
+    return out
+
+
+def _human_note(gid):
+    """记一条真人消息，返回最近一小时的条数。"""
+    gid = str(gid or "")
+    now = time.time()
+    with _gate_lock:
+        box = [t for t in (_gate_state["human"].get(gid) or []) if now - t < _HUMAN_WINDOW]
+        box.append(now)
+        _gate_state["human"][gid] = box
+        return len(box)
+
+
+def _human_count(gid):
+    now = time.time()
+    gid = str(gid or "")
+    with _gate_lock:
+        box = [t for t in (_gate_state["human"].get(gid) or []) if now - t < _HUMAN_WINDOW]
+        _gate_state["human"][gid] = box
+        return len(box)
+
+
+def _downgrade_note(gid, n, limit, appid=""):
+    """超软上限写一条日志（10 分钟内只写一次，别每句都刷）。"""
+    gid, now = str(gid or ""), time.time()
+    bucket = int(now // 600)
+    with _gate_lock:
+        last = _gate_state["downgrade"].get(gid)
+        if last == bucket:
+            return False
+        _gate_state["downgrade"][gid] = bucket
+    log("真人本小时已 %d 条 > 软上限 %d → 本群判定降为 conservative（groups/%s，不硬拒）"
+        % (n, limit, _oid8(gid)), appid)
+    return True
+
+
+def _gate_level(gid, gconf, base_level=""):
+    """这一轮的判定积极性：per-bot 覆盖 > 全局；真人超软上限 → conservative。
+
+    → (档位, 说明)。说明进日志，写清是哪一层判的、为什么降档。
+    """
+    lv = base_level if base_level in _JUDGE_LEVELS else ""
+    if not lv:
+        lv = _judge_level(_llm_conf(_base_dir) or {})
+    limit = gconf["human_hourly_limit"]
+    n = _human_count(gid)
+    if limit > 0 and n > limit:
+        lv = "conservative"
+    return lv, n
+
+
+def _speech_mark(gid, appid, name, text=""):
+    """本群最后一次 bot 发言成功（延迟期间的「抢先」判断用它）。"""
+    with _gate_lock:
+        _gate_state["spoken"][str(gid or "")] = {
+            "appid": str(appid or ""), "name": str(name or ""),
+            "text": str(text or ""), "ts": time.time()}
+
+
+def _speech_after(gid, since, me_appid=""):
+    """since 之后本群有没有**别的** bot 发言成功？→ (名字, 秒)；没有 → ("", 0)。"""
+    with _gate_lock:
+        rec = _gate_state["spoken"].get(str(gid or ""))
+        if not rec:
+            return "", 0.0
+        rec = dict(rec)
+    if rec["appid"] and rec["appid"] == str(me_appid or ""):
+        return "", 0.0
+    if rec["ts"] <= since:
+        return "", 0.0
+    return rec["name"], time.time() - rec["ts"]
+
+
+# ── 总模型：提示词 / 解析 / 调用 / 共享决定 ─────────────────────
+
+_GATE_LEAN = {
+    "conservative": "保守：只有明确在问、明确在叫某个角色时才点人，其它一律 skip。",
+    "normal": "偏积极：群里正聊着就点人接一句，别让群冷场；但同一条消息只点一个人。",
+    "eager": "积极：几乎都点人接；只有刷屏、复读、纯指令或明显成对私聊时才 skip。",
+}
+
+
+def _gate_prompt(appid, gid, gconf, roster, level):
+    """总模型的提示词：可用发言人（名字＋摘要）+ 最近 8 条带标签的消息 + 本轮状态。"""
+    lines = [
+        "你在一个 QQ 群里调度多个角色，任务是决定这一轮由谁说。",
+        "硬要求：同一轮只能有一个角色回；宁可谁都不说，也不要两个人一起说。",
+        "",
+        "【可用发言人】",
+    ]
+    for r in roster:
+        s = persona_summary(r["botdir"]) if r["botdir"] else ""
+        s = (s or "（暂无摘要）").replace(chr(10), " ")[:240]
+        lines.append("%s：%s" % (r["name"], s))
+    lines += ["", "【群内最近消息】（越靠后越新；[名字] 是别的角色，[作者 名字] 是人）",
+              _ctx_text(_ctx_rows(appid, gid))]
+    chain = _chain_of(gid)
+    last = chain[-1] if chain else ""
+    turns = ", ".join("%s %d 句" % (n, _turn_of(gid, n)) for n in roster_names(roster, chain))
+    lines += ["", "【本轮状态】连续 bot 轮次 %d / %d；各自句数：%s；上一条发言人：%s"
+              % (len(chain), gconf["bot_max_turns"], turns or "无", last or "真人"),
+              "静默中（这些关系不要点）：%s" % ("、".join(_silence_list(gid)) or "无"),
+              "", "【怎么判】",
+              "1) 正常说话：action=reply，bot 写【可用发言人】里的名字（一个）。",
+              "2) 这一轮不需要角色接（刷屏、复读、别人成对对话、纯指令）：action=skip。",
+              "3) 连续 bot 链已经绕够、或某个角色句数到上限：action=end_topic，bot 写那个角色，"
+              "让它自己自然收尾。",
+              "4) 静默中的关系不要点；真人和你说话时优先让最合适的角色接，句数上限优先。",
+              "5) 倾向：" + _GATE_LEAN.get(level, _GATE_LEAN["normal"]),
+              "", "只输出一行严格 JSON，不要代码块、不要解释：",
+              '{"action":"reply","bot":"桑多涅","why":"一句话原因"}']
+    return chr(10).join(lines)
+
+
+def roster_names(roster, extra=()):
+    """提示词里要列句数的名字：启用清单 + 已经说过话的（可能刚被停用）。"""
+    out = []
+    for r in roster:
+        if r["name"] not in out:
+            out.append(r["name"])
+    for n in extra or ():
+        if n and n not in out:
+            out.append(n)
+    return out
+
+
+_GATE_ACTIONS = {
+    "reply": "reply", "回": "reply", "回复": "reply", "回一句": "reply", "说": "reply",
+    "skip": "skip", "跳过": "skip", "不说": "skip", "不回": "skip", "none": "skip",
+    "end_topic": "end_topic", "endtopic": "end_topic", "end": "end_topic",
+    "收尾": "end_topic", "结束": "end_topic", "结束话题": "end_topic",
+}
+
+
+def _parse_gate(raw, names):
+    """总模型输出 → {"action","bot","why"}；解析不出 → None（调用方退回自判）。
+
+    容错：剥代码块、只取第一个 JSON 对象、中文引号、单引号、缺引号都尽量捞；
+    action 认中英文；bot 不在启用清单里 → 当成 skip（点了个不存在的人等于没人接）。
+    """
+    s = str(raw or "").strip()
+    if not s:
+        return None
+    s = _FENCE_RE.sub(" ", s).strip()
+    i, j = s.find("{"), s.rfind("}")
+    body = s[i:j + 1] if (i >= 0 and j > i) else s
+    obj = None
+    for cand in (body, body.replace("\u201c", '"').replace("\u201d", '"'),
+                 re.sub(r"'([^']*)'", r'"\1"', body)):
+        try:
+            v = json.loads(cand)
+        except Exception:
+            continue
+        if isinstance(v, dict):
+            obj = v
+            break
+    if obj is None:
+        act = re.search(r'"?action"?\s*[:：]\s*"?([A-Za-z_\u4e00-\u9fff]+)', body)
+        if not act:
+            # 最后一道兜底：推理系模型（deepseek-flash 这类）整段都在「想」，
+            # JSON 可能被 max_tokens 截断。正文里只要出现 action 关键词 + 一个启用中的
+            # 名字，就按它判 —— 比整轮退回自判更接近它原本的意思。
+            low = body.lower()
+            kw = ""
+            for k, v in (("end_topic", "end_topic"), ("end topic", "end_topic"),
+                         ("skip", "skip"), ("收尾", "end_topic"),
+                         ("skip", "skip"), ("reply", "reply"), ("回", "reply")):
+                if k in low:
+                    kw = v
+                    break
+            if not kw:
+                return None
+            hit = ""
+            for n in names:
+                if n and n in body:
+                    hit = n
+                    break
+            if kw == "skip" or not hit:
+                return {"action": "skip", "bot": "", "why": "非标准输出，按关键词兜底为 skip"}
+            return {"action": kw, "bot": hit, "why": "非标准输出，按关键词兜底"}
+        bot = re.search(r'"?bot"?\s*[:：]\s*"?([^",，}\n]+)', body)
+        why = re.search(r'"?why"?\s*[:：]\s*"?([^"\n}]*)"?', body)
+        obj = {"action": act.group(1), "bot": bot.group(1) if bot else "",
+               "why": why.group(1) if why else ""}
+    act = str(obj.get("action") or "").strip().lower()
+    act = _GATE_ACTIONS.get(act, "")
+    if not act:
+        return None
+    why = str(obj.get("why") or "").strip().replace(chr(10), " ")[:60]
+    bot = str(obj.get("bot") or "").strip().strip("\"'\u201c\u201d\u300c\u300d\u300e\u300f ")
+    if act == "skip":
+        return {"action": "skip", "bot": "", "why": why}
+    if bot not in names:
+        return {"action": "skip", "bot": "",
+                "why": ("点名不在启用清单：%s" % (bot or "(空)")) + (("｜" + why) if why else "")}
+    return {"action": act, "bot": bot, "why": why}
+
+
+async def _gate_model(conf, prompt):
+    """总模型调用（judge 槽位）。单独抽出来：单测直接替换这一个函数。
+
+    max_tokens 给 1500：推理系模型（deepseek-flash 这类）会先在正文里「想一下」，
+    300 个 token 全被思考吃掉 → JSON 被截断 → 解析不出就白判一轮（真机实测）。
+    提示词末尾再钉一句「只输出 JSON」，绝大多数轮次的实际输出只有几十个 token。
+    """
+    tail = (chr(10) + "现在只输出那一行 JSON，不要任何思考过程、不要解释：")
+    return await asyncio.to_thread(
+        _call_llm_sync, conf, [{"role": "user", "content": prompt + tail}], 1500, 0.2)
+
+
+def _gate_key(gid, text):
+    return (str(gid or ""), _text_hash(text))
+
+
+def _gate_claim(appid, gid, text):
+    """→ (共享记录, 我是不是这次的总模型调用者)。
+
+    同一 (群, 正文) 8 秒内只跑一次总模型：先到的认领，后到的复用他的决定。
+    记录里记下用过的 appid —— 同一个 bot 不会因为「同文再发一次」被吃掉。
+    """
+    now = time.time()
+    key = _gate_key(gid, text)
+    with _gate_lock:
+        for k in [k for k, r in _gate_rec.items() if now - r["ts"] > _GATE_REC_TTL]:
+            _gate_rec.pop(k, None)
+        rec = _gate_rec.get(key)
+        if rec is not None and str(appid) not in rec["used"]:
+            rec["used"].add(str(appid))
+            return rec, False
+        rec = {"owner": str(appid), "done": False, "ev": threading.Event(),
+               "dec": None, "ts": now, "used": {str(appid)}}
+        _gate_rec[key] = rec
+        return rec, True
+
+
+async def _gate_wait(rec):
+    """等先到的那个 bot 把决定写进共享记录（轮询，不阻塞任何 loop）。"""
+    t0 = time.time()
+    while not rec["done"] and time.time() - t0 < _GATE_WAIT_MAX:
+        await asyncio.sleep(0.05)
+    return rec["dec"] if rec["done"] else None
+
+
+def _gate_log(dec, appid=""):
+    """总模型的日志格式（验收要贴的四行之一）：reply(名字｜原因) / skip(原因) / end_topic(...)。"""
+    act = dec["action"]
+    if act == "skip":
+        log("总模型：skip(%s)" % (dec.get("why") or "无原因"), appid)
+    else:
+        tag = "end_topic" if act == "end_topic" else "reply"
+        log("总模型：%s(%s｜%s)" % (tag, dec.get("bot") or "?", dec.get("why") or "无原因"), appid)
+    return dec
+
+
+async def _gate_run(appid, gid, gconf, roster, level):
+    """真正跑一次总模型，并把「代码这层的硬约束」再兜一遍。
+
+    模型不是可靠的守卫：静默关系、句数上限、点名是否在清单里，这三样在代码里再判一次，
+    判完才把决定写进共享记录（后到的 bot 拿到的就是已经校验过的决定）。
+    """
+    names = [r["name"] for r in roster]
+    chain = _chain_of(gid)
+    last = chain[-1] if chain else ""
+    cap = gconf["bot_max_turns"]
+    conf = _conf_for("judge")
+    if conf is None:
+        log("总模型跳过：判定槽位没有模型配置（llm.json 缺 key / 地址）→ 退回自判", appid)
+        return {"action": "fallback", "bot": "", "why": "没有模型配置"}
+    prompt = _gate_prompt(appid, gid, gconf, roster, level)
+    try:
+        raw = await _gate_model(conf, prompt)
+    except Exception as e:
+        log("总模型失败，退回自判（%r）" % e, appid)
+        return {"action": "fallback", "bot": "", "why": str(e)[:60]}
+    dec = _parse_gate(raw, names)
+    if dec is None:
+        log("总模型失败，退回自判（输出解析不出 JSON：%s）"
+            % (str(raw or "").strip().replace(chr(10), " ")[:80] or "(空)"), appid)
+        return {"action": "fallback", "bot": "", "why": "解析失败"}
+    # ① 静默关系：模型点了正在静默的那一对 → 当成 skip（成对静默是硬约束）
+    if dec["action"] != "skip" and last and _silenced(gid, dec["bot"], last):
+        return _gate_log({"action": "skip", "bot": "",
+                          "why": "%s→%s 成对静默中" % (dec["bot"], last)}, appid)
+    # ② 句数上限：被点的角色已经说满 → 转成让它收尾
+    if dec["action"] != "skip" and _turn_of(gid, dec["bot"]) >= cap:
+        return _gate_log({"action": "end_topic", "bot": dec["bot"],
+                          "why": "已达 %d 句上限，转收尾" % cap}, appid)
+    # ③ 整条链绕太长：上一条发言的角色已经到上限 → 这一轮由它收尾，不许再续
+    if last and dec["action"] == "reply" and _turn_of(gid, last) >= cap:
+        dec = {"action": "end_topic", "bot": last,
+               "why": "连续 bot 轮次 %d/%d，已达上限" % (len(chain), cap)}
+    # ④ 上面三处改写可能点到「其他bot」这种不在启用清单里的名字 → 没人能接，直接收场
+    if dec["action"] != "skip" and dec["bot"] not in names:
+        return _gate_log({"action": "skip", "bot": "",
+                          "why": "点名的是未启用的角色（%s）" % (dec["bot"] or "(空)")}, appid)
+    return _gate_log(dec, appid)
+
+
+async def _gate_decide(appid, gid, text, gconf, roster, level):
+    """一条消息一次决定（跨 bot 共享）。→ {"action": reply|skip|end_topic|fallback, ...}"""
+    rec, mine = _gate_claim(appid, gid, text)
+    if not mine:
+        dec = await _gate_wait(rec)
+        if dec is None:
+            log("总模型：等其它 bot 的判定超时 → 退回自判", appid)
+            return {"action": "fallback", "bot": "", "why": "等共享判定超时"}
+        return dec
+    dec = await _gate_run(appid, gid, gconf, roster, level)
+    rec["dec"] = dec
+    rec["done"] = True
+    rec["ev"].set()
+    return dec
+
+
+async def _reply_delay(appid, gid, gconf, entry=None):
+    """被选中之后再等一会（per-bot 覆盖全局）。→ False = 期间别的 bot 抢先，放弃这次。
+
+    只有「gate_enabled 且本群 3 秒（延迟）内已有别的 bot 发言成功」才放弃；
+    没配模型（llm.json 缺 key/地址）时不延迟 —— 那种情况回的是连通测试文案，等 7 秒没意义。
+    """
+    if not (_llm_conf(_base_dir) if _base_dir else None):
+        return True
+    mn, mx = _delay_of(appid, gconf, entry)
+    if mx <= 0:
+        return True
+    t0 = time.time()
+    await asyncio.sleep(random.randint(mn, mx) / 1000.0)
+    if gconf["gate_enabled"]:
+        name, ago = _speech_after(gid, t0, appid)
+        if name:
+            log("延迟期间已被其它 bot 抢先，放弃（%s 在 %.1f 秒前发过）" % (name, ago), appid)
+            return False
+    return True
+
+
+def _closing_hint(n):
+    """end_topic 注入的 system 提示：让它自己把话收住，而不是生硬宣布结束。"""
+    return ("你已经在这个群连着说了 %d 句，这一条请用你自己的语气自然收尾：像说完一句话那样收住，"
+            "不要生硬地说「结束」「话题终止」，也不要解释自己在收尾。" % max(1, int(n)))
+
+
+async def _group_send(appid, botdir, message, gid, who, model_in, images=None,
+                      extra_sys="", closing=None):
+    """群回复的唯一出口：延迟 → 抢先检查 → 生成 → 发出去 → 记「刚说过」。
+
+    closing = {"bot","target","minutes"} 时是 end_topic 的收尾：发出去之后给这对
+    关系上静默、把该 bot 的句数清零。→ 发出去的纯文本；放弃 / 失败 → ""。
+    """
+    gconf = _gate_conf(_base_dir)
+    if not await _reply_delay(appid, gid, gconf, _my_entry(appid)):
+        return ""
+    try:
+        reply = await _reply(appid, botdir, "g" + gid, who, model_in, images=images,
+                             extra_sys=extra_sys)
+        plain, at_ids = _resolve_at_tags(reply, _mentions_of(message))
+        _note_sent(appid, gid, plain)
+        if at_ids:
+            log("@ 发出：%d 个（群聊 markdown 消息）" % len(at_ids), appid)
+            try:
+                await message._api.post_group_message(
+                    group_openid=gid, msg_type=2, msg_id=_unique_msg_id(message)[1],
+                    markdown={"content": _at_markdown(plain, at_ids)},
+                )
+            except Exception as e_at:
+                log("@ 消息发送失败（%r）→ 退回纯文本" % e_at, appid)
+                await message._api.post_group_message(
+                    group_openid=gid, msg_type=0, msg_id=_unique_msg_id(message)[1],
+                    msg_seq=2, content=plain,
+                )
+        else:
+            await message._api.post_group_message(
+                group_openid=gid, msg_type=0, msg_id=_unique_msg_id(message)[1], content=plain,
+            )
+    except Exception as e:
+        log("回群失败：%r" % e, appid)
+        return ""
+    _speech_mark(gid, appid, _my_name(appid), plain)
+    if closing:
+        me = str(closing.get("bot") or "")
+        target = str(closing.get("target") or "")
+        if me:
+            _turn_reset_pair(gid, me)
+        until = _silence_set(gid, me, target, int(closing.get("minutes") or 0))
+        if until:
+            log("静默生效：%s→%s %d 分钟（到点自动解除，只放内存）"
+                % (me, target, int(closing.get("minutes") or 0)), appid)
+        else:
+            log("收尾完成：%s 本链句数清零（没有成对目标，不上静默）" % (me or "?"), appid)
+    return plain
+
+
+def _turn_reset_pair(gid, name):
+    """收尾之后把该 bot 在这一链里的句数清零（下一次从 0 开始数）。"""
+    gid = str(gid or "")
+    with _gate_lock:
+        turns = _gate_state["turns"].get(gid) or {}
+        if name in turns:
+            turns[name] = 0
+        chain = _gate_state["chain"].get(gid) or []
+        _gate_state["chain"][gid] = [x for x in chain if x != name]
+
+
+def _at_others(appid, botdir, message):
+    """本条 @ 的是不是别人（不是我、也不是作者本人）？"""
+    own = set(str(c).upper() for c in _own_mention_ids(appid, botdir, _mentions_of(message)))
+    author = set(str(i).upper() for i in _author_ids(message))
+    for e in _mentions_of(message):
+        mid = _mention_id(e).upper()
+        if mid and mid not in own and mid not in author:
+            return True
+    return False
+
+
+async def _gated_turn(appid, botdir, message, gid, from_name, text, gconf, roster, my_name):
+    """上一条是别的 bot 说的：让总模型决定这一轮是续一句 / 收尾 / 都不说。
+
+    bot 的消息老逻辑一律不接（防互刷），只有总模型生效时才可能续 —— 而总量被
+    句数上限 + 成对静默 + 3 秒互斥三样卡着，不会无限刷。
+    """
+    level, _n = _gate_level(gid, gconf, _level_override(appid, roster))
+    dec = await _gate_decide(appid, gid, text, gconf, roster, level)
+    act = dec["action"]
+    if act == "fallback":
+        name, _ago = _speech_after(gid, time.time() - 3.0, appid)
+        log("总模型失败，退回自判：bot 的话自判不接%s"
+            % ("；且本群 3 秒内已有 %s 发言 → 本轮放弃" % name if name else " → 本轮放弃"), appid)
+        return
+    if dec["bot"] != my_name:
+        if act == "end_topic" and dec.get("bot"):
+            log("总模型：end_topic 点名 %s 收尾，本 bot 不动" % dec["bot"], appid)
+        return
+    if _silenced(gid, my_name, from_name):
+        log("跳过：%s→%s 成对静默中，本轮不接" % (my_name, from_name), appid)
+        return
+    ok, why_rate = _gate_rate(appid, gid)
+    if not ok:
+        log("%s（群=%s｜作者=%s）" % (why_rate, _oid8(gid), from_name), appid)
+        return
+    extra, closing = "", None
+    if act == "end_topic":
+        n = _turn_of(gid, my_name)
+        extra = _closing_hint(n)
+        closing = {"bot": my_name, "target": (_counterpart(gid, my_name) or from_name),
+                   "minutes": gconf["bot_silence_minutes"]}
+    ctx_block = _ctx_system(appid, gid)
+    await _group_send(appid, botdir, message, gid, from_name,
+                      "%s：%s" % (from_name, _strip_mentions(text)), _attachments_of(message),
+                      extra_sys=((ctx_block + chr(10) + chr(10)) if ctx_block else "") + extra,
+                      closing=closing)
+
+
+
 # ── 统一处理链路 ──────────────────────────────────────────
 
 
@@ -4741,19 +5874,46 @@ async def _handle_group(appid, botdir, message, tag):
 
     tag="群@" 是平台的可信 @ 事件（只在本 bot 被 @ 时推），@ 判定直接放行，
     但作者过滤 / 回环 / 限流一样要过 —— 它是复读的另一个入口。
+
+    1.0.8：启用中的 bot ≥2 且 gate_enabled=true 时，先由「总模型」决定这一轮谁说
+    （一条消息只点一个人）；总模型没生效 / 失败才退回各 bot 自判（1.0.7 的老逻辑）。
     """
     if _dedupe_message(appid, message, "群"):
         return
     trusted_at = (tag == "群@")
-    mid = str(getattr(message, "id", "") or "")
-    if not _mark_seen(mid):
+    mid = _unique_msg_id(message)[1]
+    text = (getattr(message, "content", "") or "").strip()
+    # 同一个消息 id 只处理一次；但键里带上正文哈希 —— id 万一被复用，不同内容不会被吃掉
+    if not _mark_seen(("%s|%s" % (mid, _hash_text(text)[:12])) if mid else ""):
         log("%s：重复 id=%s，跳过（同一事件同时推了 @ / 普通两种）" % (tag, mid[:12]), appid)
         return
     if not trusted_at:
         _dump_gateway_raw(botdir, "group_message_create", getattr(message, "raw", None) or {})
-    text = (getattr(message, "content", "") or "").strip()
     gid = str(getattr(message, "group_openid", "") or "")
     brief = "%s｜id=%s｜群=%s｜内容=%s" % (tag, mid[:12], gid[:8], text[:40])
+    # 总模型的开关与名单每条消息现读：启停 bot / 改开关之后，下一条消息就按新配置走
+    gconf = _gate_conf(_base_dir)
+    roster = _enabled_roster(_base_dir)
+    gate_on = bool(gconf["gate_enabled"] and len(roster) >= 2)
+    my_name = _my_name(appid)
+    from_name, _from_appid, author_oid, from_bot = _sender_of(botdir, message, roster)
+    body = _strip_mentions(text)
+
+    # ── 群内互相可见：先把这一条记进群上下文（真人 [作者 名字]，bot [名字]）
+    _ctx_note(appid, gid,
+              ("[%s]" % from_name) if from_bot else ("[作者 %s]" % _author_label(botdir, author_oid)),
+              body, bot=from_bot)
+    echo = _is_echo(appid, gid, text)
+    if echo:
+        # 自己刚说的话被推回来：这是「自己的 author id」唯一可靠的来源。
+        # 三重门：① 平台明确说是 bot（author.bot=true）；② 这个 id 不在已知其它 bot 里；
+        # ③ 只写自己的 appid。真人 openid 永远不会走到这里。
+        flag = _attr(getattr(message, "author", None), "bot", "is_bot", "isBot")
+        if flag is True:
+            known = _known_bots(botdir)
+            own = [i for i in _author_ids(message) if i and i not in known]
+            if own:
+                _note_own_bot_id(botdir, own, appid)
 
     # 闸 5 · 群级配置（<botdir>/groups/<gid>.json）：整群静音直接掐掉，后面几道闸都不用走
     gc = _group_conf(botdir, gid)
@@ -4761,54 +5921,138 @@ async def _handle_group(appid, botdir, message, tag):
         log("跳过：该群已静音（groups/%s.json enabled=false）｜%s" % (_oid8(gid), brief), appid)
         return
 
+    # 句数：真人发言把所有 bot 计数清零；bot 发言只给自己 +1
+    # （同一条消息每个 bot 各收一次，_msg_counted 保证只算一句）
+    if from_bot:
+        # 认不出名字的 bot 也计数：全部记进「其他bot」这一个桶（保守，宁可早收尾也不无限刷）
+        if from_name and not _msg_counted(gid, body):
+            _turn_add(gid, from_name)
+    else:
+        _turn_reset(gid)
+        n_human = _human_note(gid)
+        limit = gconf["human_hourly_limit"]
+        if limit > 0 and n_human > limit:
+            _downgrade_note(gid, n_human, limit, appid)
+
     # 闸 0 · 只有可信 @ 事件允许从正文猜 id；mentions.is_you=true 是平台判定，两种事件都学
     if trusted_at:
         _learn_own_ids(botdir, text)
     _learn_from_mentions(botdir, _mentions_of(message))
 
-    # 闸 2 · 作者过滤
+    # ── bot 作者：老逻辑一律不接；总模型生效时才可能续一句（句数上限 + 成对静默管着）
     why = _bot_author(botdir, message)
     if why:
-        log("%s（%s）" % (why, brief), appid)
+        if not gate_on:
+            log("%s（%s）" % (why, brief), appid)
+            return
+        if echo:
+            log("跳过：疑似复读本 bot 内容（%s）" % brief, appid)
+            return
+        if not from_bot:
+            log("%s｜作者是 bot 但认不出是谁（%s）→ 不接" % (why, brief), appid)
+            return
+        # 认不出是谁的 bot 也允许续：它只是个「[其他bot] 说了话」的上下文，回不回归总模型判
+        await _gated_turn(appid, botdir, message, gid, from_name or "其他bot", body,
+                         gconf, roster, my_name)
         return
 
     # 闸 1 · 回环：命中就说明这条是我们自己刚说的话被推回来，顺手记下自己的 author id
-    if _is_echo(appid, gid, text):
+    if echo:
         _note_own_author(botdir, _author_ids(message))
         log("跳过：疑似复读本 bot 内容（%s）" % brief, appid)
         return
 
-    # 闸 3 · @ 判定（fail-closed）
-    if not trusted_at:
-        state, why_at = _at_me(appid, botdir, message)
-        if state == "unknown":
+    # 闸 3 · @ 判定（fail-closed）+ 总模型
+    level = _gate_level(gid, gconf, _level_override(appid, roster))[0]
+    if trusted_at:
+        at_state, why_at = "yes", "平台 @ 事件"
+    else:
+        at_state, why_at = _at_me(appid, botdir, message)
+    extra_sys = _ctx_system(appid, gid)
+    closing = None
+    if gate_on:
+        # ── 多 bot：总模型决定这一轮谁说
+        if at_state == "unknown":
             log("跳过：判不出是否 @ 本 bot（%s｜%s）" % (why_at, brief), appid)
             return
-        if state == "no":
-            conf_j = _llm_conf(_base_dir) if _base_dir else None
-            jlv = _judge_level(conf_j)
-            # 名字命中前置（name_hit_as_call，默认开）：正文里出现人格名或称呼 = 被叫，
-            # 不看「群里自动接话」也不问判定模型，直接回 —— 实机里「沃雅妮莎在干啥呢」
-            # 被判成 0 的那类句子就是从这里救回来的。
-            called = ""
-            if conf_j is None or conf_j.get("name_hit_as_call", True):
-                called = _name_hit(botdir, text)
-            if called:
-                log("名字命中（%s）→ 直回（%s）" % (called, brief), appid)
-            else:
-                # 三层判定：群配置显式值 > 该 bot 覆盖 > 全局（日志写清是哪一层判的）
+        if at_state == "yes":
+            # 真人 @ 了本 bot：总模型不参与，直接由本 bot 回（对方要求的行为）
+            log("总模型跳过：真人 @ 了本 bot（直接回）｜%s" % brief, appid)
+        elif _at_others(appid, botdir, message):
+            log("总模型跳过：本条 @ 的是别人（由被 @ 的 bot 回）｜%s" % brief, appid)
+            return
+        else:
+            dec = await _gate_decide(appid, gid, text, gconf, roster, level)
+            act = dec["action"]
+            if act == "fallback":
+                # 总模型失败：退回各 bot 自判，但互斥仍生效（本群 3 秒内已有别的 bot 发言 → 放弃）
+                name, _ago = _speech_after(gid, time.time() - 3.0, appid)
+                if name:
+                    log("总模型失败，退回自判；但本群 3 秒内已有 %s 发言 → 本轮放弃"
+                        % name, appid)
+                    return
+                conf_j = _llm_conf(_base_dir) if _base_dir else None
+                named = _name_hit(botdir, text) if (
+                    conf_j is None or conf_j.get("name_hit_as_call", True)) else ""
                 auto_on, auto_src = _group_autochat_state(appid, gc)
-                if not auto_on:
-                    log("跳过：未 @ 本 bot（%s），且「群里自动接话」关闭（判定来源：%s）"
-                        "→ 默认只回 @（%s）" % (why_at, auto_src, brief), appid)
+                if named:
+                    log("名字命中（%s）→ 直回（总模型失败，退回自判）｜%s" % (named, brief), appid)
+                elif not auto_on:
+                    log("总模型失败，退回自判：既没被叫、群里自动接话也关着（判定来源：%s）"
+                        "→ 本轮放弃（%s）" % (auto_src, brief), appid)
                     return
-                # 开着也写清是哪一层判的（群配置 / 该 bot 覆盖 / 全局），便于核对三态
-                log("自动接话开（判定来源：%s）｜%s" % (auto_src, brief), appid)
-                # 自动接话开着：交给「回复判定」（设置页那一行）决定要不要插话
-                if not await _should_reply(conf_j, text, jlv):
-                    log("跳过：回复判定不接这句（%s）" % brief, appid)
+                elif not await _should_reply(conf_j, text, level):
+                    log("总模型失败，退回自判：自判不接这句（%s）" % brief, appid)
                     return
-                log("回复判定接这句（%s）" % brief, appid)
+                else:
+                    log("总模型失败，退回自判：自判接这句（%s）" % brief, appid)
+            elif act == "skip" or dec["bot"] != my_name:
+                if act != "skip":
+                    log("总模型：%s 点名 %s，本 bot 不动（%s）"
+                        % (act, dec.get("bot") or "?", brief), appid)
+                return
+            else:
+                # 总模型点了本 bot：还要过「群里自动接话」这道用户开关（老逻辑同样要过），
+                # 名字被叫到（name_hit）照旧算例外 —— 不能让开总模型把「只回 @」冲掉
+                auto_on, auto_src = _group_autochat_state(appid, gc)
+                named = _name_hit(botdir, text) if (
+                    (_llm_conf(_base_dir) or {}).get("name_hit_as_call", True)) else ""
+                if not named and not auto_on:
+                    log("跳过：总模型点了本 bot，但「群里自动接话」关闭（判定来源：%s）｜%s"
+                        % (auto_src, brief), appid)
+                    return
+            if act == "end_topic":
+                # 到上限：注入「用你的语气自然收尾」，发完给这对关系上静默、句数清零
+                n = _turn_of(gid, my_name)
+                closing = {"bot": my_name, "target": _counterpart(gid, my_name),
+                           "minutes": gconf["bot_silence_minutes"]}
+                extra_sys = ((extra_sys + chr(10) + chr(10)) if extra_sys else "") + _closing_hint(n)
+    else:
+        # ── 老逻辑（各 bot 自判）：与 1.0.7 一致，只有档位会因真人超软上限降到 conservative
+        if not trusted_at:
+            if at_state == "unknown":
+                log("跳过：判不出是否 @ 本 bot（%s｜%s）" % (why_at, brief), appid)
+                return
+            if at_state == "no":
+                conf_j = _llm_conf(_base_dir) if _base_dir else None
+                # 名字命中前置（name_hit_as_call，默认开）：正文里出现人格名或称呼 = 被叫
+                called = ""
+                if conf_j is None or conf_j.get("name_hit_as_call", True):
+                    called = _name_hit(botdir, text)
+                if called:
+                    log("名字命中（%s）→ 直回（%s）" % (called, brief), appid)
+                else:
+                    # 三层判定：群配置显式值 > 该 bot 覆盖 > 全局（日志写清是哪一层判的）
+                    auto_on, auto_src = _group_autochat_state(appid, gc)
+                    if not auto_on:
+                        log("跳过：未 @ 本 bot（%s），且「群里自动接话」关闭（判定来源：%s）"
+                            "→ 默认只回 @（%s）" % (why_at, auto_src, brief), appid)
+                        return
+                    log("自动接话开（判定来源：%s）｜%s" % (auto_src, brief), appid)
+                    if not await _should_reply(conf_j, text, level):
+                        log("跳过：回复判定不接这句（%s）" % brief, appid)
+                        return
+                    log("回复判定接这句（%s）" % brief, appid)
 
     # 闸 4 · 限流 + 熔断（只有真要回才占额度）
     ok, why_rate = _gate_rate(appid, gid)
@@ -4830,8 +6074,7 @@ async def _handle_group(appid, botdir, message, tag):
 
     log("%s：%s" % (tag, text[:60]), appid)
     # 存档：过了作者过滤与复读闸的消息一律入库 —— 不为了这条要回复，只为以后能被回忆
-    # （没 @ 本 bot、判定不接的那些句子也照存，否则「上周谁提过 X」根本没东西可查）
-    _arc_put(botdir, "group", gid, (_author_ids(message) or [""])[0], _strip_mentions(text))
+    _arc_put(botdir, "group", gid, (author_oid or ""), body)
     try:
         _note_chat(botdir, "group", gid)
         for _id in _author_ids(message):
@@ -4843,44 +6086,18 @@ async def _handle_group(appid, botdir, message, tag):
     if images:
         log("收到 %d 张图片附件（%s）" % (
             len(images), "，".join([a.get("filename") or "未命名" for a in images])[:60]), appid)
-    clean = _strip_mentions(text)
     # @ 语义：<@hex> 换成「你 / 作者本人 / 用户xxxxxxxx」，再在消息前加一行元信息。
-    # 模型靠这两样才分得清「@的是我」「@的是说话的人」「@的是别人」。
     at_body, at_meta, at_line = _at_semantics(appid, botdir, message)
     log(at_line, appid)
     model_in = (at_meta + chr(10) + at_body) if at_body else at_meta
     # 本地指令先判：过了四道闸就算「该回这条」，回时间不必打扰模型
-    if await _local_time_reply(appid, message, clean, group_openid=gid):
+    if await _local_time_reply(appid, message, body, group_openid=gid):
         return
     # 联网指令（#搜 / #读）：搜完交给模型按人格转述（人设化加工），链接洗净后贴出去
-    if await _local_web_cmd(appid, message, clean, group_openid=gid, botdir=botdir):
+    if await _local_web_cmd(appid, message, body, group_openid=gid, botdir=botdir):
         return
-    try:
-        reply = await _reply(appid, botdir, "g" + gid, "", model_in, images=images)
-        # 模型可以 @ 别人（<at>openid 前 8 位或全量</at>）：只认本条消息的 mentions，
-        # 平台侧群聊只有 markdown 消息（msg_type=2）认 @ 标签，所以带 @ 时换一种发法，
-        # 发不出去就退回纯文本（标签已剥）—— 回复本身不能因此丢掉。
-        plain, at_ids = _resolve_at_tags(reply, _mentions_of(message))
-        _note_sent(appid, gid, plain)
-        if at_ids:
-            log("@ 发出：%d 个（群聊 markdown 消息）" % len(at_ids), appid)
-            try:
-                await message._api.post_group_message(
-                    group_openid=gid, msg_type=2, msg_id=mid,
-                    markdown={"content": _at_markdown(plain, at_ids)},
-                )
-            except Exception as e_at:
-                log("@ 消息发送失败（%r）→ 退回纯文本" % e_at, appid)
-                await message._api.post_group_message(
-                    group_openid=gid, msg_type=0, msg_id=mid, msg_seq=2, content=plain,
-                )
-        else:
-            await message._api.post_group_message(
-                group_openid=gid, msg_type=0, msg_id=mid, content=plain,
-            )
-    except Exception as e:
-        log("回群失败：%r" % e, appid)
-
+    # 延迟 + 抢先检查 + 发送（_group_send 是群回复的唯一出口）
+    await _group_send(appid, botdir, message, gid, "", model_in, images, extra_sys, closing)
 
 def _make_client(appid, secret, botdir):
     """每个实例一套自己的 Client 类，避免事件回调串台"""
@@ -4984,7 +6201,7 @@ def _make_client(appid, secret, botdir):
     return Bot(intents=intents)
 
 
-async def _reply(appid, botdir, key, who, incoming, images=None):
+async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
     """把这一轮记进记忆，再让模型按人格回一句。
 
     带附件（图片）时先识图，把「（图里是：…）」拼在这一轮的入参文本后面 ——
@@ -5022,6 +6239,9 @@ async def _reply(appid, botdir, key, who, incoming, images=None):
                 % _oid8(gid_key), appid)
         auto_decide = web_on and bool(conf.get("search_auto_decide", True))
         msgs = _build_messages(botdir, key, who, incoming, first=first, search_hint=auto_decide)
+        # extra_sys：群内最近消息（带名字标签）/ 收尾提示 —— 插在这一条之前当 system
+        if extra_sys:
+            msgs.insert(len(msgs) - 1, {"role": "system", "content": extra_sys})
         # ① 触发词兜底：明显在问时效性内容就先搜一次（与「模型自判」互斥，一条消息只搜一次）
         web_block = await _auto_web_context(appid, conf, incoming) if web_on else ""
         if web_block:
@@ -5189,6 +6409,9 @@ def start_one(appid, secret, base_dir):
         log("消息存档初始化失败（忽略，收发照常）：%r" % e, appid)
     # 「群里只回 @」的一次性提示：状态页那行小字是界面侧，日志这边只在本次进程写一条
     _hint_autochat_once(appid)
+    # 人格摘要：导入人格 / 编辑保存后（Kotlin 会 restart）在这里补生成，后台线程、不挡启动。
+    # hash 没变就直接用盘上那份，不重复花 token
+    _summary_warm(botdir, appid)
     gen = time.time()
     with _lock:
         _bots[appid] = {
@@ -5263,6 +6486,8 @@ def start_all(bots_json, base_dir):
             bots_json = []
     if not isinstance(bots_json, list):
         bots_json = []
+    # 总模型的名单兜底：localbots.json 读不到时用这份（字段与 localbots.json 同名）
+    _state["bots_json"] = [b for b in bots_json if isinstance(b, dict)]
     if not _log_path:
         _log_path = os.path.join(base_dir, "local_bot.log")
     results = []

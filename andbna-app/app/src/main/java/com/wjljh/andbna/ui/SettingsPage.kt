@@ -43,6 +43,13 @@ import androidx.compose.ui.unit.sp
 import com.wjljh.andbna.data.OnboardStore
 import com.wjljh.andbna.local.BotHost
 import com.wjljh.andbna.local.BotRestarts
+import com.wjljh.andbna.local.BotStore
+import com.wjljh.andbna.local.BotStore.botGateEnabled
+import com.wjljh.andbna.local.BotStore.botMaxTurns
+import com.wjljh.andbna.local.BotStore.botSilenceMinutes
+import com.wjljh.andbna.local.BotStore.humanHourlyLimit
+import com.wjljh.andbna.local.BotStore.replyDelayMaxMs
+import com.wjljh.andbna.local.BotStore.replyDelayMinMs
 import com.wjljh.andbna.local.ModeStore
 import com.wjljh.andbna.local.PullBack
 import com.wjljh.andbna.local.RunMode
@@ -113,9 +120,12 @@ fun SettingsPage(
     val curMode = mode ?: ModeStore.get(ctx) ?: ModeStore.initial(ctx)
     // onReselectMode 仍由 App 传进来（模式选择页 Route.ModePick 的入口已挪到「状态」页，见 StatusPage），
     // 这里留着不动 App 的调用点。
+    // 「回复延迟 → 自定义…」：就地弹一格两行秒数的小面板（与「消息存档」同一个 WindowDialog 宿主）
+    var showCustomDelay by remember { mutableStateOf(false) }
     val actions = SettingsActions(
         onReselectMode, onOpenLog, onOpenTheme, onOpenTexts, onOpenAbout, onOpenModelConfig,
         onReplayOnboarding,
+        onCustomDelay = { showCustomDelay = true },
     )
 
     // 「备份与恢复」小面板：就地弹，不新开二级页（导出 / 导入都在面板里完成）
@@ -173,6 +183,18 @@ fun SettingsPage(
 
     BackupPanel(show = showBackup, onDismiss = { showBackup = false })
 
+    // 全局回复延迟「自定义…」：填「多少秒之内随机等一会儿」，落盘仍是 _ms 两个整数键
+    DelayCustomDialog(
+        show = showCustomDelay,
+        initialMinSec = (vm.delayMin / 1000).toString(),
+        initialMaxSec = (vm.delayMax / 1000).toString(),
+        onConfirm = { lo, hi ->
+            showCustomDelay = false
+            vm.applyCustomDelay(lo, hi)
+        },
+        onDismiss = { showCustomDelay = false },
+    )
+
     ArchiveDialog(
         show = showArchive,
         summary = vm.archiveSummary,
@@ -208,6 +230,8 @@ private class SettingsActions(
     val onOpenAbout: () -> Unit,
     val onOpenModelConfig: () -> Unit,
     val onReplayOnboarding: () -> Unit,
+    /** 「回复延迟」里选「自定义…」：由页面弹输入面板（数值回写走 SettingsVm.applyCustomDelay） */
+    val onCustomDelay: () -> Unit = {},
 )
 
 /** 设置项的可变状态 + 落盘动作（两种结构共用同一份，切模式不会丢已填内容）。 */
@@ -318,6 +342,113 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
         }
     }
 
+    // ── Bot 互聊（1.0.8）：多 bot 谁回 / 连续发言上限 / 静默分钟 / 真人每小时上限 / 回复延迟 ──
+    //
+    // 六个键与 Python 侧同名（prefs 与 llm.json 各一份）：
+    // gate_enabled / bot_max_turns / bot_silence_minutes / human_hourly_limit /
+    // reply_delay_min_ms / reply_delay_max_ms。判定的活口在 Python：_llm_conf 每次重读 llm.json，
+    // 所以改完写文件即可，不用重启 bot（也不用重启 App）。
+    var gate by mutableStateOf(ctx.botGateEnabled)
+    var maxTurns by mutableStateOf(ctx.botMaxTurns)
+    var silenceMin by mutableStateOf(ctx.botSilenceMinutes)
+    var humanLimit by mutableStateOf(ctx.humanHourlyLimit)
+    var delayMin by mutableStateOf(ctx.replyDelayMinMs)
+    var delayMax by mutableStateOf(ctx.replyDelayMaxMs)
+
+    val turnValues = listOf(3, 6, 10, 20)
+    val turnLabels = listOf("3", "6", "10", "20")
+    val silenceValues = listOf(5, 10, 30, 60)
+    val silenceLabels = listOf("5 分钟", "10 分钟", "30 分钟", "60 分钟")
+    val humanValues = listOf(20, 40, 60, 120)
+    val humanLabels = listOf("20", "40", "60", "120")
+    private val delayPresets = listOf(
+        DelayPreset("不延迟", 0, 0),
+        DelayPreset("1~3 秒", 1000, 3000),
+        DelayPreset("3~7 秒（默认）", 3000, 7000),
+        DelayPreset("6~10 秒", 6000, 10000),
+    )
+
+    val turnIndex: Int get() = turnValues.indexOf(maxTurns).takeIf { it >= 0 } ?: 1
+    val silenceIndex: Int get() = silenceValues.indexOf(silenceMin).takeIf { it >= 0 } ?: 1
+    val humanIndex: Int get() = humanValues.indexOf(humanLimit).takeIf { it >= 0 } ?: 1
+
+    /** 落盘里那个值（不一定是预设）→ 下拉下标；对不上任何预设就是最后一项「自定义…」 */
+    val delayIndex: Int
+        get() = delayPresets.indexOfFirst { it.min == delayMin && it.max == delayMax }
+            .let { if (it >= 0) it else delayPresets.size }
+
+    /** 自定义生效时把真实秒数写进那一项的文案，别让这一行看不出自己填了什么 */
+    val delayLabels: List<String>
+        get() = delayPresets.map { it.label } + if (delayIndex == delayPresets.size) {
+            "自定义（" + delayText(delayMin, delayMax) + "）"
+        } else {
+            "自定义…"
+        }
+
+    /** 落盘 + 重写 llm.json（Python 侧每条消息重读文件，所以这就等于立刻生效） */
+    private fun persistBotChat(block: () -> Unit, note: String) {
+        block()
+        scope.launch {
+            withContext(Dispatchers.IO) { BotStore.writeLlmJson(ctx) }
+            msg = note
+        }
+    }
+
+    fun switchGate(on: Boolean) {
+        gate = on
+        persistBotChat(
+            { ctx.botGateEnabled = on },
+            if (on) "Bot 互聊：同一句话只让最合适的一个 bot 回"
+            else "Bot 互聊：总模型不再分配，各 bot 自己判断",
+        )
+    }
+
+    fun pickTurns(index: Int) {
+        val v = turnValues.getOrNull(index) ?: return
+        maxTurns = v
+        persistBotChat({ ctx.botMaxTurns = v }, "每个 bot 连续发言上限：" + v + " 条")
+    }
+
+    fun pickSilence(index: Int) {
+        val v = silenceValues.getOrNull(index) ?: return
+        silenceMin = v
+        persistBotChat({ ctx.botSilenceMinutes = v }, "到上限后静默 " + v + " 分钟")
+    }
+
+    fun pickHumanLimit(index: Int) {
+        val v = humanValues.getOrNull(index) ?: return
+        humanLimit = v
+        persistBotChat({ ctx.humanHourlyLimit = v }, "真人每小时上限：" + v + " 条")
+    }
+
+    fun pickDelay(index: Int) {
+        val p = delayPresets.getOrNull(index) ?: return
+        delayMin = p.min
+        delayMax = p.max
+        persistBotChat(
+            {
+                ctx.replyDelayMinMs = p.min
+                ctx.replyDelayMaxMs = p.max
+            },
+            "回复延迟：" + p.label,
+        )
+    }
+
+    /** 自定义延迟：界面填「秒」，落盘毫秒；两个都填 0 = 不延迟，大小写反了自动调换 */
+    fun applyCustomDelay(minSec: Int, maxSec: Int) {
+        val lo = minOf(minSec, maxSec).coerceAtLeast(0) * 1000
+        val hi = maxOf(minSec, maxSec).coerceAtLeast(0) * 1000
+        delayMin = lo
+        delayMax = hi
+        persistBotChat(
+            {
+                ctx.replyDelayMinMs = lo
+                ctx.replyDelayMaxMs = hi
+            },
+            "回复延迟：" + delayText(lo, hi),
+        )
+    }
+
     /** 切通知开关：立刻改渠道重要性（开 LOW / 关 NONE）+ 撤通知，服务不用重启 */
     fun switchRunNotif(on: Boolean) {
         runNotif = on
@@ -368,6 +499,57 @@ private fun MiuixSettingsBody(
                     summary = vm.llmSummary,
                     startAction = { SettingsRowIcon(Icons.Filled.Key) },
                     onClick = actions.onOpenModelConfig,
+                )
+            }
+        }
+
+        // Bot 互聊（1.0.8）：紧跟「模型配置」之后。五行一律弹出列表（不自绘），
+        // 键名与 Python 侧一字不改：gate_enabled / bot_max_turns / bot_silence_minutes /
+        // human_hourly_limit / reply_delay_min_ms+max_ms。
+        item(key = "botchat") {
+            SettingsGroupTitle("Bot 互聊")
+            SettingsMiuixGroup {
+                SwitchPreference(
+                    title = "多 bot 由总模型决定谁回",
+                    summary = "开启后同一句话只让最合适的一个 bot 回；只有一个 bot 时不生效",
+                    startAction = { SettingsRowIcon(Icons.Filled.Forum) },
+                    checked = vm.gate,
+                    onCheckedChange = { vm.switchGate(it) },
+                )
+                OverlayDropdownPreference(
+                    title = "每个 bot 连续发言上限",
+                    summary = "连说到这么多条就先停一停，把话头让给人",
+                    startAction = { SettingsRowIcon(Icons.Filled.Notes) },
+                    items = vm.turnLabels,
+                    selectedIndex = vm.turnIndex,
+                    onSelectedIndexChange = { vm.pickTurns(it) },
+                )
+                OverlayDropdownPreference(
+                    title = "到上限后静默",
+                    summary = "静默期间不接话，到点自动回来",
+                    startAction = { SettingsRowIcon(Icons.Filled.Notifications) },
+                    items = vm.silenceLabels,
+                    selectedIndex = vm.silenceIndex,
+                    onSelectedIndexChange = { vm.pickSilence(it) },
+                )
+                OverlayDropdownPreference(
+                    title = "真人每小时上限",
+                    summary = "真人比这说得还多时，bot 只围观",
+                    startAction = { SettingsRowIcon(Icons.Filled.Person) },
+                    items = vm.humanLabels,
+                    selectedIndex = vm.humanIndex,
+                    onSelectedIndexChange = { vm.pickHumanLimit(it) },
+                )
+                OverlayDropdownPreference(
+                    title = "回复延迟",
+                    summary = "区间内随机等一会儿再回，别秒回",
+                    startAction = { SettingsRowIcon(Icons.Filled.Speed) },
+                    items = vm.delayLabels,
+                    selectedIndex = vm.delayIndex,
+                    onSelectedIndexChange = { i ->
+                        // 最后一项是「自定义…」：不落盘，先弹两行秒数面板
+                        if (i >= 4) actions.onCustomDelay() else vm.pickDelay(i)
+                    },
                 )
             }
         }
@@ -605,6 +787,64 @@ private fun MaterialSettingsBody(
             }
         }
 
+        // Bot 互聊（1.0.8）：material 下是同样五行，行内是同一批弹出列表（Segmented*Item）
+        item(key = "botchat") {
+            SettingsGroupTitle("Bot 互聊")
+            SegmentedGroup(modifier = settingsGroupPadding()) {
+                item {
+                    SegmentedSwitchItem(
+                        title = "多 bot 由总模型决定谁回",
+                        summary = "开启后同一句话只让最合适的一个 bot 回；只有一个 bot 时不生效",
+                        icon = Icons.Filled.Forum,
+                        checked = vm.gate,
+                        onCheckedChange = { vm.switchGate(it) },
+                    )
+                }
+                item {
+                    SegmentedDropdownItem(
+                        title = "每个 bot 连续发言上限",
+                        summary = "连说到这么多条就先停一停，把话头让给人",
+                        icon = Icons.Filled.Notes,
+                        items = vm.turnLabels,
+                        selectedIndex = vm.turnIndex,
+                        onSelectedIndexChange = { vm.pickTurns(it) },
+                    )
+                }
+                item {
+                    SegmentedDropdownItem(
+                        title = "到上限后静默",
+                        summary = "静默期间不接话，到点自动回来",
+                        icon = Icons.Filled.Notifications,
+                        items = vm.silenceLabels,
+                        selectedIndex = vm.silenceIndex,
+                        onSelectedIndexChange = { vm.pickSilence(it) },
+                    )
+                }
+                item {
+                    SegmentedDropdownItem(
+                        title = "真人每小时上限",
+                        summary = "真人比这说得还多时，bot 只围观",
+                        icon = Icons.Filled.Person,
+                        items = vm.humanLabels,
+                        selectedIndex = vm.humanIndex,
+                        onSelectedIndexChange = { vm.pickHumanLimit(it) },
+                    )
+                }
+                item {
+                    SegmentedDropdownItem(
+                        title = "回复延迟",
+                        summary = "区间内随机等一会儿再回，别秒回",
+                        icon = Icons.Filled.Speed,
+                        items = vm.delayLabels,
+                        selectedIndex = vm.delayIndex,
+                        onSelectedIndexChange = { i ->
+                            if (i >= 4) actions.onCustomDelay() else vm.pickDelay(i)
+                        },
+                    )
+                }
+            }
+        }
+
         // ③ 回复节奏（首行「群里自动接话」是全局默认；分组标题要对用户可见）
         item(key = "reply") {
             SettingsGroupTitle("回复节奏")
@@ -788,6 +1028,82 @@ private object SettingsPrefs {
     fun put(ctx: Context, k: String, v: String) {
         SecureStore.put(sp(ctx), k, v)
     }
+}
+
+/** 全局回复延迟的四个预设：label 是弹出列表上的文案，(min,max) 毫秒是落盘值。 */
+private data class DelayPreset(val label: String, val min: Int, val max: Int)
+
+/** 毫秒 → 给人看的秒数（整秒不带小数点，非整秒留一位）。 */
+private fun secText(ms: Int): String =
+    if (ms % 1000 == 0) (ms / 1000).toString()
+    else String.format(java.util.Locale.US, "%.1f", ms / 1000.0)
+
+/** 落盘的两个毫秒值 → "3~7 秒" / "不延迟"（自定义那一项的文案也用它）。 */
+private fun delayText(minMs: Int, maxMs: Int): String = when {
+    minMs <= 0 && maxMs <= 0 -> "不延迟"
+    minMs == maxMs -> secText(minMs) + " 秒"
+    else -> secText(minMs) + "~" + secText(maxMs) + " 秒"
+}
+
+/**
+ * 「回复延迟 → 自定义…」面板：两行秒数 + 保存 / 取消。
+ *
+ * 界面按秒填（3、7），落盘按毫秒（3000、7000）—— Python 侧只认 _ms 两个整数键。
+ * 与「消息存档」同一个 WindowDialog 宿主，不引 material3。
+ */
+@Composable
+private fun DelayCustomDialog(
+    show: Boolean,
+    initialMinSec: String,
+    initialMaxSec: String,
+    onConfirm: (Int, Int) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    // 每次打开都按当前落盘值重新填（用 show 做 key，关掉再开不会留着上次没保存的草稿）
+    var minSec by remember(show) { mutableStateOf(initialMinSec) }
+    var maxSec by remember(show) { mutableStateOf(initialMaxSec) }
+    val numberKeys = KeyboardOptions(keyboardType = KeyboardType.Number)
+    WindowDialog(
+        show = show,
+        title = "回复延迟（自定义）",
+        onDismissRequest = onDismiss,
+        content = {
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(PanelTokens.RowSpacing),
+            ) {
+                Text(
+                    text = "在这两个秒数之间随机等一会儿再回；两个都填 0 = 不延迟。",
+                    style = MiuixTheme.textStyles.footnote2,
+                    color = MiuixTheme.colorScheme.onBackground,
+                )
+                EditText(
+                    title = "最短（秒）",
+                    value = minSec,
+                    keyboardOptions = numberKeys,
+                    onValueChange = { v -> minSec = v.filter { c -> c.isDigit() }.take(4) },
+                )
+                EditText(
+                    title = "最长（秒）",
+                    value = maxSec,
+                    keyboardOptions = numberKeys,
+                    onValueChange = { v -> maxSec = v.filter { c -> c.isDigit() }.take(4) },
+                )
+                TextButton(
+                    text = "保存",
+                    onClick = {
+                        onConfirm(minSec.toIntOrNull() ?: 0, maxSec.toIntOrNull() ?: 0)
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                TextButton(
+                    text = "取消",
+                    onClick = onDismiss,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+            }
+        },
+    )
 }
 
 /**

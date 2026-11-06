@@ -50,8 +50,11 @@ import com.wjljh.andbna.local.BotStore
 import com.wjljh.andbna.local.BotStore.groupAutochatOverride
 import com.wjljh.andbna.local.BotStore.setGroupAutochatOverride
 import com.wjljh.andbna.local.BotStore.llmApi
+import com.wjljh.andbna.local.BotStore.llmJudgeLevel
 import com.wjljh.andbna.local.BotStore.llmKey
 import com.wjljh.andbna.local.BotStore.llmModel
+import com.wjljh.andbna.local.BotStore.replyDelayMaxMs
+import com.wjljh.andbna.local.BotStore.replyDelayMinMs
 import com.wjljh.andbna.local.LocalBot
 import com.wjljh.andbna.local.PersonaAssets
 import com.wjljh.andbna.local.WordsStore
@@ -82,8 +85,10 @@ import top.yukonga.miuix.kmp.basic.IconButton
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Switch
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.basic.TextButton
 import top.yukonga.miuix.kmp.basic.TextField
 import top.yukonga.miuix.kmp.basic.TopAppBar
+import top.yukonga.miuix.kmp.window.WindowDialog
 import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Add
@@ -144,6 +149,19 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     // 组合期不读 prefs，等下面 IO 回来再填；生效优先级见 bot_runner._group_autochat_state。
     var autochatOverride by remember(appid) { mutableStateOf("") }
 
+    // 回复判定三档覆盖（localbots.json 的 judge_level_override）：""=跟随全局 / conservative / normal / eager
+    var judgeOverride by remember(appid) { mutableStateOf("") }
+    /** 全局判定档（"跟随全局（正常）" 括号里那两个字用） */
+    var globalJudge by remember { mutableStateOf("normal") }
+    // 本 bot 的回复延迟（localbots.json 的 reply_delay_min_ms/max_ms）：0/0=跟随全局、1/1=不延迟
+    var delayMinMs by remember(appid) { mutableStateOf(0) }
+    var delayMaxMs by remember(appid) { mutableStateOf(0) }
+    /** 全局延迟（"跟随全局（3~7 秒）" 括号里那一段用） */
+    var globalDelayMin by remember { mutableStateOf(3000) }
+    var globalDelayMax by remember { mutableStateOf(7000) }
+    // 「回复延迟 → 自定义…」的小面板
+    var showDelayDialog by remember(appid) { mutableStateOf(false) }
+
     // 称呼（<botdir>/phrases.json）：只有两个对象，键名写死 master / others
     var aliasMaster by remember(appid) { mutableStateOf("") }
     var aliasOthers by remember(appid) { mutableStateOf("") }
@@ -202,6 +220,13 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
         globalModel = m
         // 群里自动接话：本 bot 的三态覆盖（设置页那一行是全局默认，两者不再共用同一个值）
         autochatOverride = withContext(Dispatchers.IO) { ctx.groupAutochatOverride(appid) }
+        // 回复判定 / 回复延迟：本 bot 的覆盖（"" 与 0/0 = 跟随全局）+ 全局实际值
+        judgeOverride = loaded?.judgeLevelOverride.orEmpty()
+        delayMinMs = loaded?.replyDelayMinMs ?: 0
+        delayMaxMs = loaded?.replyDelayMaxMs ?: 0
+        globalJudge = withContext(Dispatchers.IO) { ctx.llmJudgeLevel }
+        globalDelayMin = withContext(Dispatchers.IO) { ctx.replyDelayMinMs }
+        globalDelayMax = withContext(Dispatchers.IO) { ctx.replyDelayMaxMs }
 
         // ② 称呼 + 问候：本 bot 自己的 phrases.json / greetings.json（缺文件就是空 / 默认值）
         val words = withContext(Dispatchers.IO) { WordsStore.loadBot(ctx, appid) }
@@ -250,8 +275,21 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                             enabled = enabled,
                             name = name.trim(),
                             useGlobalLlm = inherit,
+                            // Bot 互聊：判定三档 + 延迟区间（"" / 0,0 = 跟随全局）
+                            judgeLevelOverride = judgeOverride,
+                            replyDelayMinMs = delayMinMs,
+                            replyDelayMaxMs = delayMaxMs,
                         )
                     )
+                }
+                // 启用开关在这一页也走同一套「立刻生效」：落盘之后直接起停这一个 bot，
+                // 不再等重启 App（Bot 页那个开关走的是同一个 BotHost.startOne/stopOne）
+                if (old != null && old.enabled != enabled) {
+                    if (enabled) {
+                        BotHost.startOne(ctx, appid, "编辑保存")
+                    } else {
+                        BotHost.stopOne(ctx, appid, "编辑保存")
+                    }
                 }
                 if (!inherit) {
                     // 没有 per-bot 模型存储：沿用现有的全局三件套（与 Bot 页「模型配置」同一份接口）
@@ -295,6 +333,9 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                         o.secret != secret.trim().ifBlank { o.secret } ||
                         (!inherit && (prevKey != llmK.trim() || prevApi != llmA.trim() ||
                             prevModel != llmM.trim())) ||
+                        o.judgeLevelOverride != judgeOverride ||
+                        o.replyDelayMinMs != delayMinMs ||
+                        o.replyDelayMaxMs != delayMaxMs ||
                         prevWords.master != aliasMaster ||
                         prevWords.others != aliasOthers ||
                         prevWords.enabled != greetOn ||
@@ -356,7 +397,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 )
                 BotFormSwitchRow(
                     title = "启用",
-                    summary = if (enabled) "已启用，重启服务后上线" else "已停用",
+                    summary = if (enabled) "已启用 · 保存后立刻上线" else "未启动 · 保存后立刻下线",
                     checked = enabled,
                     onCheckedChange = { enabled = it },
                 )
@@ -582,6 +623,52 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 )
             }
 
+            // 回复判定 + 回复延迟：都是**按 bot 的覆盖**（跟随全局 = 落盘 "" 与 0,0），
+            // 改这里只影响本 bot，保存时跟其它字段一起写 localbots.json（沿用「保存即重启该 bot」）。
+            BotFormSection(title = "回复判定与延迟") {
+                OverlayDropdownPreference(
+                    insideMargin = PanelTokens.PrefInside,
+                    title = "回复判定",
+                    summary = "没被 @ 时多主动才插话；右侧括号里是实际生效的那一档",
+                    items = judgeLabels(globalJudge),
+                    selectedIndex = judgeIndex(judgeOverride),
+                    onSelectedIndexChange = { i ->
+                        judgeOverride = judgeValue(i)
+                        msg = "回复判定：" + judgeLabels(globalJudge)[i] + "（保存后生效）"
+                    },
+                )
+                HorizontalDivider(
+                    modifier = Modifier.padding(vertical = 6.dp),
+                    thickness = PanelTokens.Divider,
+                    color = PanelColors.dividerLine,
+                )
+                OverlayDropdownPreference(
+                    insideMargin = PanelTokens.PrefInside,
+                    title = "回复延迟",
+                    summary = "在区间内随机等一会儿再回；跟随全局就按设置页那一档",
+                    items = botDelayLabels(globalDelayMin, globalDelayMax, delayMinMs, delayMaxMs),
+                    selectedIndex = botDelayIndex(delayMinMs, delayMaxMs),
+                    onSelectedIndexChange = { i ->
+                        when {
+                            // 0 = 跟随全局：两个键都写 0，Python 侧按全局那档
+                            i == 0 -> {
+                                delayMinMs = 0
+                                delayMaxMs = 0
+                                msg = "回复延迟：跟随全局（保存后生效）"
+                            }
+                            // 最后一项 = 自定义…：弹两行秒数面板，值回来再写状态
+                            i >= BOT_DELAY_CHOICES.size + 1 -> showDelayDialog = true
+                            else -> {
+                                val c = BOT_DELAY_CHOICES[i - 1]
+                                delayMinMs = c.min
+                                delayMaxMs = c.max
+                                msg = "回复延迟：" + c.label + "（保存后生效）"
+                            }
+                        }
+                    },
+                )
+            }
+
             // ⑨ 群配置：每个群单独设自动接话 / 每日额度 / 联网 / 整群静音
             //    （<botdir>/groups/<openid>.json；没配过的群沿用上面那三层判定）
             BotFormSection(title = "群配置") {
@@ -670,6 +757,26 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
             }
         }
     }
+
+    // 「回复延迟 → 自定义…」：界面填秒、落盘毫秒（两个都填 0 = 不延迟 = 1/1）
+    BotDelayDialog(
+        show = showDelayDialog,
+        initialMinSec = secFromMs(delayMinMs.coerceAtLeast(1)),
+        initialMaxSec = secFromMs(delayMaxMs.coerceAtLeast(1)),
+        onConfirm = { lo, hi ->
+            showDelayDialog = false
+            if (lo <= 0 && hi <= 0) {
+                delayMinMs = 1
+                delayMaxMs = 1
+                msg = "回复延迟：不延迟（保存后生效）"
+            } else {
+                delayMinMs = minOf(lo, hi).coerceAtLeast(1) * 1000
+                delayMaxMs = maxOf(lo, hi).coerceAtLeast(1) * 1000
+                msg = "回复延迟：" + botDelayText(delayMinMs, delayMaxMs) + "（保存后生效）"
+            }
+        },
+        onDismiss = { showDelayDialog = false },
+    )
 }
 
 /** bot_runner.ids_for() 的结果（只用 owner + groups）。 */
@@ -1022,4 +1129,150 @@ private fun autochatValue(index: Int): String = when (index) {
     1 -> "1"
     2 -> "0"
     else -> ""
+}
+
+// ── 回复判定 / 回复延迟（Bot 互聊 1.0.8）────────────────────────────────
+
+/**
+ * 判定三档的下拉文案：第 0 项把**全局实际档**写进括号里。
+ *
+ * 右侧显示的就是 items[selectedIndex]，所以「跟随全局」这一档天然显示成
+ * 「跟随全局（正常）」—— 不用另开一行小字。
+ */
+private fun judgeLabels(globalLevel: String): List<String> =
+    listOf("跟随全局（" + judgeLevelText(globalLevel) + "）", "保守", "正常", "积极")
+
+/** conservative / normal / eager → 界面上的两个字（脏值按 normal）。 */
+private fun judgeLevelText(raw: String): String = when (raw.trim().lowercase()) {
+    "conservative" -> "保守"
+    "eager" -> "积极"
+    else -> "正常"
+}
+
+/** 落盘值（judge_level_override）→ 下拉下标：""=跟随全局。 */
+private fun judgeIndex(value: String): Int = when (value.trim().lowercase()) {
+    "conservative" -> 1
+    "normal" -> 2
+    "eager" -> 3
+    else -> 0
+}
+
+/** 下拉下标 → 落盘值（"" 就是跟随全局，键照样写，值为空串）。 */
+private fun judgeValue(index: Int): String = when (index) {
+    1 -> "conservative"
+    2 -> "normal"
+    3 -> "eager"
+    else -> ""
+}
+
+/**
+ * 每 bot 的延迟预设。
+ *
+ * 「不延迟」落盘是 1/1 毫秒而不是 0/0：0/0 已经被「跟随全局」占用（契约里 0 = 用全局），
+ * 1 毫秒在运行时等价于立即回，Python 侧按「min<=0 且 max<=0 才用全局」判断也不会误判。
+ */
+private val BOT_DELAY_CHOICES = listOf(
+    BotDelayChoice("不延迟", 1, 1),
+    BotDelayChoice("1~3 秒", 1000, 3000),
+    BotDelayChoice("3~7 秒", 3000, 7000),
+    BotDelayChoice("6~10 秒", 6000, 10000),
+)
+
+private data class BotDelayChoice(val label: String, val min: Int, val max: Int)
+
+/** 落盘值 → 下拉下标：0=跟随全局、1..4=预设、最后一项=自定义。 */
+private fun botDelayIndex(minMs: Int, maxMs: Int): Int {
+    if (minMs <= 0 && maxMs <= 0) return 0
+    val i = BOT_DELAY_CHOICES.indexOfFirst { it.min == minMs && it.max == maxMs }
+    return if (i >= 0) i + 1 else BOT_DELAY_CHOICES.size + 1
+}
+
+/** 延迟下拉的六项：跟随全局（括号里是全局真值）+ 四个预设 + 自定义… */
+private fun botDelayLabels(
+    globalMin: Int,
+    globalMax: Int,
+    minMs: Int,
+    maxMs: Int,
+): List<String> {
+    val custom = botDelayIndex(minMs, maxMs) == BOT_DELAY_CHOICES.size + 1
+    return listOf("跟随全局（" + botDelayText(globalMin, globalMax) + "）") +
+        BOT_DELAY_CHOICES.map { it.label } +
+        if (custom) "自定义（" + botDelayText(minMs, maxMs) + "）" else "自定义…"
+}
+
+/** 毫秒区间 → "3~7 秒" / "不延迟"。 */
+private fun botDelayText(minMs: Int, maxMs: Int): String = when {
+    minMs <= 0 && maxMs <= 0 -> "不延迟"
+    minMs == maxMs -> secFromMs(minMs) + " 秒"
+    else -> secFromMs(minMs) + "~" + secFromMs(maxMs) + " 秒"
+}
+
+/** 毫秒 → 秒（整秒不带小数点，非整秒留一位；不足 1 秒的自定义面板里按 0 起填）。 */
+private fun secFromMs(ms: Int): String = when {
+    ms < 1000 -> "0"
+    ms % 1000 == 0 -> (ms / 1000).toString()
+    else -> String.format(java.util.Locale.US, "%.1f", ms / 1000.0)
+}
+
+/**
+ * 「回复延迟 → 自定义…」面板（本 bot）：两行秒数 + 保存 / 取消。
+ *
+ * 与设置页那个同一个形状，但写的是本 bot 的 reply_delay_min_ms / reply_delay_max_ms
+ * （页面内只改状态，点「保存」才跟其它字段一起落盘）。
+ */
+@Composable
+private fun BotDelayDialog(
+    show: Boolean,
+    initialMinSec: String,
+    initialMaxSec: String,
+    onConfirm: (Int, Int) -> Unit,
+    onDismiss: () -> Unit,
+) {
+    var minSec by remember(show) { mutableStateOf(initialMinSec) }
+    var maxSec by remember(show) { mutableStateOf(initialMaxSec) }
+    WindowDialog(
+        show = show,
+        title = "回复延迟（本 bot）",
+        onDismissRequest = onDismiss,
+        content = {
+            Column(Modifier.fillMaxWidth()) {
+                Text(
+                    text = "在这两个秒数之间随机等一会儿再回；两个都填 0 = 不延迟。",
+                    fontSize = 13.sp,
+                    color = PanelColors.onSurfaceVariantSummary,
+                )
+                Spacer(Modifier.height(PanelTokens.ButtonGap))
+                BotFormField(
+                    label = "最短（秒）",
+                    value = minSec,
+                    onValueChange = { v -> minSec = v.filter { c -> c.isDigit() }.take(4) },
+                    hint = "3",
+                    numeric = true,
+                )
+                Spacer(Modifier.height(PanelTokens.ButtonGap))
+                BotFormField(
+                    label = "最长（秒）",
+                    value = maxSec,
+                    onValueChange = { v -> maxSec = v.filter { c -> c.isDigit() }.take(4) },
+                    hint = "7",
+                    numeric = true,
+                )
+                Spacer(Modifier.height(PanelTokens.ButtonGap))
+                PanelPillRow {
+                    PanelPrimaryButton(
+                        text = "保存",
+                        onClick = {
+                            onConfirm(minSec.toIntOrNull() ?: 0, maxSec.toIntOrNull() ?: 0)
+                        },
+                        modifier = Modifier.weight(1f),
+                    )
+                    PanelSecondaryButton(
+                        text = "取消",
+                        onClick = onDismiss,
+                        modifier = Modifier.weight(1f),
+                    )
+                }
+            }
+        },
+    )
 }

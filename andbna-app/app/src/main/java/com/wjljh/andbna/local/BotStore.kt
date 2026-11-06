@@ -21,6 +21,11 @@ data class LocalBot(
     val name: String = "",
     /** 是否沿用全局的模型配置（Key / 地址 / 模型名） */
     val useGlobalLlm: Boolean = true,
+    /** 回复判定三档覆盖："" = 跟随全局 / conservative / normal / eager（键名 judge_level_override） */
+    val judgeLevelOverride: String = "",
+    /** 本 bot 的回复延迟（毫秒）：0 = 用全局（键名 reply_delay_min_ms / reply_delay_max_ms） */
+    val replyDelayMinMs: Int = 0,
+    val replyDelayMaxMs: Int = 0,
 ) {
     val title: String get() = name.ifBlank { appid }
 
@@ -32,6 +37,10 @@ data class LocalBot(
         .put("enabled", enabled)
         .put("name", name)
         .put("use_global_llm", useGlobalLlm)
+        // Bot 互聊：每 bot 的判定覆盖 + 延迟覆盖（0 = 用全局）
+        .put("judge_level_override", judgeLevelOverride)
+        .put("reply_delay_min_ms", replyDelayMinMs)
+        .put("reply_delay_max_ms", replyDelayMaxMs)
 
     companion object {
         fun from(j: JSONObject): LocalBot = LocalBot(
@@ -42,7 +51,14 @@ data class LocalBot(
             enabled = j.optBoolean("enabled"),
             name = j.optString("name"),
             useGlobalLlm = j.optBoolean("use_global_llm", true),
+            judgeLevelOverride = normJudge(j.optString("judge_level_override")),
+            replyDelayMinMs = j.optInt("reply_delay_min_ms", 0).coerceAtLeast(0),
+            replyDelayMaxMs = j.optInt("reply_delay_max_ms", 0).coerceAtLeast(0),
         )
+
+        /** 脏值一律当「跟随全局」：Python 侧也只认这三个字面值 */
+        fun normJudge(raw: String): String = raw.trim().lowercase()
+            .let { if (it in setOf("conservative", "normal", "eager")) it else "" }
     }
 }
 
@@ -139,6 +155,10 @@ object BotStore {
                     .put("enabled", b.enabled)
                     .put("name", b.name)
                     .put("use_global_llm", b.useGlobalLlm)
+                    // 每 bot 的判定 / 延迟覆盖（"" 与 0 = 用全局），Python 侧按 bot 现读
+                    .put("judge_level_override", b.judgeLevelOverride)
+                    .put("reply_delay_min_ms", b.replyDelayMinMs)
+                    .put("reply_delay_max_ms", b.replyDelayMaxMs)
             )
         }
         return arr.toString()
@@ -321,6 +341,59 @@ object BotStore {
             sp(this).edit().putString("llm_reasoning_effort", v.trim()).apply()
         }
 
+    // ── Bot 互聊（1.0.8）：多 bot 之间谁回、说几句、多久停、真人限速、回复延迟 ──
+    //
+    // 六个键名与 Python 侧一字不改：gate_enabled / bot_max_turns / bot_silence_minutes /
+    // human_hourly_limit / reply_delay_min_ms / reply_delay_max_ms。
+    // prefs 里存一份（界面立刻能读到），llm.json 里再写一份（bot_runner._llm_conf 每次都重读文件）。
+
+    /** 多 bot 由总模型决定谁回（默认开）：关掉 = 每个启用的 bot 各回各的。 */
+    var Context.botGateEnabled: Boolean
+        // 历史/备份都按字符串存（"1"/"0"），别用 getBoolean 撞 ClassCastException
+        get() = sp(this).getString("gate_enabled", "1").orEmpty().trim() != "0"
+        set(v) {
+            sp(this).edit().putString("gate_enabled", if (v) "1" else "0").apply()
+        }
+
+    /** 每个 bot 连续发言上限（默认 6）：到上限就静默一段时间。 */
+    var Context.botMaxTurns: Int
+        get() = sp(this).getString("bot_max_turns", "").orEmpty().trim().toIntOrNull()
+            ?.takeIf { it > 0 } ?: 6
+        set(v) {
+            sp(this).edit().putString("bot_max_turns", v.coerceAtLeast(1).toString()).apply()
+        }
+
+    /** 到上限后静默多少分钟（默认 10）。 */
+    var Context.botSilenceMinutes: Int
+        get() = sp(this).getString("bot_silence_minutes", "").orEmpty().trim().toIntOrNull()
+            ?.takeIf { it > 0 } ?: 10
+        set(v) {
+            sp(this).edit().putString("bot_silence_minutes", v.coerceAtLeast(1).toString()).apply()
+        }
+
+    /** 真人每小时最多发几条（默认 40）：超过就只当观众，不插话。 */
+    var Context.humanHourlyLimit: Int
+        get() = sp(this).getString("human_hourly_limit", "").orEmpty().trim().toIntOrNull()
+            ?.takeIf { it > 0 } ?: 40
+        set(v) {
+            sp(this).edit().putString("human_hourly_limit", v.coerceAtLeast(1).toString()).apply()
+        }
+
+    /** 全局回复延迟（毫秒，默认 3000 / 7000）：0 = 不延迟。 */
+    var Context.replyDelayMinMs: Int
+        get() = sp(this).getString("reply_delay_min_ms", "").orEmpty().trim().toIntOrNull()
+            ?.coerceAtLeast(0) ?: 3000
+        set(v) {
+            sp(this).edit().putString("reply_delay_min_ms", v.coerceAtLeast(0).toString()).apply()
+        }
+
+    var Context.replyDelayMaxMs: Int
+        get() = sp(this).getString("reply_delay_max_ms", "").orEmpty().trim().toIntOrNull()
+            ?.coerceAtLeast(0) ?: 7000
+        set(v) {
+            sp(this).edit().putString("reply_delay_max_ms", v.coerceAtLeast(0).toString()).apply()
+        }
+
     /** 回复判定：llm=模型判断要不要插话，random=按闲聊概率掷骰子 */
     var Context.replyJudge: String
         get() = sp(this).getString("reply_judge", "llm").orEmpty().ifBlank { "llm" }
@@ -400,6 +473,13 @@ object BotStore {
             .put("search_base", ctx.searchBase)
             .put("search_auth", ctx.searchAuth)
             .put("search_fields", ctx.searchFields)
+            // Bot 互聊（1.0.8）：多 bot 谁回 / 连续发言上限 / 静默分钟 / 真人每小时上限 / 回复延迟
+            .put("gate_enabled", ctx.botGateEnabled)
+            .put("bot_max_turns", ctx.botMaxTurns)
+            .put("bot_silence_minutes", ctx.botSilenceMinutes)
+            .put("human_hourly_limit", ctx.humanHourlyLimit)
+            .put("reply_delay_min_ms", ctx.replyDelayMinMs)
+            .put("reply_delay_max_ms", ctx.replyDelayMaxMs)
         try {
             val f = File(ctx.filesDir, "localbot/llm.json")
             f.parentFile?.mkdirs()

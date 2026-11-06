@@ -519,10 +519,101 @@ object BotHost {
         }
     }
 
-    fun stopOne(appid: String) {
-        try {
-            module?.callAttr("stop_one", appid)
-        } catch (_: Throwable) {
+    /**
+     * 手动启停单个 bot（Bot 页的开关）：切换即生效，不用重启 App。
+     *
+     * 为什么要有：以前那个开关只落盘 localbots.json，运行中的 bot 得等下次 startAll
+     * （也就是重启 App）才会变 —— 用户明确说这是痛点。走 Python 的 start_one / stop_one，
+     * 只动这一个 bot，别的 bot 不断线（和 restart_one 同一个理由）。
+     *
+     * 返回人能读的一句结果（"已启动" / "已停止" / 失败原因），并且**一定**留一行日志：
+     * 「手动启停：<name> 已启动/已停止」（[reason] 默认就是那四个字）。
+     */
+    fun startOne(context: Context, appid: String, reason: String = "手动启停"): String {
+        val c = context.applicationContext
+        ctx = c
+        val why = reason.trim().ifBlank { "手动启停" }
+        val bot = BotStore.load(c).firstOrNull { it.appid == appid }
+        val label = bot?.title ?: appid
+        val m = ensure()
+        if (m == null) {
+            val err = lastError.ifBlank { "Python 未就绪" }
+            logNote(why + "：" + label + " 启动失败（" + err + "）")
+            return "启动失败：" + err
+        }
+        if (bot == null) {
+            logNote(why + "：" + label + " 启动失败（本机清单里没有这个 bot）")
+            return "启动失败：本机清单里没有这个 bot"
+        }
+        if (bot.secret.isBlank()) {
+            logNote(why + "：" + label + " 启动失败（缺 AppSecret）")
+            return "启动失败：缺 AppSecret"
+        }
+        return try {
+            // 人格与运行时配置先推一遍：内存里那份不换，新起来的 bot 会用旧 Key / 旧模型
+            if (bot.persona.isNotBlank()) {
+                val d = File(dataDir(c), appid)
+                d.mkdirs()
+                PersonaAssets.writeTo(c, bot.persona, d)
+            }
+            pushRuntimeConfig(c)
+            m.callAttr(
+                "set_group_autochat", appid, c.groupAutochatOverride(appid), c.groupAutochat,
+            )
+            val r = m.callAttr(
+                "start_one", appid, bot.secret, dataDir(c).absolutePath,
+            ).toString().trim()
+            when {
+                r == "OK" -> {
+                    logNote(why + "：" + label + " 已启动")
+                    "已启动"
+                }
+                r.contains("已经在跑") -> {
+                    logNote(why + "：" + label + " 已经在跑了，跳过")
+                    "已在运行"
+                }
+                else -> {
+                    logNote(why + "：" + label + " 启动失败（" + r + "）")
+                    "启动失败：" + r
+                }
+            }
+        } catch (e: Throwable) {
+            lastError = "启动异常：" + (e.message ?: e.javaClass.simpleName)
+            logNote(why + "：" + label + " 启动失败（" + lastError + "）")
+            "启动失败：" + (e.message ?: e.javaClass.simpleName)
+        }
+    }
+
+    /** 手动停单个 bot：见 [startOne]。返回 "已停止" / "未在运行" / 失败原因。 */
+    fun stopOne(context: Context, appid: String, reason: String = "手动启停"): String {
+        ctx = context.applicationContext
+        val why = reason.trim().ifBlank { "手动启停" }
+        val label = BotStore.load(context).firstOrNull { it.appid == appid }?.title ?: appid
+        val m = ensure()
+        if (m == null) {
+            val err = lastError.ifBlank { "Python 未就绪" }
+            logNote(why + "：" + label + " 停止失败（" + err + "）")
+            return "停止失败：" + err
+        }
+        return try {
+            when (val r = m.callAttr("stop_one", appid).toString().trim()) {
+                "OK" -> {
+                    logNote(why + "：" + label + " 已停止")
+                    "已停止"
+                }
+                "没在跑" -> {
+                    logNote(why + "：" + label + " 本来就没在跑")
+                    "未在运行"
+                }
+                else -> {
+                    logNote(why + "：" + label + " 停止失败（" + r + "）")
+                    "停止失败：" + r
+                }
+            }
+        } catch (e: Throwable) {
+            lastError = "停止异常：" + (e.message ?: e.javaClass.simpleName)
+            logNote(why + "：" + label + " 停止失败（" + lastError + "）")
+            "停止失败：" + (e.message ?: e.javaClass.simpleName)
         }
     }
 

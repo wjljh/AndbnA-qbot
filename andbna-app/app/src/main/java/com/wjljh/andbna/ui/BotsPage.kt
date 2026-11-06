@@ -200,14 +200,21 @@ fun BotsPage(
 
             bots.forEach { b ->
                 item(key = "bot-" + b.appid) {
+                    // 启停开关：不只落盘 —— 落盘之后**立刻**起停这一个 bot（不用重启 App）。
+                    // 顺序很讲究：先写 localbots.json 的 enabled，再动进程。Python 侧按「启用中的
+                    // bot 数」判断总模型要不要上岗，所以它必须在新状态落盘之后才收到 stop/start。
                     val onToggle: (Boolean) -> Unit = { on ->
-                        msg = if (on) "已启用 " + b.appid + "，重启服务后上线" else "已停用 " + b.appid
-                        // 写盘 + 读回都在 IO：别让一次开关把主线程顶住
+                        msg = if (on) "正在启动「" + b.title + "」…" else "正在停止「" + b.title + "」…"
                         scope.launch {
-                            bots = withContext(Dispatchers.IO) {
+                            val note = withContext(Dispatchers.IO) {
                                 BotStore.setEnabled(ctx, b.appid, on)
-                                BotStore.load(ctx)
+                                if (on) BotHost.startOne(ctx, b.appid, "手动启停")
+                                else BotHost.stopOne(ctx, b.appid, "手动启停")
                             }
+                            bots = withContext(Dispatchers.IO) { BotStore.load(ctx) }
+                            // 立刻拉一次快照：状态从「已上线」变「未启动」不用等 2 秒轮询
+                            pullSnapshot()
+                            msg = "手动启停：" + b.title + " " + note
                         }
                     }
                     // 「编辑」= 进二级页做这个 bot 的详细配置（Route.BotEdit），不再复用添加弹层
@@ -412,11 +419,13 @@ private fun BotCard(
     onCancelDelete: () -> Unit,
     onConfirmDelete: () -> Unit,
 ) {
-    val running = status.contains("已上线") || status.contains("连接中")
+    val running = status.contains("已上线") || status.contains("连接中") ||
+        status.contains("正在启动")
     val statusText = when {
         running -> status
         bot.enabled -> "已启用，待启动"
-        else -> "已停用"
+        // 手动关掉 = 真的停了（不再是「重启 App 才生效」那套）
+        else -> "未启动"
     }
     val summaryColor = PanelColors.onSurfaceVariantSummary
 
@@ -519,11 +528,12 @@ private fun parseRuntime(raw: String): Map<String, String> {
 
 /** 卡上的一行小字：状态 · 人格 · AppID（两种模式共用）。 */
 private fun botSubtitle(bot: LocalBot, status: String): String {
-    val running = status.contains("已上线") || status.contains("连接中")
+    val running = status.contains("已上线") || status.contains("连接中") ||
+        status.contains("正在启动")
     val statusText = when {
         running -> status
         bot.enabled -> "已启用，待启动"
-        else -> "已停用"
+        else -> "未启动"
     }
     return statusText + " · 人格：" + bot.persona.ifBlank { "未设置" } +
         " · AppID " + bot.appid + if (bot.secret.isBlank()) "（缺 AppSecret）" else ""
