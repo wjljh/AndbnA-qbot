@@ -77,7 +77,7 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
         info = withContext(Dispatchers.IO) { readAbout(ctx) }
     }
 
-    // 自动检查更新：开关落盘（默认关）。打开后启动时最短 30 分钟才查一次，
+    // 自动检查更新：开关落盘（默认开，老用户显式关过的照旧是关）。打开后启动时最短 30 分钟才查一次，
     // 发现新版本在状态页 hero 下面出一张提示卡；「立即检查」在下一行（无视 30 分钟节流）。
     var autoCheck by remember { mutableStateOf(Updater.autoEnabled(ctx)) }
 

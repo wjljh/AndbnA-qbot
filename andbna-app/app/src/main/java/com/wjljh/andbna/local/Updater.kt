@@ -12,24 +12,29 @@ import java.net.HttpURLConnection
 import java.net.URL
 
 /**
- * 检查更新：GET 更新源 JSON（默认 GitHub releases/latest），读 tag_name / body / assets[]。
+ * 检查更新：GET 更新源 JSON（默认静态源 docs/latest.json，失败回退 GitHub releases/latest），
+ * 读 tag_name / body / assets[]。
  *
  * 两件硬要求：
  *  · GitHub 的匿名 API **必须带 User-Agent**，不带直接 403（实测）；
  *  · 失败一律静默 —— 只记一条「更新：检查失败（原因）」日志，不在界面上打扰人。
  *
- * 更新源可换（prefs 键 [KEY_API]，与搜索后端同一思路）：留空 = 官方 GitHub，
- * 自建镜像只要返回同样形状的 JSON（tag_name / body / assets[].browser_download_url / size）即可。
+ * 更新源可换（prefs 键 [KEY_API]，与搜索后端同一思路）：留空 = 默认双源
+ * （先 [STATIC_API]，失败/解析不出再 [FALLBACK_API]）+ 自建镜像只要返回同样形状的 JSON
+ * （tag_name / body / assets[].browser_download_url / size）即可。
  */
 object Updater {
 
     private const val TAG = "更新"
 
-    /** 落盘键：自定义更新源（空 = 用 [DEFAULT_API]） */
+    /** 落盘键：自定义更新源（空 = 先用 [STATIC_API]，不行再 [FALLBACK_API]） */
     const val KEY_API = "update_api"
 
-    /** 默认更新源：GitHub 官方 releases/latest */
-    const val DEFAULT_API = "https://api.github.com/repos/wjljh/AndbnA-qbot/releases/latest"
+    /** 默认静态更新源：仓库 docs/latest.json（GitHub Actions 发版时自动维护，形状与 GitHub API 兼容） */
+    const val STATIC_API = "https://cdn.jsdelivr.net/gh/wjljh/AndbnA-qbot@main/docs/latest.json"
+
+    /** 静态源失败时的回退：GitHub 官方 releases/latest */
+    const val FALLBACK_API = "https://api.github.com/repos/wjljh/AndbnA-qbot/releases/latest"
 
     /** 超时 8s：检查更新不值得让人等 */
     private const val TIMEOUT_MS = 8_000
@@ -57,7 +62,7 @@ object Updater {
     /** 一次检查的结论 + 给人看的一行说明（手动「立即检查」把它直接写进界面） */
     data class Checked(val result: Result, val note: String)
 
-    fun apiUrl(ctx: Context): String = Prefs.get(ctx, KEY_API).ifBlank { DEFAULT_API }
+    fun apiUrl(ctx: Context): String = Prefs.get(ctx, KEY_API).ifBlank { STATIC_API }
 
     fun setApiUrl(ctx: Context, url: String) = Prefs.put(ctx, KEY_API, url)
 
@@ -67,7 +72,7 @@ object Updater {
     /** 一次检查：查到有更新就顺手覆盖本地缓存（失败/最新都不留过期缓存） */
     suspend fun checkDetailed(ctx: Context, currentVersionName: String): Checked =
         withContext(Dispatchers.IO) {
-            val c = fetch(apiUrl(ctx), currentVersionName)
+            val c = fetchAuto(ctx, currentVersionName)
             applyCache(ctx, c)
             c
         }
@@ -78,12 +83,28 @@ object Updater {
      */
     suspend fun checkNow(ctx: Context, currentVersionName: String): Checked =
         withContext(Dispatchers.IO) {
-            val c = fetch(apiUrl(ctx), currentVersionName)
+            val c = fetchAuto(ctx, currentVersionName)
             sp(ctx).edit().putLong(KEY_LAST, System.currentTimeMillis()).apply()
             applyCache(ctx, c)
             Log.i(TAG, "更新：手动立即检查 → " + c.note)
             c
         }
+
+    /**
+     * 一次联网检查：用户自定义源最优先；否则先静态源，失败/解析不出再回退 GitHub API **一次**。
+     * 两边都失败时靠这条链路各自的日志（含 HTTP 码）说明原因。
+     */
+    private fun fetchAuto(ctx: Context, current: String): Checked {
+        val custom = Prefs.get(ctx, KEY_API).trim()
+        if (custom.isNotEmpty()) {
+            Log.i(TAG, "更新：使用自定义更新源")
+            return fetch(custom, current)
+        }
+        val first = fetch(STATIC_API, current)
+        if (first.result != Result.Failed) return first
+        Log.i(TAG, "更新：静态源失败，回退 GitHub API")
+        return fetch(FALLBACK_API, current)
+    }
 
     private fun fetch(url: String, current: String): Checked {
         var conn: HttpURLConnection? = null
@@ -97,18 +118,18 @@ object Updater {
             }
             val code = conn.responseCode
             // 响应体只进日志（限流 / UA / 路径错全靠它区分），界面那行小字保持干净
-            if (code != 200) return fail("HTTP " + code, errorHint(conn))
+            if (code != 200) return fail(reasonOf(code), errorHint(conn))
             parse(conn.inputStream.bufferedReader().use { it.readText() }, current)
         } catch (e: CancellationException) {
             throw e
         } catch (e: java.net.SocketTimeoutException) {
-            fail("超时（" + TIMEOUT_MS / 1000 + "s）：" + url)
+            fail(reasonOf(0), "（" + TIMEOUT_MS / 1000 + "s 超时：" + url + "）")
         } catch (e: java.net.UnknownHostException) {
-            fail("域名解析失败：" + (e.message ?: url))
+            fail(reasonOf(0), "（域名解析失败：" + (e.message ?: url) + "）")
         } catch (e: java.io.IOException) {
-            fail("网络错误：" + (e.message ?: "IO 异常"))
+            fail(reasonOf(0), "（" + (e.message ?: "IO 异常") + "：" + url + "）")
         } catch (e: Throwable) {
-            fail(e.message ?: e.javaClass.simpleName)
+            fail(reasonOf(0), "（" + (e.message ?: e.javaClass.simpleName) + "）")
         } finally {
             runCatching { conn?.disconnect() }
         }
@@ -197,7 +218,14 @@ object Updater {
 
     private fun sp(ctx: Context) = ctx.getSharedPreferences("andbna_local", Context.MODE_PRIVATE)
 
-    fun autoEnabled(ctx: Context): Boolean = sp(ctx).getBoolean(KEY_AUTO, false)
+    /**
+     * 自动检查更新：**默认开**。兼容老用户 —— 键不存在（从没动过）才算默认开，
+     * 用户显式关过（键在且为 false）就一直关着。
+     */
+    fun autoEnabled(ctx: Context): Boolean {
+        val p = sp(ctx)
+        return !p.contains(KEY_AUTO) || p.getBoolean(KEY_AUTO, true)
+    }
 
     fun setAutoEnabled(ctx: Context, on: Boolean) {
         sp(ctx).edit().putBoolean(KEY_AUTO, on).apply()
@@ -280,7 +308,7 @@ object Updater {
             if (now < noon) return@withContext null
             if (lastCheckAt(ctx) >= noon) return@withContext null
             Log.i(TAG, "更新：每日 12 点检查触发")
-            val c = fetch(apiUrl(ctx), currentVersionName)
+            val c = fetchAuto(ctx, currentVersionName)
             applyCache(ctx, c)
             when (val r = c.result) {
                 is Result.Newer -> {
@@ -314,37 +342,25 @@ object Updater {
         set(java.util.Calendar.MILLISECOND, 0)
     }.timeInMillis
 
-    // ── 下载前校验（缓存里的 assetUrl 可能已经失效）────────────────────────────
+    // ── 下载前探活（只说清原因，不自动重试、不覆盖缓存）────────────────────────
     //
-    // 真机事故：update_info.json 里留着测试源写的 .../AndbnA_1.0.8.apk，点更新直接 404，
-    // 用户只看到「下载失败 HTTP 404」。所以下载前先探活，失效就按 API 重新拿一次
-    // browser_download_url 覆盖缓存，再不行才失败。
+    // 用户要的是「知道到底出了什么事」，重试由用户手动点。所以这里只探活一次 assetUrl：
+    // 按 HTTP 码给出具体原因，**不动缓存、不再重取 API 覆盖**。
+    // 只有 404/410 算「链接失效」（发布时被替换或删除），403 / 5xx / 超时都归网络或权限问题。
 
     /** 下载准备结论：release 非空就能下；为空时 [reason] 是给人看的原因 */
     data class Prep(val release: Release?, val reason: String = "")
 
     /**
-     * 下载前校验（同步，跑在下载线程上）：
+     * 下载前探活（同步，跑在下载线程上）：
      *  ① HEAD 探活 assetUrl（不支持 HEAD 的源退化成 Range: bytes=0-0 的 GET）；
-     *  ② 能用 → 顺手核对 API：缓存 versionCode 与 API 不一致（同 tag 被重发）或 URL 变了，以 API 为准；
-     *  ③ 不能用 → 「缓存 URL 已失效，重新获取」，重新拉一次 API 并覆盖缓存后重试；
-     *  ④ 仍不行 → 返回 null + 「URL 失效且刷新后仍失败（HTTP xxx）」。
+     *  ② 200/206 → 直接给一个可下的 [Release]（缓存原样保留）；
+     *  ③ 其它 → 返回 null + [reasonOf] 那行人话，日志记「下载失败：<原因>｜url=…」。
      */
     fun prepareDownload(ctx: Context, url: String, name: String, size: Long): Prep {
-        val cachedName = readCache(ctx)?.release?.versionName.orEmpty()
         val code = probe(url)
         if (code == 200 || code == 206) {
-            val latest = fetchReleaseQuiet(ctx)
-            if (latest != null) {
-                val cached = versionCodeOf(cachedName)
-                val fresh = versionCodeOf(latest.versionName)
-                if (fresh > cached || (fresh == cached && latest.apkUrl != url)) {
-                    Log.i(TAG, "更新：缓存已过期（" + (cachedName.ifBlank { "未知" }) + " → " +
-                        latest.versionName + "），以 API 为准")
-                    saveCache(ctx, latest)
-                    return Prep(latest)
-                }
-            }
+            val cachedName = readCache(ctx)?.release?.versionName.orEmpty()
             return Prep(
                 Release(
                     tag = "v" + cachedName,
@@ -356,22 +372,27 @@ object Updater {
                 )
             )
         }
-        Log.i(TAG, "更新：缓存 URL 已失效，重新获取")
-        val latest = fetchReleaseQuiet(ctx)
-        if (latest == null) {
-            val reason = "URL 失效且刷新后仍失败（" + httpText(code) + "）"
-            Log.w(TAG, "下载失败：" + reason)
-            return Prep(null, reason)
-        }
-        saveCache(ctx, latest)
-        val fresh = probe(latest.apkUrl)
-        if (fresh == 200 || fresh == 206) return Prep(latest)
-        val reason = "URL 失效且刷新后仍失败（" + httpText(fresh) + "）"
-        Log.w(TAG, "下载失败：" + reason)
+        val reason = reasonOf(code)
+        Log.w(
+            TAG,
+            "下载失败：" + reason + (if (linkDead(code)) "（链接失效）" else "") + "｜url=" + url,
+        )
         return Prep(null, reason)
     }
 
-    private fun httpText(code: Int): String = if (code > 0) "HTTP " + code else "连接失败"
+    /** 只有 404/410 算「链接失效」；403 / 5xx / 连不上都只是网络或权限问题 */
+    fun linkDead(code: Int): Boolean = code == 404 || code == 410
+
+    /** HTTP 码 → 给人看的具体原因（0 或负数 = 连不上 / 超时） */
+    fun reasonOf(code: Int): String = when {
+        code in 200..299 -> "HTTP " + code
+        code == 401 -> "HTTP 401：需要授权"
+        code == 403 -> "HTTP 403：GitHub 拒绝访问，通常是匿名请求被限流，或代理出口 IP 被限流"
+        code == 404 || code == 410 -> "HTTP " + code + "：文件不存在，可能是发布时被替换或删除"
+        code in 500..599 -> "GitHub 服务器错误 HTTP " + code + "，请稍后重试"
+        code <= 0 -> "网络超时或连接中断，请稍后重试"
+        else -> "HTTP " + code + "：无法下载，请稍后重试"
+    }
 
     /** 探活：200/206 = 可以下；0 = 连不上（超时 / DNS / IO） */
     private fun probe(url: String): Int {
@@ -394,31 +415,6 @@ object Updater {
             conn.responseCode
         } catch (e: Throwable) {
             0
-        } finally {
-            runCatching { conn?.disconnect() }
-        }
-    }
-
-    /** 只解析、不判断新旧：给「刷新失效 URL」用；失败只记日志并返回 null */
-    private fun fetchReleaseQuiet(ctx: Context): Release? {
-        var conn: HttpURLConnection? = null
-        return try {
-            conn = (URL(apiUrl(ctx)).openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = TIMEOUT_MS
-                readTimeout = TIMEOUT_MS
-                setRequestProperty("User-Agent", UA)
-                setRequestProperty("Accept", "application/vnd.github+json")
-            }
-            val code = conn.responseCode
-            if (code != 200) {
-                Log.w(TAG, "更新：刷新失败（HTTP " + code + "）")
-                return null
-            }
-            parseRelease(conn.inputStream.bufferedReader().use { it.readText() })
-        } catch (e: Throwable) {
-            Log.w(TAG, "更新：刷新失败（" + (e.message ?: e.javaClass.simpleName) + "）")
-            null
         } finally {
             runCatching { conn?.disconnect() }
         }

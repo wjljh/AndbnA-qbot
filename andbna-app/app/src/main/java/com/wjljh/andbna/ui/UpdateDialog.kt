@@ -23,7 +23,7 @@ import top.yukonga.miuix.kmp.window.WindowDialog
  * （原生，见 [MarkdownText]；body 为空就退化成一行说明）。
  *
  * 三个动作：更新（进前台服务下载）/ 忽略此版本（同一版本不再提示）/ 取消。
- * 更新源地址不在这页出现：默认硬编码官方 GitHub，要换只走隐藏 prefs 键 update_api。
+ * 更新源地址不在这页出现：默认走仓库 docs/latest.json（失败回退 GitHub API），要换只走隐藏 prefs 键 update_api。
  */
 @Composable
 fun UpdateDialog(
