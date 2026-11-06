@@ -256,7 +256,8 @@ private fun GroupEditScreen(
         }
     }
 
-    // 「跟随全局」括号里显示设置页当前那一档（0 = 无上限），下拉文案与设置页同一套叫法
+    // 「跟随全局（…）」括号里那一档**不是写死的 50**：组合期现读 BotStore.dailyLimit
+    // （设置页「每日上限」那份 prefs，0 = 无上限），设置页改成 80 / 无上限，这里跟着变。
     val globalLimit = ctx.dailyLimit
     val limitIndex = if (custom) LIMIT_CUSTOM else limitIndexOf(limit)
     val limitLabels = limitItems(

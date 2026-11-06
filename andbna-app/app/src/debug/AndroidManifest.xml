@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  只作用于 debug 构建（com.wjljh.andbna.debug.qbot）。
+
+  profileable + shell：让 heapprofd / perfetto / simpleperf 能挂到本进程上抓 native 堆。
+  release 清单一个字都不动 —— 线上包不允许被调试器/采样器附加。
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <application>
+        <profileable android:shell="true" />
+    </application>
+</manifest>

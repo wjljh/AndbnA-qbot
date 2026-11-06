@@ -4010,7 +4010,8 @@ def _log_soft(msg):
 # 一个群一份覆盖；**没有这份文件 = 这个群全部走 bot 全局配置**（升级后老用户零变化）。
 # 字段缺项 / null / 0 都是「跟随」，不是 false：
 #   {"auto_reply": true|null,   群里是否自动接话（覆盖该 bot 的覆盖值 / 全局开关）
-#    "daily_limit": 0,          本群每天最多回几条（0 = 不限），计数在 <botdir>/group_quota.json
+#    "daily_limit": null,       本群每天最多回几条：null = 跟随全局（llm.json 的 daily_limit）、
+#                               0 = 本群不限、>0 = 本群额度。计数在 <botdir>/group_quota.json
 #    "web_search": true|null,   false = 本群禁止自判搜索与 #搜 / #读（主人也不行）
 #    "enabled": true}           false = 本群完全静默（回复 / 随机问候 / 定时群发都不发）
 # 群人格（persona / <gid>.persona.txt）已下线：人格恒取 bot 详情页那一份。
@@ -4018,13 +4019,14 @@ def _log_soft(msg):
 
 _GROUP_DEFAULT = {
     "auto_reply": None,
-    "daily_limit": 0,
+    "daily_limit": None,
     "web_search": None,
     "enabled": True,
 }
 
 _group_cache = {}           # (botdir, gid) -> ((mtime_ns, size), conf)
 _group_lock = threading.Lock()
+_daily_cache = {}           # llm.json 路径 -> ((mtime_ns, size), daily_limit)
 
 
 def _groups_dir(botdir):
@@ -4045,6 +4047,33 @@ def _file_stamp(path):
         return (st.st_mtime_ns, st.st_size)
     except OSError:
         return None
+
+
+_DAILY_DEFAULT = 50         # llm.json 没写 daily_limit / 值坏了时的全局默认（0 = 不限）
+
+
+def _global_daily_limit(base_dir=None):
+    """全局每日上限（llm.json 的 daily_limit）：int，0 = 不限，缺项 / 坏值 → 50。
+
+    群配置 daily_limit = null（跟随全局）时读这一档；群消息是每条都过的热路径，
+    所以与 _group_conf 一样按 mtime / size 缓存，文件没变就不重读盘。
+    """
+    path = os.path.join(str(base_dir or _base_dir or ""), "llm.json")
+    stamp = _file_stamp(path)
+    with _group_lock:
+        hit = _daily_cache.get(path)
+        if hit and hit[0] == stamp:
+            return hit[1]
+    raw = _load_json(path, {}) if stamp is not None else {}
+    limit = _DAILY_DEFAULT
+    if isinstance(raw, dict) and "daily_limit" in raw:
+        try:
+            limit = max(0, int(raw.get("daily_limit")))
+        except (TypeError, ValueError):
+            limit = _DAILY_DEFAULT
+    with _group_lock:
+        _daily_cache[path] = (stamp, limit)
+    return limit
 
 
 def _group_conf(botdir, gid):
@@ -4074,10 +4103,14 @@ def _group_conf(botdir, gid):
             elif name == "enabled":
                 conf[name] = v if isinstance(v, bool) else True
             elif name == "daily_limit":
-                try:
-                    conf[name] = max(0, int(v or 0))
-                except (TypeError, ValueError):
-                    conf[name] = 0
+                # 三态：null = 跟随全局（下面群闸门再取 _global_daily_limit）、0 = 不限、>0 = 本群额度
+                if v is None:
+                    conf[name] = None
+                else:
+                    try:
+                        conf[name] = max(0, int(v))
+                    except (TypeError, ValueError):
+                        conf[name] = None
     with _group_lock:
         _group_cache[key] = (stamp, dict(conf))
     return conf
@@ -6063,13 +6096,20 @@ async def _handle_group(appid, botdir, message, tag):
             log("%s（%s）" % (why_rate, brief), appid)
         return
 
-    # 闸 6 · 群级每日额度（groups/<gid>.json daily_limit，0 = 不限）：超了静默
-    limit = int(gc.get("daily_limit") or 0)
+    # 闸 6 · 群级每日额度（groups/<gid>.json daily_limit 三态）：超了静默
+    #   null / 缺项 = 跟随全局（llm.json 的 daily_limit）；0 = 本群不限；>0 = 本群额度
+    raw_limit = gc.get("daily_limit")
+    if raw_limit is None:
+        limit = _global_daily_limit(botdir)
+        limit_src = "跟随全局"
+    else:
+        limit = max(0, int(raw_limit))
+        limit_src = "本群"
     if limit > 0:
         ok_quota, used = _group_quota_take(botdir, gid, limit)
         if not ok_quota:
-            log("跳过：该群今日已回 %d 条，达到上限 %d 条 → 今日不再回复"
-                "（groups/%s.json daily_limit）｜%s" % (used, limit, _oid8(gid), brief), appid)
+            log("跳过：该群今日已回 %d 条，达到上限 %d 条（来源：%s）→ 今日不再回复｜%s"
+                % (used, limit, limit_src, brief), appid)
             return
 
     log("%s：%s" % (tag, text[:60]), appid)

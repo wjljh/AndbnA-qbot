@@ -11,6 +11,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "app", "src", "main", "python"))
@@ -72,7 +73,12 @@ def reset(autochat=False, base_dir=""):
     br._mute.clear()
     br._state["log"][:] = []
     br._group_cache.clear()
+    br._daily_cache.clear()
     br._autochat_override.clear()
+    try:                              # 当日计数：上一个用例用掉的额度不带进下一个
+        os.remove(os.path.join(BOTDIR, "group_quota.json"))
+    except OSError:
+        pass
     del SEARCHES[:]
     br._base_dir = base_dir
     br.set_group_autochat(autochat)
@@ -85,7 +91,7 @@ def logs():
 
 def write_group(gid, **kw):
     """写一份群配置；没给的字段按「跟随全局」的默认值落盘（和界面写出来的形状一致）。"""
-    conf = {"auto_reply": None, "daily_limit": 0,
+    conf = {"auto_reply": None, "daily_limit": None,
             "web_search": None, "enabled": True}
     conf.update(kw)
     d = os.path.join(BOTDIR, "groups")
@@ -94,6 +100,13 @@ def write_group(gid, **kw):
         json.dump(conf, f, ensure_ascii=False, indent=1)
     br._group_cache.clear()
     return conf
+
+
+def write_llm(daily_limit):
+    """写全局每日上限（llm.json 的 daily_limit，0 = 无上限）：群配置 null 时读这一档。"""
+    with open(os.path.join(BOTDIR, "llm.json"), "w", encoding="utf-8") as f:
+        json.dump({"daily_limit": daily_limit}, f, ensure_ascii=False)
+    return daily_limit
 
 
 def drop_group(gid):
@@ -294,13 +307,19 @@ def main():
         f.write("{ 这不是 json")
     br._group_cache.clear()
     conf = br._group_conf(BOTDIR, GA)
-    check("9 坏 JSON → 全部跟随全局（不抛异常）",
-          conf["auto_reply"] is None and conf["enabled"] is True and conf["daily_limit"] == 0,
-          str(conf))
+    check("9 坏 JSON → 全部跟随全局（不抛异常，daily_limit 为 null = 跟随全局）",
+          conf["auto_reply"] is None and conf["enabled"] is True and
+          conf["daily_limit"] is None, str(conf))
     write_group(GA, auto_reply="yes", daily_limit=-3)
     conf = br._group_conf(BOTDIR, GA)
-    check("9b 脏值归一：auto_reply 非 bool → None，daily_limit 负数 → 0",
+    check("9b 脏值归一：auto_reply 非 bool → None，daily_limit 负数 → 0（本群不限）",
           conf["auto_reply"] is None and conf["daily_limit"] == 0, str(conf))
+    with open(bad, "w", encoding="utf-8") as f:
+        json.dump({"auto_reply": None, "web_search": None, "enabled": True}, f)
+    br._group_cache.clear()
+    check("9c daily_limit 字段缺失 → null（跟随全局）",
+          br._group_conf(BOTDIR, GA)["daily_limit"] is None,
+          str(br._group_conf(BOTDIR, GA)))
 
     # ── 10) 界面写的形状（org.json JSONObject.toString(1)）Python 读得一样 ──
     reset(autochat=False)
@@ -315,6 +334,76 @@ def main():
           conf["auto_reply"] is None and conf["web_search"] is False and
           conf["daily_limit"] == 2 and conf["enabled"] is True and "persona" not in conf,
           str(conf))
+
+    # ── 12) 每日额度三态：null = 跟随全局 / 0 = 本群不限 / >0 = 本群额度 ──
+    # 12a null → 用全局值（全局 2 → 第 3 条被拒）
+    reset(autochat=False)
+    write_llm(2)
+    write_group(GA, daily_limit=None)
+    for i in range(3):
+        run(at(GA, "g%d" % i, "第%d条" % (i + 1)))
+    check("12 daily_limit=null → 跟随全局（全局 2 → 只回 2 条，第 3 条静默）",
+          len(API.sent) == 2, "posts=%d logs=%s" % (len(API.sent),
+                                                    [x for x in logs() if "上限" in x][:1]))
+    check("12b 日志写明来源：跟随全局",
+          any("达到上限 2 条（来源：跟随全局）" in x for x in logs()),
+          str([x for x in logs() if "上限" in x][:1]))
+
+    # 12c 全局 0 = 无上限 → 跟随全局的群也不限
+    reset(autochat=False)
+    write_llm(0)
+    write_group(GA, daily_limit=None)
+    for i in range(3):
+        run(at(GA, "g%d" % (i + 10), "第%d条" % (i + 1)))
+    check("12c 全局 daily_limit=0 → 跟随全局也不限（回 3 条、无上限日志）",
+          len(API.sent) == 3 and not any("上限" in x for x in logs()),
+          "posts=%d logs=%s" % (len(API.sent), [x for x in logs() if "上限" in x][:1]))
+
+    # 12d 本群 0 = 本群不限，全局再怎么限也不影响这个群
+    reset(autochat=False)
+    write_llm(1)
+    write_group(GA, daily_limit=0)
+    for i in range(3):
+        run(at(GA, "g%d" % (i + 20), "第%d条" % (i + 1)))
+    check("12d 本群 daily_limit=0 → 本群不限（全局 1 也不影响）", len(API.sent) == 3,
+          "posts=%d" % len(API.sent))
+
+    # 12e 本群 >0 覆盖全局
+    reset(autochat=False)
+    write_llm(50)
+    write_group(GA, daily_limit=1)
+    for i in range(2):
+        run(at(GA, "g%d" % (i + 30), "第%d条" % (i + 1)))
+    check("12e 本群 daily_limit=1 → 该群只回 1 条（本群值覆盖全局）", len(API.sent) == 1,
+          "posts=%d logs=%s" % (len(API.sent), [x for x in logs() if "上限" in x][:1]))
+    check("12f 日志写明来源：本群",
+          any("达到上限 1 条（来源：本群）" in x for x in logs()),
+          str([x for x in logs() if "上限" in x][:1]))
+
+    # 12g 全局额度读盘缓存：同一 mtime 不重读，改文件后立刻生效
+    reset(autochat=False)
+    write_llm(3)
+    br._global_daily_limit(BOTDIR)                  # 先读一次进缓存
+    calls = {"n": 0}
+    real_load = br._load_json
+
+    def counting_load(path, default):
+        calls["n"] += 1
+        return real_load(path, default)
+
+    br._load_json = counting_load
+    try:
+        br._global_daily_limit(BOTDIR)
+        cached_calls = calls["n"]
+        time.sleep(0.02)          # 这台机器文件系统 mtime 只有 10ms 刻度，等一下才有新 stamp
+        write_llm(7)                                # mtime 变 → 缓存失效
+        later = br._global_daily_limit(BOTDIR)
+        after_calls = calls["n"]
+    finally:
+        br._load_json = real_load
+    check("12g 全局额度缓存：同一 mtime 不重读盘 / 改了文件立刻生效",
+          cached_calls == 0 and after_calls == 1 and later == 7,
+          "cached=%d after=%d limit=%s" % (cached_calls, after_calls, later))
 
     # ── 11) 三层优先：群配置 > 该 bot 覆盖 > 全局 ─────────────────────
     drop_group(GB)                                # 用例 1 给 GB 写过 auto_reply=true，这里先清掉
