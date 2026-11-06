@@ -12,6 +12,7 @@ import androidx.core.app.NotificationCompat
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
+import com.wjljh.andbna.BuildConfig
 import com.wjljh.andbna.MainActivity
 import com.wjljh.andbna.local.BotStore.chatProb
 import com.wjljh.andbna.local.BotStore.groupAutochat
@@ -25,6 +26,14 @@ import com.wjljh.andbna.local.BotStore.llmSummaryModel
 import com.wjljh.andbna.local.BotStore.llmVisionModel
 import com.wjljh.andbna.local.BotStore.replyJudge
 import java.io.File
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.cancel
 
 /**
  * 纯 APK 模式的托管入口：把「所有启用的 bot」一起跑起来。
@@ -45,6 +54,34 @@ class BotService : Service() {
         com.wjljh.andbna.ui.Prefs.put(this, "svc_started_at", System.currentTimeMillis().toString())
         // 前台服务起来就保证「自动拉回」的监督在跑（ADB/root 满足条件时无需用户点任何开关）
         PullBack.supervise(this)
+        // 每天中午 12:00 的那次更新检查：前台服务本来就在跑，一个 10 分钟醒一次的轻循环即可
+        startDailyUpdateLoop()
+    }
+
+    /** 每日 12 点检查的协程作用域 / 任务（服务销毁时一起取消） */
+    private val dailyScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var dailyJob: Job? = null
+
+    /**
+     * 轻量循环：不引入 WorkManager（前台服务常驻，系统调度器那套反而多一层不可控）。
+     * 每 [DAILY_TICK_MS] 醒一次问 [Updater.dailyCheckIfDue]：过了今天 12:00 且上次检查早于 12:00 才联网。
+     */
+    private fun startDailyUpdateLoop() {
+        if (dailyJob?.isActive == true) return
+        dailyJob = dailyScope.launch {
+            while (isActive) {
+                try {
+                    val found = Updater.dailyCheckIfDue(this@BotService, BuildConfig.VERSION_NAME)
+                    if (found != null) {
+                        // 进程里有人开着状态页就顺手出卡，不然下次开页也有缓存可读
+                        runCatching { com.wjljh.andbna.ui.UpdateRuntime.found(found) }
+                    }
+                } catch (e: Throwable) {
+                    Log.w(TAG, "更新：每日检查异常（" + (e.message ?: e.javaClass.simpleName) + "）")
+                }
+                delay(DAILY_TICK_MS)
+            }
+        }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -89,6 +126,8 @@ class BotService : Service() {
 
     override fun onDestroy() {
         alive = false
+        runCatching { dailyJob?.cancel() }
+        runCatching { dailyScope.cancel() }
         BotHost.stopAll()
         // 顺手把 Shizuku 的 UserService 解绑：只靠 binder 断开去回收并不可靠（实测 Shizuku 13.7
         // 在客户端进程消失后会把 `<包名>:shell` 的 app_process 留成 PPID=1 的孤儿），
@@ -124,6 +163,9 @@ class BotService : Service() {
         const val ACTION_START = "com.wjljh.andbna.START_LOCAL"
         const val ACTION_STOP = "com.wjljh.andbna.STOP_LOCAL"
         const val ACTION_REFRESH = "com.wjljh.andbna.REFRESH_NOTIF"
+
+        /** 每日 12 点检查的醒来自：10 分钟（起服务先查一次，之后每 10 分钟一轮） */
+        private const val DAILY_TICK_MS = 10L * 60L * 1000L
 
         fun start(context: Context) {
             val i = Intent(context, BotService::class.java).apply { action = ACTION_START }

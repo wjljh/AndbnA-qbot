@@ -132,7 +132,7 @@ private fun LocalStatusContent(
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
 
-    // 自动检查更新：一个进程最多查一次（真正的 24 小时节流在 Updater.autoCheck 里），
+    // 自动检查更新：一个进程最多查一次（真正的节流在 Updater.autoCheck 里：最短 30 分钟），
     // 开关关着就一次网络请求都不发。查到新版本 → hero 下面出一张提示卡。
     LaunchedEffect(Unit) {
         UpdateRuntime.triggerOnce(ctx, BuildConfig.VERSION_NAME)

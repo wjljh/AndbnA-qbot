@@ -31,9 +31,16 @@ object RunNotification {
     const val CHANNEL_ON = "andbna_local_bot"
     const val CHANNEL_ON_NAME = "AndbnA 本机 Bot"
 
-    /** 早前版本遗留的「不显示」渠道前缀，启动时清一次 */
-    private const val LEGACY_OFF_PREFIX = "andbna_local_bot_off_"
-    private const val LEGACY_HIDDEN_PREFIX = "andbna_local_bot_hidden"
+    /**
+     * 只留这两条渠道，其余一律删（每次启动都做，幂等）。
+     *
+     * 实测（dumpsys notification）：本包历史上堆了 30+ 条渠道 —— andbna_local_bot_hidden_1..9、
+     * andbna_local_bot_off_1..17、andbna_local_bot_v2 …，一次性的「删已知区间」根本清不干净。
+     * 改成枚举全部渠道、白名单外全删：不依赖任何落盘标记，新出现的脏渠道下次启动就没了。
+     */
+    private val KEEP_IDS = setOf(CHANNEL_ON, UpdateDownloadService.CHANNEL)
+
+    /** 旧版落盘标记：不再依赖，只在清理时顺手归零，免得老数据吓人 */
     private const val KEY_OFF_SEQ = "notif_off_seq"
     private const val KEY_LEGACY_CLEANED = "notif_legacy_cleaned"
 
@@ -53,10 +60,12 @@ object RunNotification {
         BotService.refreshNotification(ctx)
     }
 
-    /** 渠道管理入口：「开」渠道补齐 + 清掉旧版本遗留的「不显示」渠道 */
+    /** 渠道管理入口：先补齐白名单那两条，再把白名单以外的全部删掉 */
     fun ensureChannels(ctx: Context) {
         ensureOnChannel(ctx)
-        dropLegacyOffChannels(ctx)
+        // 更新下载渠道也归这里建：白名单里有它，先建好才不会「刚建就被删」
+        runCatching { UpdateDownloadService.ensureChannel(ctx) }
+        sweepChannels(ctx)
     }
 
     /** 「开」用的渠道：IMPORTANCE_LOW，只建一次 */
@@ -74,23 +83,31 @@ object RunNotification {
     }
 
     /**
-     * 一次性清掉试制期间建过的一批「不显示」渠道（现在不用了，留着只会脏系统设置里的通知列表）。
-     * 用标记位保证只跑一次；删不掉的（已被系统回收成墓碑）忽略即可。
+     * 白名单之外全删：枚举本包现存渠道（API 26+），不猜 id、不看标记位，每次启动跑一遍。
+     * 渠道组一并清（组本身也会出现在设置页里）；删不掉的（系统墓碑）忽略即可。
      */
-    private fun dropLegacyOffChannels(ctx: Context) {
+    private fun sweepChannels(ctx: Context) {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
-        val prefs = sp(ctx)
-        if (prefs.getBoolean(KEY_LEGACY_CLEANED, false)) return
         val mgr = manager(ctx)
-        val seq = prefs.getInt(KEY_OFF_SEQ, 0)
-        val ids = buildList {
-            add(LEGACY_HIDDEN_PREFIX)
-            (1..24).forEach { add(LEGACY_HIDDEN_PREFIX + "_" + it) }
-            (1..seq).forEach { add(LEGACY_OFF_PREFIX + it) }
+        val removed = ArrayList<String>()
+        runCatching { mgr.notificationChannels }.getOrNull().orEmpty().forEach { ch ->
+            val id = ch.id ?: return@forEach
+            if (id in KEEP_IDS) return@forEach
+            runCatching { mgr.deleteNotificationChannel(id) }
+                .onSuccess { removed.add(id) }
+                .onFailure { Log.w(TAG, "通知渠道清理：删不掉 " + id + "（" + it.message + "）") }
         }
-        ids.forEach { runCatching { mgr.deleteNotificationChannel(it) } }
-        prefs.edit().putInt(KEY_OFF_SEQ, 0).putBoolean(KEY_LEGACY_CLEANED, true).apply()
-        Log.i(TAG, "运行通知：清理旧渠道 " + ids.size + " 条")
+        runCatching { mgr.notificationChannelGroups }.getOrNull().orEmpty().forEach { g ->
+            val id = g.id ?: return@forEach
+            if (id in KEEP_IDS) return@forEach
+            runCatching { mgr.deleteNotificationChannelGroup(id) }
+        }
+        if (removed.isNotEmpty()) {
+            Log.i(TAG, "通知渠道清理：删除 " + removed.size + " 个历史渠道（" +
+                removed.joinToString(", ") + "）")
+            // 老标记位归零：逻辑已不依赖它们，留着只会让下次读代码的人以为还有一次性清理
+            sp(ctx).edit().putInt(KEY_OFF_SEQ, 0).putBoolean(KEY_LEGACY_CLEANED, true).apply()
+        }
     }
 
     fun cancel(ctx: Context) {

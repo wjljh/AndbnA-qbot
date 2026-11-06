@@ -24,6 +24,8 @@ import androidx.compose.foundation.clickable
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -75,9 +77,14 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
         info = withContext(Dispatchers.IO) { readAbout(ctx) }
     }
 
-    // 自动检查更新：开关落盘（默认关）。打开后启动时最多每 24 小时查一次，
-    // 发现新版本在状态页 hero 下面出一张提示卡 —— 关于页这里不再有手动检查入口。
+    // 自动检查更新：开关落盘（默认关）。打开后启动时最短 30 分钟才查一次，
+    // 发现新版本在状态页 hero 下面出一张提示卡；「立即检查」在下一行（无视 30 分钟节流）。
     var autoCheck by remember { mutableStateOf(Updater.autoEnabled(ctx)) }
+
+    // 「立即检查」：无视 30 分钟节流（Updater.checkNow 仍写 last_check_at），结论写在这一行的小字里
+    var checkNote by remember { mutableStateOf("") }
+    var checking by remember { mutableStateOf(false) }
+    val scope = rememberCoroutineScope()
 
     BackHandler { onBack() }
 
@@ -126,6 +133,34 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
                                 autoCheck = it
                                 Updater.setAutoEnabled(ctx, it)
                             })
+                        },
+                    )
+                }
+
+                // ②-2 立即检查：一行小字动作，忽略 30 分钟节流；查到的结论就地显示，
+                // 并立刻接管状态页那张提示卡（UpdateRuntime），不用回去重进
+                SectionCard(metrics) {
+                    SuperRow(
+                        icon = Icons.Filled.Refresh,
+                        title = "立即检查",
+                        subtitle = checkNote.ifBlank { "忽略 30 分钟节流，马上查一次更新" },
+                        onClick = {
+                            if (!checking) {
+                                checking = true
+                                checkNote = "检查中…"
+                                scope.launch {
+                                    val c = Updater.checkNow(ctx, BuildConfig.VERSION_NAME)
+                                    checkNote = when (val r = c.result) {
+                                        is Updater.Result.Newer -> {
+                                            UpdateRuntime.found(r.release)
+                                            c.note
+                                        }
+                                        Updater.Result.Latest -> c.note
+                                        Updater.Result.Failed -> "检查失败（" + c.note + "）"
+                                    }
+                                    checking = false
+                                }
+                            }
                         },
                     )
                 }

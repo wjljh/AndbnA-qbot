@@ -44,7 +44,8 @@ class UpdateDownloadService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        val first = notification(this, name, 0L, 0L, 0)
+        // 立刻挂上「更新下载」通知（进程还没开始动 IO，这里就是用户点更新后第一眼看到的那条）
+        val first = preparing(this, name)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
             startForeground(ID_PROGRESS, first, ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC)
         } else {
@@ -58,63 +59,78 @@ class UpdateDownloadService : Service() {
         val dir = dir(this)
         // 旧包先清掉：cacheDir/update 只放「这一次的更新包」，多个残留只会占地方
         runCatching { dir.listFiles()?.filter { it.name.endsWith(".part") }?.forEach { it.delete() } }
-        val target = File(dir, name)
-        val part = File(dir, name + ".part")
-        var conn: HttpURLConnection? = null
-        try {
-            conn = (URL(url).openConnection() as HttpURLConnection).apply {
-                requestMethod = "GET"
-                connectTimeout = 15_000
-                readTimeout = 15_000
-                setRequestProperty("User-Agent", "AndbnA-Updater/1.0 (Android)")
-                instanceFollowRedirects = true
-            }
-            val code = conn.responseCode
-            if (code != 200) throw java.io.IOException("HTTP " + code)
-            val total = if (conn.contentLengthLong > 0) conn.contentLengthLong else hint
-            if (part.exists()) part.delete()
-            var done = 0L
-            var lastPct = -1
-            conn.inputStream.use { input ->
-                FileOutputStream(part).use { out ->
-                    val buf = ByteArray(16 * 1024)
-                    while (true) {
-                        val n = input.read(buf)
-                        if (n <= 0) break
-                        out.write(buf, 0, n)
-                        done += n
-                        if (total > 0) {
-                            val pct = ((done * 100L) / total).toInt().coerceIn(0, 100)
-                            if (pct != lastPct) {
-                                lastPct = pct
-                                notifyProgress(name, done, total, pct)
+        var done: File? = null
+        var failure: String? = null
+        // ① 下载前校验：缓存里的 assetUrl 可能已失效（真机 404 事故），失效就按 API 重取一次
+        val prep = Updater.prepareDownload(this, url, name, hint)
+        val rel = prep.release
+        if (rel == null) {
+            failure = prep.reason
+        } else {
+            val target = File(dir, rel.apkName.ifBlank { name })
+            val tmp = File(dir, target.name + ".part")
+            var conn: HttpURLConnection? = null
+            try {
+                conn = (URL(rel.apkUrl).openConnection() as HttpURLConnection).apply {
+                    requestMethod = "GET"
+                    connectTimeout = 15_000
+                    readTimeout = 15_000
+                    setRequestProperty("User-Agent", "AndbnA-Updater/1.0 (Android)")
+                    instanceFollowRedirects = true
+                }
+                val code = conn.responseCode
+                if (code != 200) throw java.io.IOException("HTTP " + code)
+                val total = if (conn.contentLengthLong > 0) conn.contentLengthLong else rel.size.takeIf { it > 0 } ?: hint
+                if (tmp.exists()) tmp.delete()
+                var got = 0L
+                var lastPct = -1
+                conn.inputStream.use { input ->
+                    FileOutputStream(tmp).use { out ->
+                        val buf = ByteArray(16 * 1024)
+                        while (true) {
+                            val n = input.read(buf)
+                            if (n <= 0) break
+                            out.write(buf, 0, n)
+                            got += n
+                            if (total > 0) {
+                                val pct = ((got * 100L) / total).toInt().coerceIn(0, 100)
+                                if (pct != lastPct) {
+                                    lastPct = pct
+                                    notifyProgress(target.name, got, total, pct)
+                                }
                             }
                         }
+                        out.flush()
                     }
-                    out.flush()
                 }
+                if (target.exists()) target.delete()
+                if (!tmp.renameTo(target)) throw java.io.IOException("写入失败：改不了文件名")
+                if (total > 0 && target.length() != total) {
+                    throw java.io.IOException("大小不符：" + target.length() + " ≠ " + total)
+                }
+                Log.i(TAG, "更新：下载完成（" + target.absolutePath + "，" + target.length() + " 字节）")
+                done = target
+            } catch (e: Throwable) {
+                runCatching { tmp.delete() }
+                failure = e.message ?: e.javaClass.simpleName
+                Log.w(TAG, "更新：下载失败（" + failure + "）")
+            } finally {
+                runCatching { conn?.disconnect() }
             }
-            if (target.exists()) target.delete()
-            if (!part.renameTo(target)) throw java.io.IOException("写入失败：改不了文件名")
-            if (total > 0 && target.length() != total) {
-                throw java.io.IOException("大小不符：" + target.length() + " ≠ " + total)
-            }
-            Log.i(TAG, "更新：下载完成（" + target.absolutePath + "，" + target.length() + " 字节）")
-            notifyCompleted(target)
-        } catch (e: Throwable) {
-            runCatching { part.delete() }
-            val reason = e.message ?: e.javaClass.simpleName
-            Log.w(TAG, "更新：下载失败（" + reason + "）")
-            notifyFailed(name, reason)
-        } finally {
-            runCatching { conn?.disconnect() }
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-            } else {
-                @Suppress("DEPRECATION")
-                stopForeground(true)
-            }
-            stopSelf()
+        }
+        // ② 先退出前台（REMOVE 会带走前台那条通知），再把结果写回同一条「更新下载」通知
+        stopForegroundCompat()
+        val apk = done
+        if (apk != null) notifyCompleted(apk) else notifyFailed(name, failure ?: "未知错误")
+        stopSelf()
+    }
+
+    private fun stopForegroundCompat() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.N) {
+            stopForeground(STOP_FOREGROUND_REMOVE)
+        } else {
+            @Suppress("DEPRECATION")
+            stopForeground(true)
         }
     }
 
@@ -145,10 +161,12 @@ class UpdateDownloadService : Service() {
         runCatching { manager(this).cancel(ID_PROGRESS) }
     }
 
+    /** 失败就地改写「更新下载」那条通知（同 id），用户看到的是同一条通知变成「下载失败」 */
     private fun notifyFailed(name: String, reason: String) {
         val n = NotificationCompat.Builder(this, CHANNEL)
-            .setContentTitle("下载失败")
-            .setContentText(name + "：" + reason)
+            .setContentTitle("更新下载")
+            .setContentText("下载失败：" + name + "（" + reason + "）")
+            .setStyle(NotificationCompat.BigTextStyle().bigText("下载失败：" + name + "（" + reason + "）"))
             .setSmallIcon(android.R.drawable.stat_notify_error)
             .setAutoCancel(true)
             .setContentIntent(
@@ -158,8 +176,7 @@ class UpdateDownloadService : Service() {
                 )
             )
             .build()
-        runCatching { manager(this).notify(ID_DONE, n) }
-        runCatching { manager(this).cancel(ID_PROGRESS) }
+        runCatching { manager(this).notify(ID_PROGRESS, n) }
     }
 
     companion object {
@@ -180,7 +197,13 @@ class UpdateDownloadService : Service() {
         /** 下载落地目录：cacheDir/update（FileProvider 只暴露这一层） */
         fun dir(ctx: Context): File = File(ctx.cacheDir, "update").apply { mkdirs() }
 
+        /**
+         * 点「更新」立刻调：先在通知栏同步挂一条「正在准备下载…」，
+         * 再起前台服务接手（服务内会原地换成进度，失败也改这一条）。
+         */
         fun start(ctx: Context, url: String, name: String, size: Long) {
+            runCatching { manager(ctx).notify(ID_PROGRESS, preparing(ctx, name)) }
+                .onFailure { Log.w(TAG, "更新：准备通知失败（" + it.message + "）") }
             val i = Intent(ctx, UpdateDownloadService::class.java).apply {
                 action = ACTION_DOWNLOAD
                 putExtra(EXTRA_URL, url)
@@ -217,9 +240,30 @@ class UpdateDownloadService : Service() {
             "正在下载 " + mb(done) + " MB"
         }
 
+        private fun preparing(ctx: Context, name: String) =
+            NotificationCompat.Builder(ctx, CHANNEL)
+                .setContentTitle("更新下载")
+                .setContentText("正在准备下载…")
+                .setStyle(
+                    NotificationCompat.BigTextStyle()
+                        .bigText("正在准备下载…（" + name + "）")
+                )
+                .setSmallIcon(android.R.drawable.stat_sys_download)
+                .setProgress(0, 0, true)
+                .setOngoing(true)
+                .setSilent(true)
+                .setContentIntent(
+                    PendingIntent.getActivity(
+                        ctx, ID_PROGRESS, Intent(ctx, MainActivity::class.java),
+                        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+                    )
+                )
+                .build()
+
+        /** 进度 / 准备中都用这一条：标题固定「更新下载」，正文写百分比 */
         private fun notification(ctx: Context, name: String, done: Long, total: Long, pct: Int) =
             NotificationCompat.Builder(ctx, CHANNEL)
-                .setContentTitle("更新包 " + name)
+                .setContentTitle("更新下载")
                 .setContentText(progressText(done, total, pct))
                 .setSmallIcon(android.R.drawable.stat_sys_download)
                 .setProgress(100, pct, total <= 0L)

@@ -28,3 +28,7 @@ CHANGELOG.md
 # Python 字节码
 __pycache__/
 *.pyc
+
+# Kotlin 构建缓存
+andbna-app/.kotlin/
+1.jpg
