@@ -90,6 +90,23 @@ class BotService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
+        // 「停止全部」的标记还在、又不是用户自己点的启动（没有 EXTRA_USER_START）：
+        // 这条拉起来自系统（START_STICKY 粘性重启 / 开机广播 / 外部 am / 看门狗跳板），
+        // 尊重用户的停止意图 —— 不上线，并且别留「服务退了但 Python 里还连着」的半死状态。
+        val userStart = intent?.getBooleanExtra(EXTRA_USER_START, false) == true
+        if (PullBack.isUserStopped(this) && !userStart) {
+            val why = if (intent == null) "系统重启" else "系统重启/粘性重启"
+            BotHost.logNote("跳过启动：用户已停止全部（来源=" + why + "）")
+            Log.i(TAG, "跳过启动：用户已停止全部（来源=" + why + "）")
+            // 幂等：真停一遍 python（关 http / 停 loop / 提升 generation），不留半死连接
+            BotHost.stopAll()
+            stopSelf()
+            return START_NOT_STICKY
+        }
+        if (userStart) {
+            BotHost.logNote("启动：用户手动启动（已清停顿标记）")
+            Log.i(TAG, "启动：用户手动启动（已清停顿标记）")
+        }
         // ACTION_REFRESH 只重挂通知（设置页刚切换了开关），不重启 bot
         if (intent?.action != ACTION_REFRESH) BotHost.startAll(this)
         // 通知内容就写「运行中」，不要把逐条启动结果塞进通知栏
@@ -167,8 +184,14 @@ class BotService : Service() {
         /** 每日 12 点检查的醒来自：10 分钟（起服务先查一次，之后每 10 分钟一轮） */
         private const val DAILY_TICK_MS = 10L * 60L * 1000L
 
-        fun start(context: Context) {
-            val i = Intent(context, BotService::class.java).apply { action = ACTION_START }
+        /** start() 的来源标记：只有用户自己点「启动」才带，onStartCommand 见它才放行 */
+        const val EXTRA_USER_START = "com.wjljh.andbna.USER_START"
+
+        fun start(context: Context, userStart: Boolean = false) {
+            val i = Intent(context, BotService::class.java).apply {
+                action = ACTION_START
+                if (userStart) putExtra(EXTRA_USER_START, true)
+            }
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                 context.startForegroundService(i)
             } else {
@@ -196,6 +219,46 @@ class BotService : Service() {
         fun stop(context: Context) {
             BotHost.stopAll()
             context.stopService(Intent(context, BotService::class.java))
+        }
+
+        /**
+         * 用户**手动**点「停止」（状态页 / Hero 详情 / 控制条 / Bot 页的「停止全部」）。
+         *
+         * 顺序就是这件事的全部：**先写停顿标记，再停服务**。
+         * 标记写两处（见 [PullBack.setUserStopped]）：App 私有 prefs 的 user_stopped
+         * 与外部 `autopull.pause`（shell / root 读不到 prefs，只认这个文件）。
+         * 反过来先停服务的话，stopService 之后到标记落盘之前那一小段里，看门狗（60s 一轮）
+         * 会看见「App 没了」把活动拉回来 → start_all() → bot 全部重新上线，
+         * 用户看到的就是「提示已停止，但 bot 还在跑」。
+         *
+         * 看门狗自己触发的停止（模式切换 / 通道断开 / 达上限 / 设置里关了自动拉回）
+         * **不要**走这里 —— 那些场景要允许它之后继续拉回。
+         */
+        fun stopByUser(context: Context) {
+            PullBack.setUserStopped(context, true)
+            BotHost.logNote("手动停止：已写停顿标记（看门狗不再拉回）")
+            Log.i(TAG, "手动停止：已写停顿标记（看门狗不再拉回）")
+            stop(context)
+        }
+
+        /** 用户**手动**点「启动」：先清停顿标记（看门狗重新上岗），再拉服务 */
+        fun startByUser(context: Context) {
+            clearUserStopped(context)
+            // 带 EXTRA_USER_START：即使标记因竞态还在，onStartCommand 也认这是用户的意图
+            start(context, userStart = true)
+        }
+
+        /**
+         * 清「停止全部」的停顿标记 + 留痕。
+         *
+         * 单独一个出口是因为 Bot 页的「启动全部」只重启 python 里的 bot、不拉服务，
+         * 但同样必须先让看门狗重新上岗（不清标记的话 start() 一次都不 spawn，
+         * 卡片会永远停在「已暂停（用户停止全部）」）。
+         */
+        fun clearUserStopped(context: Context) {
+            PullBack.setUserStopped(context, false)
+            BotHost.logNote("手动启动：已清停顿标记")
+            Log.i(TAG, "手动启动：已清停顿标记")
         }
     }
 }

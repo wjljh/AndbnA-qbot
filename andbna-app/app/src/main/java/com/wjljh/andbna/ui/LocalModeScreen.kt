@@ -43,6 +43,7 @@ import com.wjljh.andbna.local.BotHost
 import com.wjljh.andbna.local.BotService
 import com.wjljh.andbna.local.BotStore
 import com.wjljh.andbna.local.ModeStore
+import com.wjljh.andbna.local.PullBack
 import com.wjljh.andbna.local.RootHost
 import com.wjljh.andbna.local.RunMode
 import com.wjljh.andbna.local.ShizukuAuth
@@ -97,7 +98,8 @@ fun LocalStatusContent(metrics: Metrics, onOpenDetail: () -> Unit = {}) {
         val hasEnabled = BotStore.load(ctx).any {
             it.enabled && it.appid.isNotBlank() && it.secret.isNotBlank()
         }
-        if (hasEnabled && !BotHost.isRunning()) {
+        // 用户点过「停止」就别自动拉起（这个默认开启只服务「没停过」的情形）
+        if (hasEnabled && !BotHost.isRunning() && !PullBack.isUserStopped(ctx)) {
             BotHost.init(ctx)
             BotService.start(ctx)
         }
@@ -160,7 +162,7 @@ fun LocalStatusContent(metrics: Metrics, onOpenDetail: () -> Unit = {}) {
                                 askNotif.launch(Manifest.permission.POST_NOTIFICATIONS)
                             }
                             BotHost.init(ctx)
-                            BotService.start(ctx)
+                            BotService.startByUser(ctx)
                             msgOk = true
                             msg = "已拉起前台服务（$botCount 个 bot）"
                             scope.launch {
@@ -171,7 +173,8 @@ fun LocalStatusContent(metrics: Metrics, onOpenDetail: () -> Unit = {}) {
                         }
                     }
                     ActionChip("停止") {
-                        BotService.stop(ctx)
+                        // 先写停顿标记再停服务：反过来的话看门狗会在中间那一小段把 App 拉回来
+                        BotService.stopByUser(ctx)
                         BotHost.stopAll()
                         msgOk = true
                         msg = "已请求停止"

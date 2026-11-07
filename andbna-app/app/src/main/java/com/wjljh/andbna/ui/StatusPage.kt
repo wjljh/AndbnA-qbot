@@ -202,7 +202,8 @@ private fun LocalStatusContent(
         val list = withContext(Dispatchers.IO) { BotStore.load(ctx) }
         botCount = list.count { it.enabled }
         val hasEnabled = list.any { it.enabled && it.appid.isNotBlank() && it.secret.isNotBlank() }
-        if (hasEnabled && !BotHost.isRunning()) {
+        // 用户点过「停止」就别自动拉起：这个默认开启只服务「没停过」的情形
+        if (hasEnabled && !BotHost.isRunning() && !PullBack.isUserStopped(ctx)) {
             BotHost.init(ctx)
             BotService.start(ctx)
             // 自动拉起时也给即时反馈，别让用户以为没启动
@@ -388,9 +389,8 @@ private fun LocalStatusContent(
                                     askNotif.launch(Manifest.permission.POST_NOTIFICATIONS)
                                 }
                                 BotHost.init(ctx)
-                                BotService.start(ctx)
-                                // 用户想跑：清掉「停止全部」的停顿标记，让自动拉回重新上岗
-                                PullBack.setUserStopped(ctx, false)
+                                // 用户想跑：清掉「停止全部」的停顿标记（看门狗重新上岗），再拉服务
+                                BotService.startByUser(ctx)
                                 msgOk = true
                                 msg = "已拉起前台服务（" + botCount + " 个 bot）"
                                 pending = "启动中"
@@ -409,10 +409,9 @@ private fun LocalStatusContent(
                     PanelSecondaryButton(
                         text = "停止",
                         onClick = {
-                            BotService.stop(ctx)
+                            // 先写停顿标记再停服务：反过来的话看门狗会在中间那一小段把 App 拉回来
+                            BotService.stopByUser(ctx)
                             BotHost.stopAll()
-                            // 用户主动停：写停顿标记，自动拉回不能把用户刚停掉的 App 又拉起来
-                            PullBack.setUserStopped(ctx, true)
                             msgOk = true
                             msg = "已请求停止"
                         },

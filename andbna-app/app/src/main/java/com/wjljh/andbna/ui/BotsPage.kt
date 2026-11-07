@@ -271,7 +271,7 @@ fun BotsPage(
                                             modifier = Modifier.weight(1f),
                                             onClick = {
                                                 // 用户想跑：清「停止全部」的停顿标记，自动拉回重新上岗
-                                                PullBack.setUserStopped(ctx, false)
+                                                BotService.clearUserStopped(ctx)
                                                 scope.launch {
                                                     msg = withContext(Dispatchers.Default) { BotHost.startAll(ctx) }
                                                         .ifBlank { "没有启用的 bot" }
@@ -283,10 +283,9 @@ fun BotsPage(
                                             text = "停止全部",
                                             modifier = Modifier.weight(1f),
                                             onClick = {
-                                                BotService.stop(ctx)
+                                                // 先写停顿标记再停服务，看门狗不会把刚停掉的 App 又拉起来
+                                                BotService.stopByUser(ctx)
                                                 BotHost.stopAll()
-                                                // 用户主动停：写停顿标记，自动拉回不会把刚停掉的 App 又拉起来
-                                                PullBack.setUserStopped(ctx, true)
                                                 scope.launch { pullSnapshot() }
                                                 msg = "已停止"
                                             },
@@ -303,7 +302,7 @@ fun BotsPage(
                                     modifier = Modifier.weight(1f),
                                     onClick = {
                                         // 用户想跑：清「停止全部」的停顿标记，自动拉回重新上岗
-                                        PullBack.setUserStopped(ctx, false)
+                                        BotService.clearUserStopped(ctx)
                                         scope.launch {
                                             msg = withContext(Dispatchers.Default) { BotHost.startAll(ctx) }
                                                 .ifBlank { "没有启用的 bot" }
@@ -315,10 +314,9 @@ fun BotsPage(
                                     text = "停止全部",
                                     modifier = Modifier.weight(1f),
                                     onClick = {
-                                        BotService.stop(ctx)
+                                        // 先写停顿标记再停服务，看门狗不会把刚停掉的 App 又拉起来
+                                        BotService.stopByUser(ctx)
                                         BotHost.stopAll()
-                                        // 用户主动停：写停顿标记，自动拉回不会把刚停掉的 App 又拉起来
-                                        PullBack.setUserStopped(ctx, true)
                                         scope.launch { pullSnapshot() }
                                         msg = "已停止"
                                     },

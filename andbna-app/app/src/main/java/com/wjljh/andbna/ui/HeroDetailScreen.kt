@@ -199,7 +199,7 @@ fun HeroDetailScreen(
                                         askNotif.launch(Manifest.permission.POST_NOTIFICATIONS)
                                     }
                                     BotHost.init(ctx)
-                                    BotService.start(ctx)
+                                    BotService.startByUser(ctx)
                                     msg = "已拉起服务（" + botCount + " 个 bot）"
                                 }
                             },
@@ -207,7 +207,8 @@ fun HeroDetailScreen(
                         PanelSecondaryButton(
                             text = "停止",
                             onClick = {
-                                BotService.stop(ctx)
+                                // 同状态页：先写停顿标记再停服务，看门狗才不会拉回
+                                BotService.stopByUser(ctx)
                                 BotHost.stopAll()
                                 msg = "已停止"
                             },
@@ -215,12 +216,14 @@ fun HeroDetailScreen(
                         PanelSecondaryButton(
                             text = "重启",
                             onClick = {
-                                BotService.stop(ctx)
+                                // 重启也是手动意图：停这一下同样写标记（停的瞬间看门狗不去拉回），
+                                // 800ms 后再清标记拉服务 —— 结束时状态是「用户要它跑」
+                                BotService.stopByUser(ctx)
                                 BotHost.stopAll()
                                 scope.launch {
                                     delay(800)
                                     BotHost.init(ctx)
-                                    BotService.start(ctx)
+                                    BotService.startByUser(ctx)
                                     msg = "已重启"
                                 }
                             },
