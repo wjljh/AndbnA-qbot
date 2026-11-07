@@ -14,8 +14,8 @@ android {
         applicationId = "com.wjljh.andbna.qbot"
         minSdk = 26
         targetSdk = 37
-        versionCode = 1080
-        versionName = "1.0.8"
+        versionCode = 1090
+        versionName = "1.0.9"
 
         // Chaquopy 版本：插件版本就是运行时依赖（com.chaquo.python.runtime:chaquopy_java）的版本，
         // 从根构建脚本的插件声明里读，避免在源码里再抄一份常量。

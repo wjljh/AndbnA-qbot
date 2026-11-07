@@ -407,6 +407,20 @@ object BotStore {
             sp(this).edit().putString("reply_delay_max_ms", v.coerceAtLeast(0).toString()).apply()
         }
 
+    /**
+     * 非主人不称呼主人（默认开）：对方不是主人时，回复里的「主人」换成 phrases.json 的 others 称呼。
+     *
+     * 缺省 true 用 contains 判断，别让 getString 的默认值盖掉用户显式关闭（缺键 → true，"0" → false）。
+     */
+    var Context.masterWordGuard: Boolean
+        get() = sp(this).let {
+            !it.contains("master_word_guard") ||
+                it.getString("master_word_guard", "1").orEmpty().trim() != "0"
+        }
+        set(v) {
+            sp(this).edit().putString("master_word_guard", if (v) "1" else "0").apply()
+        }
+
     /** 回复判定：llm=模型判断要不要插话，random=按闲聊概率掷骰子 */
     var Context.replyJudge: String
         get() = sp(this).getString("reply_judge", "llm").orEmpty().ifBlank { "llm" }
@@ -493,6 +507,8 @@ object BotStore {
             .put("human_hourly_limit", ctx.humanHourlyLimit)
             .put("reply_delay_min_ms", ctx.replyDelayMinMs)
             .put("reply_delay_max_ms", ctx.replyDelayMaxMs)
+            // 非主人不称呼主人（默认 true）：false = 只注入规则、不替换「主人」
+            .put("master_word_guard", ctx.masterWordGuard)
             // 全局每日上限：群配置「跟随全局」时 Python 侧读这一档（0 = 无上限）
             .put("daily_limit", ctx.dailyLimit)
         try {

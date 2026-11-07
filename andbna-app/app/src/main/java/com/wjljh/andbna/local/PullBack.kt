@@ -73,27 +73,51 @@ object PullBack {
             get() = hb > 0 && System.currentTimeMillis() / 1000 - hb < PERIOD * 2
     }
 
+    /** 卡片这一行点下去该干什么（UI 只认这个，不再自己猜文案） */
+    enum class Action {
+        /** 纯信息行：不可点 */
+        NONE,
+
+        /** 达上限暂停：点它弹确认，走 [resumeFromLimit] */
+        RESUME,
+
+        /** 设置里手动关掉了：点它去设置页打开 */
+        SETTINGS,
+    }
+
+    /** 状态页那一行：文案 + 该行能不能点 */
+    data class Status(val text: String, val action: Action = Action.NONE)
+
     /**
-     * UI 那一行文案。四态：已启用（带上次时间）/ 未启用（未绑定 Shizuku、没有 root）/
-     * 已暂停（达上限、用户停止全部）/ 已关闭（设置里的开关关掉了）。
+     * 状态页那一行的**唯一**判定处（设置页的开关读的是同一个键，见 [autoEnabled]）。
+     *
+     * 文案：已启用（带上次时间）/ 未启用（未绑定 Shizuku、没有 root）/ 已暂停（达上限、手动关闭、
+     * 用户停止全部）。只有「达上限」和「手动关闭」可点，动作用 [Action] 表达。
      */
-    fun statusText(ctx: Context, mode: RunMode): String {
-        val d = dir(ctx) ?: return "未启用"
-        val st = readState(d)
+    fun status(ctx: Context, mode: RunMode): Status {
+        val st = dir(ctx)?.let { readState(it) } ?: State()
         return when {
-            mode == RunMode.NORMAL -> "未启用（普通模式）"
+            mode == RunMode.NORMAL -> Status("未启用（普通模式）")
             // 设置里关掉优先于通道状态：这是用户自己的决定，不该被写成「未绑定 Shizuku」
-            !autoEnabled(ctx) -> "已关闭（设置里开启）"
+            !autoEnabled(ctx) -> Status("已暂停（手动关闭）", Action.SETTINGS)
             mode == RunMode.ADB && !(ShizukuShell.bound && ShizukuShell.running()) ->
-                "未启用（未绑定 Shizuku）"
-            mode == RunMode.ROOT && !RootHost.hasRoot() -> "未启用（没有 root 权限）"
-            st.state == "paused" && st.reason == "limit" -> "已暂停（达上限）"
-            st.state == "paused" && st.reason == "user" -> "已暂停（用户停止全部）"
-            st.state == "running" && st.alive ->
-                if (st.last > 0) "已启用 · 上次 " + clock(st.last) else "已启用"
-            else -> "未启用"
+                Status("未启用（未绑定 Shizuku）")
+            mode == RunMode.ROOT && !RootHost.hasRoot() -> Status("未启用（没有 root 权限）")
+            st.state == "paused" && st.reason == "limit" -> Status("已暂停（达上限）", Action.RESUME)
+            st.state == "paused" && st.reason == "user" -> Status("已暂停（用户停止全部）")
+            // 看门狗真的在跑就以它为准（文案带上次拉回时间）
+            st.state == "running" && st.alive -> Status(
+                if (st.last > 0) "已启用 · 上次 " + clock(st.last) else "已启用",
+            )
+            // 开关开着、脚本却没岗：多半是「停止全部」的停顿标记还在（start() 按设计不上岗），
+            // 这种要说成「已暂停」而不是含糊的「未启用」，否则用户以为开关没生效
+            isUserStopped(ctx) -> Status("已暂停（用户停止全部）")
+            else -> Status("未启用")
         }
     }
+
+    /** 兼容旧调用点：只要文案 */
+    fun statusText(ctx: Context, mode: RunMode): String = status(ctx, mode).text
 
     /** 应用 Context：日志要同时写进看门狗那份文件，grep 一个前缀就能看到 App 侧和脚本侧 */
     @Volatile
@@ -131,12 +155,46 @@ object PullBack {
             // 关着的时候脚本已经退了，它留下的 state/hb 是「尸体」：不清掉的话心跳还新鲜，
             // start() 会以为看门狗还在跑直接 return，开关打开后要等两分钟才真上岗
             clearState(app)
+            // 这个开关就是「自动拉回」的总闸：打开它 = 让它工作，所以顺带清掉「停止全部」留下的
+            // 停顿标记（start() 会因它一次都不 spawn，卡片就永远停在「已暂停（用户停止全部）」）。
+            // 想再停：按状态页的「停止」/ Bot 页的「停止全部」，标记会重新写上。
+            if (isUserStopped(app)) {
+                app.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+                    .putBoolean(KEY_STOPPED, false).apply()
+                dir(app)?.let { runCatching { File(it, PAUSE).delete() } }
+                log("设置里打开了「自动拉回」：清掉「停止全部」的停顿标记")
+            }
             log("设置里打开了「自动拉回」：立刻让看门狗上岗")
             poke(app)
         } else {
             log("设置里关了「自动拉回」：让看门狗退出，之后不再拉起")
             stop(app, "设置里关了自动拉回")
         }
+    }
+
+    /**
+     * 卡片上「恢复自动拉回」：达上限暂停后，用户点卡片确认恢复。
+     *
+     * 三件事：① 把「达上限」的暂停状态复位 —— 计数 COUNT 只活在脚本进程里，脚本一退就没了，
+     * 残留的是 state=reason=limit + 心跳这两份「尸体」，删掉即等于把计数清零；
+     * ② 让看门狗重新上岗（[poke] → tick → start；start() 见到 limit 会直接 return，所以必须先清状态）；
+     * ③ 写一行日志，App 侧与脚本侧都在同一份 autopull.log 里。
+     */
+    fun resumeFromLimit(ctx: Context) {
+        val app = ctx.applicationContext
+        appCtx = app
+        val d = dir(app)
+        if (d != null) {
+            runCatching { File(d, STATE).delete() }
+            runCatching { File(d, HB).delete() }
+            runCatching { File(d, OFF).delete() }
+            // 恢复 = 用户想让自动拉回工作：停顿标记也要一起清，否则 start() 仍然不上岗
+            runCatching { File(d, PAUSE).delete() }
+        }
+        app.getSharedPreferences(PREF, Context.MODE_PRIVATE).edit()
+            .putBoolean(KEY_STOPPED, false).apply()
+        log("已手动恢复（原因为达到上限）")
+        poke(app)
     }
 
     // ── 对外：用户意图 ─────────────────────────────────────────────────────

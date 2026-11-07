@@ -479,6 +479,10 @@ private fun MainTabs(
                             onOpenDetail = onOpenDetail,
                             // App 持有的 mode 状态：hero 胶囊与「资源占用」卡都读它，改完立刻一致
                             mode = mode,
+                            // 「自动拉回（手动关闭）」那行点下去直接翻到设置页（底部导航第 4 项）
+                            onOpenSettings = {
+                                scope.launch { pagerState.animateScrollToPage(3) }
+                            },
                         )
                         1 -> LocalTextsContent(
                             metrics = metrics,

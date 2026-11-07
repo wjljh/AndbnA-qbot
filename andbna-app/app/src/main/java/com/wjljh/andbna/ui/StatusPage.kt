@@ -51,6 +51,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.lifecycle.compose.LifecycleResumeEffect
 import com.wjljh.andbna.BuildConfig
 import com.wjljh.andbna.local.AdbHost
 import com.wjljh.andbna.local.BotHost
@@ -66,6 +67,7 @@ import com.wjljh.andbna.local.ShizukuState
 import com.wjljh.andbna.local.UpdateDownloadService
 import com.wjljh.andbna.local.Updater
 import com.wjljh.andbna.ui.component.PanelAnimatedNotice
+import com.wjljh.andbna.ui.component.PanelConfirmDialog
 import com.wjljh.andbna.ui.component.PanelGroupCard
 import com.wjljh.andbna.ui.component.PanelInfoRow
 import com.wjljh.andbna.ui.component.PanelModePill
@@ -115,9 +117,11 @@ fun StatusPage(
     onOpenDetail: () -> Unit = {},
     /** 当前模式由 App 统一持有（改完立刻重组）；不传就退回 ModeStore 的落盘值 */
     mode: RunMode? = null,
+    /** 「已暂停（手动关闭）」那行点下去要跳到设置页；不传就给一句提示（本页无权切页） */
+    onOpenSettings: (() -> Unit)? = null,
 ) {
     // 模式入口只剩 hero（点卡片进「运行控制」页），信息卡里那行「运行模式」已删
-    LocalStatusContent(visible, bottomInset, onOpenDetail, mode)
+    LocalStatusContent(visible, bottomInset, onOpenDetail, mode, onOpenSettings)
 }
 
 // ── 本机托管（普通 / ADB / root）────────────────────────────────────────────
@@ -128,6 +132,7 @@ private fun LocalStatusContent(
     bottomInset: Dp,
     onOpenDetail: () -> Unit,
     mode: RunMode?,
+    onOpenSettings: (() -> Unit)?,
 ) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
@@ -169,8 +174,16 @@ private fun LocalStatusContent(
     // 自检只留一行结论（完整依赖清单进日志），30 秒后自动收起
     var probeLine by remember { mutableStateOf("") }
     var probeOk by remember { mutableStateOf(true) }
-    // 「自动拉回」那行：三态文案由 PullBack 自己的状态文件算出来（读文件，别在主线程）
-    var pullText by remember { mutableStateOf("") }
+    // 「自动拉回」那行：文案与可点动作都只从 PullBack.status() 来（读文件，别在主线程）。
+    // 设置页那个开关读的是同一个键（PullBack.autoEnabled / auto_pull），两处不各存一份内存状态。
+    var pull by remember { mutableStateOf(PullBack.Status("")) }
+    var resumeAsk by remember { mutableStateOf(false) }
+    // 每次回到前台（ON_RESUME）都让下面的轮询立刻重读一次，别等下一个 3 秒
+    var resumeTick by remember { mutableIntStateOf(0) }
+    LifecycleResumeEffect(Unit) {
+        resumeTick++
+        onPauseOrDispose { }
+    }
     var msg by remember { mutableStateOf("") }
     var msgOk by remember { mutableStateOf(true) }
     var busy by remember { mutableStateOf(false) }
@@ -199,14 +212,14 @@ private fun LocalStatusContent(
 
     // 只有本页在显示时才轮询状态；顺带刷新启用 bot 数。
     // key 里必须带 curMode：只 key visible 的话协程捕获的是旧模式，切完模式「自动拉回」那行文案不会跟着变
-    LaunchedEffect(visible, curMode) {
+    LaunchedEffect(visible, curMode, resumeTick) {
         if (!visible) return@LaunchedEffect
         while (true) {
             status = BotHost.stateText().also {
                 if (it.isNotBlank()) Prefs.put(ctx, "last_state", it)
             }
             botCount = withContext(Dispatchers.IO) { BotStore.load(ctx).count { it.enabled } }
-            pullText = withContext(Dispatchers.IO) { PullBack.statusText(ctx, curMode) }
+            pull = withContext(Dispatchers.IO) { PullBack.status(ctx, curMode) }
             svcSince = withContext(Dispatchers.IO) { Prefs.get(ctx, "svc_started_at").toLongOrNull() ?: 0L }
             tick = System.currentTimeMillis()
             // 成本快照：3 轮取一次（轮询一格 3 秒），用计数取模，不新起循环
@@ -331,10 +344,25 @@ private fun LocalStatusContent(
 
         item(key = "info") {
             PanelGroupCard {
+                // 只有「达上限」和「手动关闭」两种暂停可点：前者弹确认就地恢复，后者去设置页
+                val pullClick: (() -> Unit)? = when (pull.action) {
+                    PullBack.Action.RESUME -> ({ resumeAsk = true })
+                    PullBack.Action.SETTINGS -> ({
+                        val go = onOpenSettings
+                        if (go != null) {
+                            go()
+                        } else {
+                            msgOk = true
+                            msg = "自动拉回已在设置里关掉：到底栏「设置」页把它打开"
+                        }
+                    })
+                    PullBack.Action.NONE -> null
+                }
                 PanelInfoRow(
                     icon = Icons.Filled.Refresh,
                     title = "自动拉回",
-                    value = pullText.ifBlank { "检测中…" },
+                    value = pull.text.ifBlank { "检测中…" },
+                    onClick = pullClick,
                 )
                 PanelInfoRow(
                     icon = Icons.Filled.Folder,
@@ -438,6 +466,30 @@ private fun LocalStatusContent(
             onDismiss = { updateDialog = false },
         )
     }
+
+    // 「已暂停（达上限）」点卡片 → 确认后：清掉暂停状态、让看门狗重新上岗、写一行恢复日志
+    PanelConfirmDialog(
+        show = resumeAsk,
+        title = "恢复自动拉回",
+        body = "自动拉回因为「达到上限」暂停了。恢复会清掉这次的暂停计数，让看门狗重新上岗，" +
+            "被杀后照常把 App 拉回来。",
+        confirmLabel = "恢复自动拉回",
+        danger = false,
+        onConfirm = {
+            resumeAsk = false
+            scope.launch {
+                withContext(Dispatchers.IO) { PullBack.resumeFromLimit(ctx) }
+                msgOk = true
+                msg = "自动拉回：已恢复（看门狗重新上岗）"
+                // 脚本被 spawn 后才写 pid/state/hb，上岗要一两秒：连读几次，别停在「未启用」上
+                listOf(600L, 1500L, 3000L, 5000L).forEach { wait ->
+                    delay(wait)
+                    pull = withContext(Dispatchers.IO) { PullBack.status(ctx, curMode) }
+                }
+            }
+        },
+        onDismiss = { resumeAsk = false },
+    )
 }
 
 // ── 页面内私有拼装 ──────────────────────────────────────────────────────────

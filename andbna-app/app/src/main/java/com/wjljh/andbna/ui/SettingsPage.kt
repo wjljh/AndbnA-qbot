@@ -49,6 +49,7 @@ import com.wjljh.andbna.local.BotStore.botSilenceMinutes
 import com.wjljh.andbna.local.BotStore.dailyLimit
 import com.wjljh.andbna.local.BotStore.humanHourlyLimit
 import com.wjljh.andbna.local.BotStore.llmJudgeLevel
+import com.wjljh.andbna.local.BotStore.masterWordGuard
 import com.wjljh.andbna.local.BotStore.nameHitAsCall
 import com.wjljh.andbna.local.BotStore.replyDelayMaxMs
 import com.wjljh.andbna.local.BotStore.replyDelayMinMs
@@ -435,6 +436,9 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
     var delayMin by mutableStateOf(ctx.replyDelayMinMs)
     var delayMax by mutableStateOf(ctx.replyDelayMaxMs)
 
+    /** 非主人不称呼主人（默认开）：false = 只注入规则，不把「主人」换成配置的称呼 */
+    var masterGuard by mutableStateOf(ctx.masterWordGuard)
+
     val turnValues = listOf(3, 6, 10, 20)
     val turnLabels = listOf("3", "6", "10", "20")
     val silenceValues = listOf(5, 10, 30, 60)
@@ -480,6 +484,19 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
             { ctx.botGateEnabled = on },
             if (on) "Bot 互聊：同一句话只让最合适的一个 bot 回"
             else "Bot 互聊：总模型不再分配，各 bot 自己判断",
+        )
+    }
+
+    /**
+     * 切「非主人不称呼主人」：prefs + llm.json 各一份，Python 侧每条消息重读文件 —— 不用重启 bot。
+     * 判定与替换都在 Python（master_word_guard），界面只负责把这个布尔给它。
+     */
+    fun switchMasterGuard(on: Boolean) {
+        masterGuard = on
+        persistBotChat(
+            { ctx.masterWordGuard = on },
+            if (on) "非主人不称呼主人：开着，回复里的「主人」会换成你配的称呼"
+            else "非主人不称呼主人：关了，只提示不改字",
         )
     }
 
@@ -681,6 +698,13 @@ private fun MiuixSettingsBody(
             }
             JudgeConfigCardMiuix(vm)
             SettingsMiuixGroup {
+                SwitchPreference(
+                    title = "非主人不称呼主人",
+                    summary = "对方不是主人时，把回复里的「主人」换成你配置的称呼；关闭后只提示、不替换",
+                    startAction = { SettingsRowIcon(Icons.Filled.Person) },
+                    checked = vm.masterGuard,
+                    onCheckedChange = { vm.switchMasterGuard(it) },
+                )
                 SwitchPreference(
                     title = "群里自动接话",
                     summary = "关着时群里只有 @ 才会回；打开后它会自己判断要不要插话（默认关）",
@@ -1084,6 +1108,15 @@ private fun MaterialSettingsBody(
             }
             JudgeConfigCardMaterial(vm)
             SegmentedGroup(modifier = settingsGroupPadding()) {
+                item {
+                    SegmentedSwitchItem(
+                        title = "非主人不称呼主人",
+                        summary = "对方不是主人时，把回复里的「主人」换成你配置的称呼；关闭后只提示、不替换",
+                        icon = Icons.Filled.Person,
+                        checked = vm.masterGuard,
+                        onCheckedChange = { vm.switchMasterGuard(it) },
+                    )
+                }
                 item {
                     SegmentedSwitchItem(
                         title = "群里自动接话",

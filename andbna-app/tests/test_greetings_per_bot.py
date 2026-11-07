@@ -142,42 +142,49 @@ def test_migrate():
     shutil.rmtree(base, ignore_errors=True)
 
 
-# ── 2 · 注入：aliases 空则不加规则；有值时日志出现「称呼主人为…」 ──────
+# ── 2 · 注入：非主人**永远**有硬规则；主人按 master 配置给 ────────────
 def test_inject():
     print("[2] 注入")
     base = tempfile.mkdtemp(prefix="andbna-words-")
     bot = mkbot(base, "botA")
     clear_logs()
-    rules = br._words_rules(bot)
-    check("aliases 空 → 不追加任何规则", rules == "" and "注入称呼" not in logs(), rules)
-    sysmsg = br._build_messages(bot, "g1", "小明", "在吗", first=True)["" if False else 0]["content"]
-    check("aliases 空 → prompt 里没有称呼规则", "称呼主人为" not in sysmsg)
+    rules = br._words_rules(bot, "gGROUP99")
+    check("aliases 空 → 非主人照样注入硬规则（禁止「主人」+ 用「你」）",
+          "禁止用「主人」称呼对方" in rules and "「你」" in rules and "注入称呼" in logs(), rules)
+    sysmsg = br._build_messages(bot, "g1", "小明", "在吗", first=True)[0]["content"]
+    check("aliases 空 → prompt 里没有 master 那句", "称呼主人为" not in sysmsg)
     check("首句不再注入问候", "可以用这句开场" not in sysmsg and "问候" not in sysmsg)
 
-    write(os.path.join(bot, "phrases.json"), {"aliases": {"master": "主人", "others": "小可爱"}})
+    write(os.path.join(bot, "phrases.json"), {"aliases": {"master": "阿爸", "others": "小可爱"}})
     write(os.path.join(bot, "owner.json"), {"member_openid": "OWNER1234", "user_openid": "OWNER1234"})
     clear_logs()
     rules = br._words_rules(bot, "pOWNER1234")
-    check("主人私聊 → 只给 master 那句", rules.strip() == "称呼主人为 主人。", rules)
-    check("日志出现「称呼主人为…」", "称呼主人为 主人" in logs(), logs())
+    check("主人私聊 → 只给 master 那句（祈使句）",
+          "请用「阿爸」称呼对方" in rules and "禁止用「主人」" not in rules, rules)
+    check("日志出现注入的称呼规则（含配置值）", "注入称呼" in logs() and "阿爸" in logs(), logs())
     check("日志写出对象判定（主人 + openid 前 8 位）",
           "称呼：对象=主人（openid 前 8 位 OWNER123）" in logs(), logs())
     sysmsg = br._build_messages(bot, "pOWNER1234", "", "在吗")[0]["content"]
-    check("主人私聊的 prompt 带 master 称呼", "称呼主人为 主人" in sysmsg and "小可爱" not in sysmsg)
+    check("主人私聊的 prompt 带 master 称呼（人格之后、祈使句）",
+          "请用「阿爸」称呼对方" in sysmsg and "小可爱" not in sysmsg, sysmsg[-80:])
     check("prompt 里不再有口癖注入", "口头习惯" not in sysmsg)
 
     clear_logs()
     rules2 = br._words_rules(bot, "gGROUP99")
-    check("群聊 → 只给 others 那句", rules2.strip() == "称呼其他人 小可爱。", rules2)
+    check("群聊 → 只给 others 那句 + 禁止「主人」",
+          "请称呼对方为「小可爱」" in rules2 and "禁止用「主人」称呼对方" in rules2
+          and "阿爸" not in rules2, rules2)
     check("日志写明对象=其他人", "称呼：对象=其他人（openid 前 8 位 GROUP99）" in logs(), logs())
     sysmsg2 = br._build_messages(bot, "gGROUP99", "小明", "在吗")[0]["content"]
-    check("群聊的 prompt 只有 others，没有 master", "称呼其他人 小可爱" in sysmsg2 and "称呼主人为" not in sysmsg2)
+    check("群聊的 prompt 只有 others，没有 master",
+          "小可爱" in sysmsg2 and "阿爸" not in sysmsg2 and "称呼主人为" not in sysmsg2,
+          sysmsg2[-80:])
 
     write(os.path.join(bot, "phrases.json"), {"aliases": {"master": "", "others": "小可爱"}})
     clear_logs()
     check("master 为空 → 主人私聊不加规则（不硬塞默认词）", br._words_rules(bot, "pOWNER1234") == "")
     clear_logs()
-    check("others 有值 → 群聊照常加", br._words_rules(bot, "gGROUP99").strip() == "称呼其他人 小可爱。")
+    check("others 有值 → 群聊照常加", "请称呼对方为「小可爱」" in br._words_rules(bot, "gGROUP99"))
 
     # 没有 owner.json 但有 known_chats 的 c2c → 仍能认定主人
     os.remove(os.path.join(bot, "owner.json"))

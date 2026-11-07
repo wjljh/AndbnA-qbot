@@ -186,7 +186,15 @@ class BotService : Service() {
             runCatching { context.startService(i) }
         }
 
+        /**
+         * 停服务。**必须先真停 Python，再 stopService**：
+         * stopService 只销毁服务、不动 python 里那些 botpy 连接，顺序反了就是
+         * 「前台通知没了、服务没了，bot 还在群里回话」。
+         * stop_all 内部走 stop_one（关 http + 停 loop + 提升 generation），且是幂等的，
+         * 所以界面里后面再补一次 BotHost.stopAll() 也不会有第二次动作。
+         */
         fun stop(context: Context) {
+            BotHost.stopAll()
             context.stopService(Intent(context, BotService::class.java))
         }
     }
@@ -555,9 +563,21 @@ object BotHost {
     }
 
     fun stopAll() {
+        val m = module ?: return
         try {
-            module?.callAttr("stop_all")
-        } catch (_: Throwable) {
+            // python 侧的 stop_all 现在是「真停」：关 http/gateway + 停那个 loop +
+            // 提升 generation（见 bot_runner.stop_one），不是只改状态
+            val was = try {
+                m.callAttr("is_running").toBoolean()
+            } catch (_: Throwable) {
+                false
+            }
+            m.callAttr("stop_all")
+            // 停完后 onDestroy / 界面里那个补调的 stopAll 还会再来一次（幂等，不再有动作），
+            // 只有「刚才确实在跑」这一次才记日志，否则日志里会连着三条一样的
+            if (was) logNote("服务停止：已调用 stop_all()")
+        } catch (e: Throwable) {
+            logNote("服务停止：stop_all() 出错（" + (e.message ?: e.javaClass.simpleName) + "）")
         }
     }
 

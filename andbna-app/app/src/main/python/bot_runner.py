@@ -1686,24 +1686,66 @@ def _migrate_words(botdir, appid=""):
 
 
 def _words_rules(botdir, key=""):
-    """人格之后追加的称呼规则，按对话对象只给一个：主人 → master，其它 → others。
+    """人格之后追加的**硬规则**（祈使句），按对话对象只给一个：主人 → master，其它 → others。
 
-    口癖（旧 tics）已下线，这里不再注入；问候也不再塞进 prompt（改成时段随机私聊）。
-    该场景没配（空串）就不加规则 —— 不拿默认词硬塞。
+    位置固定在人格之后，而且用命令语气：内置预设人格与用户自定义人格都只在末尾
+    追加这段，人格正文一个字都不改 —— 自定义人格也就同样被这条规则管住。
+    非主人那条**永远**注入（没配 others 也注入）：真机事故就是配置为空时模型照旧喊「主人」，
+    注入缺失等于没约束；发送前还有 _master_word_fix 再兜一道。
+    主人那条不配 master 就不注入（不拿默认词硬塞）。
     """
     a = _aliases(botdir)
     if _is_master_key(botdir, key):
         log("称呼：对象=主人（openid 前 8 位 %s）" % _oid8(_owner_openid(botdir)))
-        s = ("称呼主人为 %s" % a["master"]) if a.get("master") else ""
+        s = ("本轮对话对象就是主人本人。请用「%s」称呼对方，不要换别的称呼。"
+             % a["master"]) if a.get("master") else ""
     else:
         who = str(key or "")
         peer = who[1:] if who[:1] in ("p", "g", "c") else ""
         log("称呼：对象=其他人" + (("（openid 前 8 位 %s）" % _oid8(peer)) if peer else ""))
-        s = ("称呼其他人 %s" % a["others"]) if a.get("others") else ""
+        if a.get("others"):
+            s = ("本轮对话对象不是主人。禁止用「主人」称呼对方；请称呼对方为「%s」。"
+                 % a["others"])
+        else:
+            s = ("本轮对话对象不是主人。禁止用「主人」称呼对方；"
+                 "请用对方的昵称称呼对方，不知道昵称就用「你」。")
     if not s:
         return ""
-    log("注入称呼：%s。" % s)
-    return chr(10) + chr(10) + s + "。"
+    log("注入称呼：%s" % s)
+    return chr(10) + chr(10) + s
+
+
+_MASTER_WORD = "主人"
+
+
+def _master_guard_on(base_dir=""):
+    """llm.json 的 master_word_guard：默认**开**（缺省 / 认不出都按开）。
+
+    关掉只是不做发送前的文本替换；_words_rules 那条注入规则照样生效。
+    """
+    c = _load_json(os.path.join(str(base_dir or _base_dir or ""), "llm.json"), {}) or {}
+    v = c.get("master_word_guard")
+    if isinstance(v, bool):
+        return v
+    if isinstance(v, str):
+        return v.strip().lower() not in ("", "0", "false", "no", "off")
+    if isinstance(v, (int, float)):
+        return bool(v)
+    return True
+
+
+def _master_word_fix(botdir, key, text):
+    """发送前兜底：对方不是主人时，正文里不该出现「主人」。
+
+    → (新正文, 替换处数, others 配置值或 "")；主人私聊 / 本来就没有「主人」→ 原样返回。
+    没配 others 就把这个称呼换成「你」（直接删掉会把句子弄断，换个能读的代称更稳）。
+    """
+    s = str(text or "")
+    if not s or _MASTER_WORD not in s or _is_master_key(botdir, key):
+        return s, 0, ""
+    others = str(_aliases(botdir).get("others") or "").strip()
+    n = s.count(_MASTER_WORD)
+    return s.replace(_MASTER_WORD, others or "你"), n, others
 
 
 # ── 上下文压缩（只有达到窗口 75% 才压一次）────────────────────
@@ -2473,7 +2515,7 @@ def archive_export_text(botdir, max_rows=0):
 
 
 def _system_prompt(botdir, key):
-    """系统提示词：人格 → 称呼规则 → 当前时间 → 群聊硬规则。
+    """系统提示词：人格 → 称呼硬规则 → 当前时间 → 群聊硬规则。
 
     人格走 _persona_for：该群配了 persona（groups/<gid>.json）就用群人格，否则仍是 bot 人格。
     """
@@ -2556,6 +2598,61 @@ def _clean_reply(text, limit=120):
                 break
         s = (s[:cut] if cut else s[:limit]).rstrip("，,、 　")
     return s.strip()
+
+
+# ── 出站清洗（思考 / 指令 / 收尾标记一律不发）────────────────────
+#
+# 真机事故（用户截图）：
+#   「不要过长，1-2句。回应"那不一定"——…end那就等练到了再说。」
+#   「别的 bot 说要算账。我回应，简短。end账我来算。」
+# 句首是**我们自己的指令/模型的计划**，end 是总模型收尾提示里的标记 —— 全被照抄进了群聊。
+# _clean_reply 只管格式（路径 / 清单 / 代码块），管不了这类「自言自语」；这里再洗一遍：
+#   ① 独立的 end / end_topic / [end] 标记：正文在它后面，之前那段整段丢掉；
+#   ② 「思考：」「分析：」「(内心)」这类整段丢掉（叙述性括号动作照旧保留）；
+#   ③ 以指令口吻开头的整句丢掉；
+#   ④ 洗完为空 → 本条**不发**（调用方看到空串就不发，日志记「出站清洗：内容为空，丢弃」）。
+# 只做减法：正常角色台词原样返回（连句子之间的空格都不动）。
+
+# 独立标记只认这几种位置：正文开头 / 句末标点之后 / 行首（后面可带括号）
+# 「那首歌的 end 挺好听的」这种嵌在句子中间的英文单词不算标记。
+_END_MARK_RE = re.compile(r"(?i)(?:^|(?<=[。！？!?；;、\n]))\s*[\[\(【]?\s*end(?:_topic)?\s*[\]\)】]?")
+_SENT_RE = re.compile(r"[^。！？!?；;\n]+[。！？!?；;]?|\n+")
+_BRACKET_RE = re.compile(r"[（(【\[]([^）)】\]]*)[）)】\]]")
+# 句首出现这些 → 这句是指令/计划，不是台词
+_META_PREFIX = ("不要过长", "不要超过", "不要多于", "我回应", "系统提示", "（系统", "(系统",
+                "系统：", "系统:", "思考", "分析", "推理", "内心", "本轮", "指令：",
+                "输出要求", "格式要求", "字数要求")
+_THINK_WORDS = ("思考", "分析", "推理", "thinking", "analysis", "reasoning")
+
+
+def _is_meta_sentence(one):
+    """这句话是不是模型的「自言自语」（指令 / 内心独白）？"""
+    t = str(one or "").strip()
+    if not t:
+        return False
+    low = t.lower()
+    if any(low.startswith(p) for p in _META_PREFIX):
+        return True
+    return any(w in low for w in _THINK_WORDS) and ("：" in t or ":" in t)
+
+
+def sanitize_reply(text):
+    """模型输出 → 只留能发进群的正文；洗不出正文就返回空串（= 本条不发）。"""
+    s = str(text or "")
+    if not s.strip():
+        return ""
+    last = None
+    for m in _END_MARK_RE.finditer(s):
+        last = m
+    if last is not None:
+        tail = s[last.end():]
+        s = tail if tail.strip() else s[:last.start()]
+    s = _BRACKET_RE.sub(
+        lambda m: "" if any(w in m.group(1).lower() for w in _THINK_WORDS) else m.group(0), s)
+    s = "".join(m.group(0) for m in _SENT_RE.finditer(s) if not _is_meta_sentence(m.group(0)))
+    s = _END_MARK_RE.sub("", s)
+    s = re.sub(r"[ \t]{2,}", " ", s)
+    return s.strip(" \t\r\n　·-—")
 
 
 # ── 联网（DeepSeek 官方 Search / Fetch）──────────────────────
@@ -4731,6 +4828,11 @@ def _at_me(appid, botdir, message):
         return "yes", "mentions.is_you=true（平台权威判定）"
     if any(f is False for f in flags):
         return "no", "明确不是叫我（mentions 非空，但没有 is_you=true）"
+    if not mentions and _MENTION_RE.search(text):
+        # 平台没给 mentions，正文里却有 <@hex>：id 归属读不出来（QQ 的 openid 按 bot 分配，
+        # 正文里的 id 永远不在我们的候选集合里）。fail-closed：当「@ 了别人」，
+        # 让 _at_others 跳过总模型 —— 绝不抢走别人头上的 @，也绝不因此白烧一次总模型。
+        return "no", "正文有 <@…> 但平台 mentions 为空（视为 @ 别人）"
 
     cand = _candidates(appid, botdir)
     if not cand:
@@ -5180,6 +5282,38 @@ def _roster(base=""):
 
 def _enabled_roster(base=""):
     return [r for r in _roster(base) if r["enabled"]]
+
+
+def _bot_running_or_unknown(appid):
+    """这个 bot 当前有运行实例吗：_bots 里有记录就看 alive；没记录 = 「不知道」→ 按有算。
+
+    start_all / start_one 会给每个启用的 bot 建一条记录（掉线 / 停止时 alive=False），
+    所以「有记录 + 没在跑」才是真的没人接；host 侧直接调用 / 测试里根本没有 _bots 表，
+    那种情况不能把候选全判成「没在跑」，否则整条链路会静默退化成「不走总模型」。
+    """
+    with _lock:
+        info = _bots.get(str(appid or ""))
+    if info is None:
+        return True
+    return bool(info.get("alive"))
+
+
+def _gate_candidates(base=""):
+    """总模型候选：enabled **且当前有运行实例**。
+
+    没在跑的 bot 点名等于白烧一次调用、还没人接（日志里点「惜月」那次）。
+    「没有运行记录」不算没在跑，见 _bot_running_or_unknown。
+    """
+    return [r for r in _enabled_roster(base) if _bot_running_or_unknown(r["appid"])]
+
+
+def _log_gate_candidates(appid, cand):
+    """每次总模型调用前一行：谁在候选里、谁被排除（验收要的日志之一）。"""
+    keep = set(r["appid"] for r in cand)
+    marks = ["%s(%s)" % (r["name"], "运行中" if r["appid"] in keep else "未运行，已排除")
+             for r in _enabled_roster(_base_dir)]
+    if marks:
+        log("总模型候选：" + "、".join(marks), appid)
 
 
 def _my_entry(appid, roster=None):
@@ -5715,6 +5849,7 @@ async def _gate_run(appid, gid, gconf, roster, level):
     if conf is None:
         log("总模型跳过：判定槽位没有模型配置（llm.json 缺 key / 地址）→ 退回自判", appid)
         return {"action": "fallback", "bot": "", "why": "没有模型配置"}
+    _log_gate_candidates(appid, roster)
     prompt = _gate_prompt(appid, gid, gconf, roster, level)
     try:
         raw = await _gate_model(conf, prompt)
@@ -5738,10 +5873,11 @@ async def _gate_run(appid, gid, gconf, roster, level):
     if last and dec["action"] == "reply" and _turn_of(gid, last) >= cap:
         dec = {"action": "end_topic", "bot": last,
                "why": "连续 bot 轮次 %d/%d，已达上限" % (len(chain), cap)}
-    # ④ 上面三处改写可能点到「其他bot」这种不在启用清单里的名字 → 没人能接，直接收场
+    # ④ 上面三处改写可能点到「其他bot」这种不在候选清单里的名字（未启用 / 没在跑）→ 没人能接，直接收场
     if dec["action"] != "skip" and dec["bot"] not in names:
         return _gate_log({"action": "skip", "bot": "",
-                          "why": "点名的是未启用的角色（%s）" % (dec["bot"] or "(空)")}, appid)
+                          "why": "点名的是未启用 / 未在运行的角色（%s）"
+                          % (dec["bot"] or "(空)")}, appid)
     return _gate_log(dec, appid)
 
 
@@ -5783,9 +5919,13 @@ async def _reply_delay(appid, gid, gconf, entry=None):
 
 
 def _closing_hint(n):
-    """end_topic 注入的 system 提示：让它自己把话收住，而不是生硬宣布结束。"""
-    return ("你已经在这个群连着说了 %d 句，这一条请用你自己的语气自然收尾：像说完一句话那样收住，"
-            "不要生硬地说「结束」「话题终止」，也不要解释自己在收尾。" % max(1, int(n)))
+    """收尾时注入的 system 提示：让它自己把话收住，而不是生硬宣布结束。
+
+    这里**不写任何会被照抄的关键字**：旧版把「结束」「话题终止」写进提示，
+    模型就把这两个词（以及标记本身）一起抄进了群聊。只描述动作，不给词。
+    """
+    return ("你在这一轮已经连着说了 %d 句，这一条就把话自然收住：用你自己的语气说完最后半句，"
+            "像聊天里随口应一声那样停下，别让人看出你在刻意收场。" % max(1, int(n)))
 
 
 async def _group_send(appid, botdir, message, gid, who, model_in, images=None,
@@ -5801,6 +5941,8 @@ async def _group_send(appid, botdir, message, gid, who, model_in, images=None,
     try:
         reply = await _reply(appid, botdir, "g" + gid, who, model_in, images=images,
                              extra_sys=extra_sys)
+        if not reply:
+            return ""          # 出站清洗判空：这条不发（_reply 里已记「丢弃」日志）
         plain, at_ids = _resolve_at_tags(reply, _mentions_of(message))
         _note_sent(appid, gid, plain)
         if at_ids:
@@ -5850,7 +5992,13 @@ def _turn_reset_pair(gid, name):
 
 
 def _at_others(appid, botdir, message):
-    """本条 @ 的是不是别人（不是我、也不是作者本人）？"""
+    """本条 @ 的是不是别人（不是我、也不是作者本人）？
+
+    mentions 为空但正文里有 <@hex> 一样算「别人」：fail-closed，宁可这条不回，
+    也不让总模型把别人的 @ 转给群里随便一个 bot。
+    """
+    if not _mentions_of(message) and _MENTION_RE.search(str(getattr(message, "content", "") or "")):
+        return True
     own = set(str(c).upper() for c in _own_mention_ids(appid, botdir, _mentions_of(message)))
     author = set(str(i).upper() for i in _author_ids(message))
     for e in _mentions_of(message):
@@ -5867,7 +6015,7 @@ async def _gated_turn(appid, botdir, message, gid, from_name, text, gconf, roste
     句数上限 + 成对静默 + 3 秒互斥三样卡着，不会无限刷。
     """
     level, _n = _gate_level(gid, gconf, _level_override(appid, roster))
-    dec = await _gate_decide(appid, gid, text, gconf, roster, level)
+    dec = await _gate_decide(appid, gid, text, gconf, _gate_candidates(_base_dir), level)
     act = dec["action"]
     if act == "fallback":
         name, _ago = _speech_after(gid, time.time() - 3.0, appid)
@@ -5927,7 +6075,13 @@ async def _handle_group(appid, botdir, message, tag):
     # 总模型的开关与名单每条消息现读：启停 bot / 改开关之后，下一条消息就按新配置走
     gconf = _gate_conf(_base_dir)
     roster = _enabled_roster(_base_dir)
-    gate_on = bool(gconf["gate_enabled"] and len(roster) >= 2)
+    # 总模型候选 = enabled **且**当前有运行实例：点名一个没在跑的 bot 等于白花钱且没人接。
+    # 运行中不足两个 → 按现有规则不走总模型（各 bot 各判各的）。
+    cand = _gate_candidates(_base_dir)
+    gate_on = bool(gconf["gate_enabled"] and len(cand) >= 2)
+    if gconf["gate_enabled"] and len(roster) >= 2 and len(cand) < 2:
+        log("总模型不走：运行中的 bot 只有 %d 个（启用 %d 个）→ 退回各判各的"
+            % (len(cand), len(roster)), appid)
     my_name = _my_name(appid)
     from_name, _from_appid, author_oid, from_bot = _sender_of(botdir, message, roster)
     body = _strip_mentions(text)
@@ -6012,10 +6166,13 @@ async def _handle_group(appid, botdir, message, tag):
             # 真人 @ 了本 bot：总模型不参与，直接由本 bot 回（对方要求的行为）
             log("总模型跳过：真人 @ 了本 bot（直接回）｜%s" % brief, appid)
         elif _at_others(appid, botdir, message):
-            log("总模型跳过：本条 @ 的是别人（由被 @ 的 bot 回）｜%s" % brief, appid)
+            if not _mentions_of(message) and _MENTION_RE.search(text):
+                log("总模型跳过：正文 @ 了别人（mentions 为空）｜%s" % brief, appid)
+            else:
+                log("总模型跳过：本条 @ 的是别人（由被 @ 的 bot 回）｜%s" % brief, appid)
             return
         else:
-            dec = await _gate_decide(appid, gid, text, gconf, roster, level)
+            dec = await _gate_decide(appid, gid, text, gconf, cand, level)
             act = dec["action"]
             if act == "fallback":
                 # 总模型失败：退回各 bot 自判，但互斥仍生效（本群 3 秒内已有别的 bot 发言 → 放弃）
@@ -6139,13 +6296,19 @@ async def _handle_group(appid, botdir, message, tag):
     # 延迟 + 抢先检查 + 发送（_group_send 是群回复的唯一出口）
     await _group_send(appid, botdir, message, gid, "", model_in, images, extra_sys, closing)
 
-def _make_client(appid, secret, botdir):
-    """每个实例一套自己的 Client 类，避免事件回调串台"""
+def _make_client(appid, secret, botdir, gen=None):
+    """每个实例一套自己的 Client 类，避免事件回调串台。
+
+    gen 一起带进来：事件处理器入口要拿它跟 _bots[appid]["gen"] 比，
+    被 stop_one 停掉的旧实例再投进来的事件一律丢弃。
+    """
     import botpy
     _install_group_message_parser()
 
     class Bot(botpy.Client):
         async def on_ready(self):
+            if _stale(appid, gen):
+                return
             name = getattr(self.robot, "name", "?")
             # @ 判定只认本 bot 自己的 id：appid 一定算，robot 上还有别的就一起登记
             _register_self_id(appid, getattr(self.robot, "id", None),
@@ -6169,29 +6332,39 @@ def _make_client(appid, secret, botdir):
             log("已上线：「%s」" % name, appid)
 
         async def on_at_message_create(self, message):
+            if _stale(appid, gen):
+                return
             if _dedupe_message(appid, message, "频道"):
                 return
             text = (getattr(message, "content", "") or "").strip()
             log("频道@：%s" % text[:60], appid)
             try:
+                say = await _reply(appid, botdir, "c" + str(message.channel_id), "", text,
+                                   images=_attachments_of(message))
+                if not say:
+                    return         # 出站清洗判空：这条不发（_reply 里已记「丢弃」日志）
                 await message._api.post_message(
-                    channel_id=message.channel_id, msg_id=message.id,
-                    content=await _reply(appid, botdir, "c" + str(message.channel_id), "", text,
-                                         images=_attachments_of(message)),
+                    channel_id=message.channel_id, msg_id=message.id, content=say,
                 )
             except Exception as e:
                 log("回频道失败：%r" % e, appid)
 
         async def on_group_at_message_create(self, message):
+            if _stale(appid, gen):
+                return
             # botpy 原生解析器（平台推 group_at_message_create 时走这里）
             await _handle_group(appid, botdir, message, "群@")
 
         async def on_group_message_create(self, message):
+            if _stale(appid, gen):
+                return
             # 我们自己补的解析器推过来的（平台推 group_message_create 时走这里）。
             # 采集 → _reply → post_group_message 全复用 _handle_group，没有第二套回复链路。
             await _handle_group(appid, botdir, message, "群消息(新事件)")
 
         async def on_c2c_message_create(self, message):
+            if _stale(appid, gen):
+                return
             # 同一条私聊消息有时会被两个事件回调各投一次：按 msg_id 去重，只处理一次
             if _dedupe_message(appid, message, "私聊"):
                 return
@@ -6223,12 +6396,14 @@ def _make_client(appid, secret, botdir):
             try:
                 # 私聊的会话键用 p + 对方 openid（之前误用了群的 g + group_openid，
                 # 而 C2CMessage 根本没有 group_openid 属性 → 回私聊必报 AttributeError）
+                say = await _reply(appid, botdir,
+                                   "p" + str(message.author.user_openid), "", text,
+                                   images=images)
+                if not say:
+                    return         # 出站清洗判空：这条不发（_reply 里已记「丢弃」日志）
                 await message._api.post_c2c_message(
                     openid=message.author.user_openid, msg_type=0,
-                    msg_id=message.id,
-                    content=await _reply(appid, botdir,
-                                         "p" + str(message.author.user_openid), "", text,
-                                         images=images),
+                    msg_id=message.id, content=say,
                 )
             except Exception as e:
                 log("回私聊失败：%r" % e, appid)
@@ -6358,8 +6533,27 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
         if not text:
             text = "（模型没返回内容）"
         raw_len = len(text)
+        # ① 出站清洗：模型把自己的指令 / 思考 / 收尾标记一起抄出来时，这里只留正文
+        before = text
+        text = sanitize_reply(text)
+        if text != before.strip():
+            log("出站清洗：删掉指令/思考片段（%d → %d 字）" % (len(before), len(text)), appid)
+        if not text:
+            log("出站清洗：内容为空，丢弃", appid)
+            return ""
         text = _clean_reply(text)
         log("回复清洗：原 %d 字 → 现 %d 字" % (raw_len, len(text)), appid)
+        # ② 称呼兜底：对方不是主人时，「主人」不许发出去（master_word_guard 默认开）
+        if _master_guard_on(_base_dir):
+            fixed, n_fix, others = _master_word_fix(botdir, key, text)
+            if n_fix:
+                if others:
+                    log("称呼兜底：替换 %d 处「主人」→「%s」（对方非主人）"
+                        % (n_fix, others), appid)
+                else:
+                    log("称呼兜底：删除 %d 处「主人」→「你」（对方非主人，未配置称呼）"
+                        % n_fix, appid)
+                text = fixed
         _remember(botdir, key, "assistant", text)
         # 存档：把这一轮发出去的话补到「刚收到那条」的 reply_text 上（一行 = 原文 ⇢ 回复）
         _arc_reply_by_key(botdir, key, text)
@@ -6379,38 +6573,99 @@ def _own(appid, gen):
     return _bots.get(appid, {}).get("gen") == gen
 
 
+_stale_seen = set()      # "appid:gen" —— 同一个已停止实例只记一次，避免刷屏
+
+
+def _stale(appid, gen):
+    """这条事件来自一个已经被停掉的实例吗？
+
+    为什么必须有：stop_one 提升 generation 之后，旧 botpy client 手里可能还有
+    已经排进队列的回调在路上，它们照样能发消息 —— 用户看到的就是
+    「界面显示已停止，bot 还在回话」。所有事件处理器入口先过这里。
+    """
+    if _own(appid, gen):
+        return False
+    key = "%s:%s" % (appid, gen)
+    with _lock:
+        first = key not in _stale_seen
+        _stale_seen.add(key)
+    if first:
+        log("忽略：来自已停止实例的事件", appid)
+    return True
+
+
+async def _safe_close(client, appid=""):
+    """把 botpy 的 close() 真正跑完。
+
+    botpy.client.Client.close 是**协程**（_closed 置位 + await self.http.close()）。
+    直接 c.close() 只是造了个没人 await 的协程对象，一条连接都没断 ——
+    这正是「关掉 bot 但 bot 仍在跑」的根因。而且它必须投递到 client 自己的
+    那个 loop 上执行（_run_bot 里 new_event_loop 那个），不能在当前线程直接 await。
+    """
+    if client is None:
+        return
+    try:
+        r = client.close()
+        if asyncio.iscoroutine(r):
+            await r
+    except Exception as e:
+        log("close() 出错（忽略）：%r" % e, appid)
+
+
 def _run_bot(appid, secret, botdir, gen=None):
     loop = None
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
+        with _lock:
+            if _own(appid, gen):
+                # 尽早登记：stop_one 要把 close() 投递到这个 loop 上、再 call_soon_threadsafe(stop)
+                # 让 run_until_complete 退出；没有它 stop_one 就只能改状态，连接照跑
+                _bots[appid]["loop"] = loop
         try:
             os.chdir(botdir)
         except Exception:
             pass
         _fix_botpy_logging(botdir)
         log("准备连接…", appid)
-        client = _make_client(appid, secret, botdir)
+        client = _make_client(appid, secret, botdir, gen)
         with _lock:
-            if _own(appid, gen):
+            mine = _own(appid, gen)
+            if mine:
                 _bots[appid]["status"] = "连接中"
                 _bots[appid]["client"] = client
+        if not mine:
+            # 启动过程中就被 stop_one 停掉了：别再连了，否则这条连接没人能停
+            log("已停止：启动过程中收到停止指令，不再连接", appid)
+            return
         log("开始 run()（阻塞直到连接结束）", appid)
         client.run(appid=appid, secret=secret)
-        log("run() 返回，连接已结束", appid)
         with _lock:
-            if _own(appid, gen):
+            mine = _own(appid, gen)
+        log("run() 返回（%s）" % ("连接已结束" if mine else "实例已被停止"), appid)
+        with _lock:
+            if mine:
                 _bots[appid]["status"] = "连接已结束"
     except Exception as e:
-        log("启动失败：%s" % e, appid)
-        log(traceback.format_exc()[:1200], appid)
         with _lock:
-            if _own(appid, gen):
-                _bots[appid]["status"] = "启动失败：%s" % str(e)[:60]
+            mine = _own(appid, gen)
+        if not mine:
+            # 这条线程是被 stop_one 停掉的：loop.stop() 会让 botpy 里的
+            # run_until_complete 抛 RuntimeError(Event loop stopped before Future completed)
+            # —— 那是「停成功」的回执，不是启动失败
+            log("run() 已退出（实例已被停止）：%s" % e, appid)
+        else:
+            log("启动失败：%s" % e, appid)
+            log(traceback.format_exc()[:1200], appid)
+            with _lock:
+                if _own(appid, gen):
+                    _bots[appid]["status"] = "启动失败：%s" % str(e)[:60]
     finally:
         with _lock:
             if _own(appid, gen):
                 _bots[appid]["alive"] = False
+            if _bots.get(appid, {}).get("loop") is loop:
+                _bots[appid]["loop"] = None      # 别攥着一个已经关掉的 loop
         if loop is not None:
             try:
                 asyncio.set_event_loop(None)
@@ -6457,7 +6712,7 @@ def start_one(appid, secret, base_dir):
         _bots[appid] = {
             "appid": appid, "dir": botdir, "status": "正在启动",
             "alive": True, "started_at": time.time(), "name": "",
-            "client": None, "gen": gen,
+            "client": None, "loop": None, "gen": gen,
         }
     t = threading.Thread(target=_run_bot, args=(appid, secret, botdir, gen), daemon=True)
     t.start()
@@ -6465,23 +6720,44 @@ def start_one(appid, secret, base_dir):
 
 
 def stop_one(appid):
+    """真的把这个 bot 停掉（不只是把状态写成「已停止」）。
+
+    三步缺一不可：
+      ① 提升 generation —— 从这一刻起旧 client 投回来的事件全部被 _stale() 丢掉；
+      ② 关 http/gateway —— botpy 的 close() 是协程，必须 asyncio.run_coroutine_threadsafe
+         投递到它自己的 loop 上 await（在当前线程直接 c.close() 只造了个协程对象）；
+      ③ 停那个 loop —— client.run() 内部是 loop.run_until_complete(runner())，
+         不停它 run() 永远不返回，线程和连接就都还在跑。
+    """
     appid = str(appid or "").strip()
     with _lock:
         info = _bots.get(appid)
-    if not info:
-        return "没在跑"
-    log("收到停止指令", appid)
-    try:
+        if not info:
+            return "没在跑"
+        if not info.get("alive") and info.get("loop") is None:
+            return "没在跑"      # 已经停透了：重复调 stop_all 不刷日志
+        loop = info.get("loop")
         c = info.get("client")
-        if c is not None:
-            c.close()
+        # ① 先失效：状态与 generation 一次改完，别让旧实例在这中间再回一条
+        info["gen"] = time.time()
+        info["status"] = "已停止"
+        info["alive"] = False
+        info["client"] = None
+        info["loop"] = None
+        info["stopped_at"] = time.time()
+    log("收到停止指令", appid)
+    if loop is None or not loop.is_running():
+        log("已停止（该实例没连上过，事件将被忽略）", appid)
+        return "OK"
+    # ② 关 http/gateway：close() 是协程，必须投递到它自己那个 loop 上 await
+    fut = None
+    try:
+        fut = asyncio.run_coroutine_threadsafe(_safe_close(c, appid), loop)
     except Exception as e:
-        log("close() 出错（忽略）：%r" % e, appid)
-    with _lock:
-        if appid in _bots:
-            _bots[appid]["status"] = "已停止"
-            _bots[appid]["alive"] = False
-            _bots[appid]["client"] = None
+        log("投递 close() 出错（忽略）：%r" % e, appid)
+    # ③ 等 close() 跑完再停 loop —— 交给一个短命线程，不阻塞调用方
+    #    （Kotlin 的 stop_all 是从主线程调的，同步等 3 秒会卡界面）
+    threading.Thread(target=_finish_stop, args=(appid, loop, fut), daemon=True).start()
     return "OK"
 
 
@@ -6544,9 +6820,35 @@ def start_all(bots_json, base_dir):
     return "\n".join(results)
 
 
+def _finish_stop(appid, loop, fut):
+    """停 loop 并把「已停止」落进日志（在单独线程里做，stop_one 立即返回）。
+
+    client.run() 内部是 loop.run_until_complete(runner())：不停这个 loop，
+    run() 永远不返回，线程和连接就都还在跑 —— 界面上「已停止」而 bot 还在回话。
+    """
+    try:
+        if fut is not None:
+            fut.result(timeout=3)          # http/gateway 真的关掉
+    except Exception as e:
+        log("等 close() 超时/出错（继续停 loop）：%r" % e, appid)
+    try:
+        loop.call_soon_threadsafe(loop.stop)
+    except Exception as e:
+        log("停 loop 出错（忽略）：%r" % e, appid)
+    end = time.time() + 3.0
+    while time.time() < end and loop.is_running():
+        time.sleep(0.02)
+    log("已停止（loop 已停，旧实例事件将被忽略）", appid)
+
+
 def stop_all():
-    for appid in list(_bots.keys()):
-        stop_one(appid)
+    """逐个真停（不是只改状态）：stop_one 会关 http、停 loop、提升 generation。"""
+    ids = list(_bots.keys())
+    for appid in ids:
+        try:
+            stop_one(appid)
+        except Exception as e:
+            log("停止 %s 出错（继续停其它）：%r" % (appid, e), appid)
     return "OK"
 
 
