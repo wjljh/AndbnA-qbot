@@ -174,7 +174,8 @@ def test_inject():
     check("群聊 → 只给 others 那句 + 禁止「主人」",
           "请称呼对方为「小可爱」" in rules2 and "禁止用「主人」称呼对方" in rules2
           and "阿爸" not in rules2, rules2)
-    check("日志写明对象=其他人", "称呼：对象=其他人（openid 前 8 位 GROUP99）" in logs(), logs())
+    # 群里的判定改成按 openid（1.1.x：「不认主」修复），日志带上判据；这里没传 member_oid
+    check("日志写明对象=其他人", "称呼：对象=其他人（群=GROUP99｜作者前 8 位 未知）" in logs(), logs())
     sysmsg2 = br._build_messages(bot, "gGROUP99", "小明", "在吗")[0]["content"]
     check("群聊的 prompt 只有 others，没有 master",
           "小可爱" in sysmsg2 and "阿爸" not in sysmsg2 and "称呼主人为" not in sysmsg2,

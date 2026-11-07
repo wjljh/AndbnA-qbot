@@ -217,6 +217,13 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
         enabled = loaded?.enabled ?: false
         inherit = loaded?.useGlobalLlm ?: true
         personas = plist
+        // 迁移：老 bot 没有 persona_meta.json 的，打开时就地按「当前人格来源」补一份
+        // （Python 侧对缺文件是「回退按名字」，导入的同名人格会被误判成内置，所以才要补）
+        val curPersona = loaded?.persona.orEmpty()
+        if (curPersona.isNotBlank()) {
+            val d = java.io.File(BotHost.dataDir(ctx), appid)
+            withContext(Dispatchers.IO) { PersonaAssets.ensurePersonaMeta(ctx, curPersona, d) }
+        }
         llmK = k
         llmA = a
         llmM = m

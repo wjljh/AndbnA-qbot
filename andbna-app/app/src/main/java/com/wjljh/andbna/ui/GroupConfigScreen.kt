@@ -238,6 +238,9 @@ private fun GroupEditScreen(
             dailyLimit = limit?.coerceAtLeast(0),
             webSearch = webSearch,
             enabled = enabled,
+            // 这一页没有「本群主人」入口（默认自动识别：群里发言的 openid 与私聊主人一致即为主人），
+            // 但老数据里可能已经写了 owner_member_openid —— 原样带过去，别因为保存一次就抹掉
+            ownerMemberOpenid = baseline?.ownerMemberOpenid,
         )
         scope.launch {
             val err = withContext(Dispatchers.IO) { GroupConfig.save(ctx, appid, gid, conf) }

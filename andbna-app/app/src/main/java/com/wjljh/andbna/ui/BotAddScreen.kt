@@ -28,6 +28,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.wjljh.andbna.local.BotHost
 import com.wjljh.andbna.local.BotStore
 import com.wjljh.andbna.local.BotStore.llmApi
 import com.wjljh.andbna.local.BotStore.llmKey
@@ -136,6 +137,12 @@ fun BotAddScreen(metrics: Metrics, onBack: () -> Unit, onCreated: (String) -> Un
                         useGlobalLlm = inherit,
                     )
                 )
+                // 新建即落人格：正文 + 来源标记（persona_meta.json）一起写 ——
+                // 只写 localbots.json 的话，Python 侧只能按人格名字猜来源，
+                // 导入的同名人格（也叫「鲸鱼娘」）会被当成内置档
+                if (persona.isNotBlank()) {
+                    PersonaAssets.writeTo(ctx, persona, java.io.File(BotHost.dataDir(ctx), id))
+                }
                 if (!inherit) {
                     // 没有 per-bot 模型存储：沿用全局三件套（与 Bot 页「模型配置」同一份接口）
                     ctx.llmKey = llmK

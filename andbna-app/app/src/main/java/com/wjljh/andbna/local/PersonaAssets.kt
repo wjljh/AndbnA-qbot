@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.provider.OpenableColumns
 import android.util.Log
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.nio.ByteBuffer
@@ -39,6 +40,15 @@ object PersonaAssets {
 
     /** 原文件名的侧车后缀：<档名>.orig 里存导入时的原始文件名，删除时一起删。 */
     private const val ORIG_SUFFIX = ".orig"
+
+    /**
+     * 人格来源标记（<botdir>/persona_meta.json）。
+     *
+     * Python 侧以前按**人格名字**猜内置：用户导入的同名人格（也叫「鲸鱼娘」）就被当成内置档，
+     * 定时问候锁死、提示「内置人格不能更改」。这份标记才是唯一可信的来源：
+     * {"builtin": true|false, "name": "<人格名>"}（name 不带「自定义：」前缀）。
+     */
+    const val META = "persona_meta.json"
 
     /** 导入结果：失败也要给一句人能读的原因；成功时 message = 导入时的原文件名。 */
     class ImportResult(val ok: Boolean = false, val name: String = "", val message: String = "")
@@ -109,6 +119,8 @@ object PersonaAssets {
                 val dir = File(base, id).apply { mkdirs() }
                 File(dir, "persona.txt").writeText(text + "\n")
                 File(dir, "persona_name.txt").writeText(name + "\n")
+                // 来源标记跟正文同步写：切换人格也是「应用人格」的一种
+                writePersonaMeta(dir, isBuiltinName(ctx, name), name)
             }
             ctx.getSharedPreferences(PREF, Context.MODE_PRIVATE)
                 .edit().putString(KEY, name).apply()
@@ -140,17 +152,56 @@ object PersonaAssets {
         return out.filterValues { it.isNotEmpty() }
     }
 
-    /** 把某档人格写进指定目录（多 bot 时每个 bot 一份；自定义与内置走同一入口） */
+    /**
+     * 把某档人格写进指定目录（多 bot 时每个 bot 一份；自定义与内置走同一入口）。
+     *
+     * persona.txt / persona_name.txt / persona_meta.json 三份一起写：只写正文的话，
+     * Python 侧就只能按名字猜来源 —— 这正是「导入的同名人格被当成内置」的根因。
+     */
     fun writeTo(ctx: Context, name: String, dir: java.io.File): Boolean {
         val text = readText(ctx, name) ?: return false
         return try {
             dir.mkdirs()
             File(dir, "persona.txt").writeText(text + "\n")
             File(dir, "persona_name.txt").writeText(name + "\n")
+            writePersonaMeta(dir, isBuiltinName(ctx, name), name)
             true
         } catch (e: Exception) {
             false
         }
+    }
+
+    /** 这个名字是不是内置档（assets/personas 里那份）。自定义档一律带前缀，所以先看前缀。 */
+    fun isBuiltinName(ctx: Context, name: String): Boolean =
+        !isCustom(name) && list(ctx).contains(name.trim())
+
+    /**
+     * 写 <botdir>/persona_meta.json —— 所有写人格的路径都从这里过，别各处散写。
+     *
+     * 名字去掉「自定义：」前缀再落盘：Python 侧拿它跟内置档名比对，前缀会让比对永远落空。
+     */
+    fun writePersonaMeta(dir: File, builtin: Boolean, name: String): Boolean = try {
+        dir.mkdirs()
+        val o = JSONObject()
+            .put("builtin", builtin)
+            .put("name", name.removePrefix(CUSTOM_PREFIX).trim())
+        File(dir, META).writeText(o.toString(1), Charsets.UTF_8)
+        true
+    } catch (e: Exception) {
+        Log.w(TAG, "写 " + META + " 失败：" + (e.message ?: e.javaClass.simpleName))
+        false
+    }
+
+    /**
+     * 老 bot 没有 persona_meta.json：按**当前人格的来源**补写一次。
+     *
+     * Python 侧对缺文件的兼容是「回退按名字」，所以不补也能跑（同名人格照旧判错），
+     * 但打开 / 保存这个 bot 时就地补上，老数据会自然收敛。
+     */
+    fun ensurePersonaMeta(ctx: Context, name: String, dir: File): Boolean {
+        if (name.isBlank()) return false
+        if (File(dir, META).isFile) return false
+        return writePersonaMeta(dir, isBuiltinName(ctx, name), name)
     }
 
     // ── 自定义人格：导入 / 删除 ─────────────────────────────────────────

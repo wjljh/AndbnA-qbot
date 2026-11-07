@@ -1086,6 +1086,63 @@ def _persona_name(botdir):
     return name
 
 
+# persona_meta.json：人格的**来源标记**（Kotlin 侧在应用人格时写），
+# {"builtin": true|false, "name": "鲸鱼娘"}。内置判定优先看它，**不看名字**：
+# 用户导入的自定义人格可以叫「鲸鱼娘」，名字撞上不等于内置（1.1.x 的真机事故）。
+_persona_meta_missing_logged = set()
+
+
+def _persona_meta(botdir):
+    """<botdir>/persona_meta.json 的 dict；文件缺失 / 读坏 / 不是对象 → {}（调用方回退旧行为）。"""
+    d = _load_json(os.path.join(_bot_root(botdir), "persona_meta.json"), {})
+    return d if isinstance(d, dict) else {}
+
+
+def _persona_name_raw(botdir):
+    """persona_name.txt 的原文（只去空白）：「自定义：」前缀本身就是自定义人格的证据。"""
+    try:
+        with open(os.path.join(_bot_root(botdir), "persona_name.txt"), encoding="utf-8") as f:
+            return f.read().strip()
+    except Exception:
+        return ""
+
+
+def _greet_preset(botdir):
+    """→ 内置预设的固定时段（list）或 None；**唯一**的内置判定点。
+
+    判定顺序（1.1.x 真机事故：用户导入的人格叫「鲸鱼娘」→ 被当成内置 → 问候锁死）：
+      ① <botdir>/persona_meta.json 的 builtin（Kotlin 侧写）：true → 锁死内容；
+         false → 一律按自定义人格，再像的名字也不锁。
+      ② 没有 meta：persona_name.txt 原文带「自定义：」前缀 → 直接当自定义人格，
+         不做名字匹配（_persona_name 会把前缀去掉，只剩名字，所以要看原文）。
+      ③ 都没有（老装机 / 还没迁移）：回退旧行为 —— 按名字匹配，并记一行日志。
+    """
+    meta = _persona_meta(botdir)
+    if meta:
+        if not bool(meta.get("builtin")):
+            return None
+        name = str(meta.get("name") or "").strip() or _persona_name(botdir)
+        fixed = _PRESET_GREETINGS.get(name)
+        if not fixed:
+            log("问候判定：persona_meta.json 标了内置，但代码里没有「%s」的预设问候 → 按文件槽位"
+                % name)
+        return fixed
+    raw = _persona_name_raw(botdir)
+    if raw.startswith("自定义：") or raw.startswith("自定义:"):
+        log("问候判定：persona_name.txt 带「自定义：」前缀 → 自定义人格（不按名字匹配）")
+        return None
+    root = _bot_root(botdir)
+    with _lock:
+        seen = root in _persona_meta_missing_logged
+        if not seen:
+            if len(_persona_meta_missing_logged) > 240:
+                _persona_meta_missing_logged.clear()
+            _persona_meta_missing_logged.add(root)
+    if not seen:
+        log("问候判定：persona_meta.json 缺失，回退按名字匹配")
+    return _PRESET_GREETINGS.get(_persona_name(botdir))
+
+
 # 内置预设人格的固定问候：名字键 = assets/personas 档名去掉后缀。
 # 三个时段（早上 08:00 / 午间 12:00 / 深夜 22:00），每个时段 2~3 条，口吻照各角色的
 # 表达 DNA 写（参考 DGP-Studio/Genshin.Skill，MIT；只借鉴语气，不照抄原句）。
@@ -1331,7 +1388,7 @@ def _greetings_conf(botdir):
     d = _load_json(_bot_words_paths(botdir)[1], {})
     if not isinstance(d, dict):
         d = {}
-    fixed = _PRESET_GREETINGS.get(_persona_name(botdir))
+    fixed = _greet_preset(botdir)
     if fixed:
         # 预设人格的时段：文件里能改 at / window_min / disabled（内容仍从代码来，
         # 所以文件里的 lines 一律为空、也被忽略）。
@@ -1412,6 +1469,76 @@ def _is_master_key(botdir, key):
     """这个会话是不是主人私聊：私聊的会话键是 "p" + 主人 openid。"""
     owner = _owner_openid(botdir)
     return bool(owner) and str(key or "") == "p" + owner
+
+
+def _group_owner(botdir, gid):
+    """该群**手工指定**的主人 member_openid（groups/<gid>.json 的 owner_member_openid）。
+
+    可选覆盖：只用于主人认错时手工纠正；没配 → 空串，回退「作者 openid == 主人 openid」。
+    文件名先试全量 gid、再试前 8 位（两种写法都兼容）；读不到 → 空串。
+    """
+    gid = str(gid or "").strip()
+    if not gid:
+        return ""
+    for name in (gid, gid[:8]):
+        if not name:
+            continue
+        path = _group_conf_path(botdir, name)
+        if not path:
+            continue
+        d = _load_json(path, {})
+        if not isinstance(d, dict):
+            continue
+        v = str(d.get("owner_member_openid") or "").strip()
+        if v:
+            return v
+    return ""
+
+
+def _member_openid_of(message):
+    """真人发言人的 openid：message 对象 / raw dict / 直接给的 openid 字符串都能吃。"""
+    if message is None:
+        return ""
+    if isinstance(message, str):
+        return message.strip()
+    if isinstance(message, dict):
+        v = str(message.get("member_openid") or "").strip()
+        if v:
+            return v
+        a = message.get("author")
+        return str(a.get("member_openid") or "").strip() if isinstance(a, dict) else ""
+    v = getattr(message, "member_openid", None)
+    if v and str(v).strip():
+        return str(v).strip()
+    for src in (getattr(message, "author", None), message):
+        if src is None:
+            continue
+        v = getattr(src, "member_openid", None)
+        if v and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def _is_master_msg(botdir, gid, message):
+    """这一轮的对话对象是不是主人（群聊 / 私聊都认）。
+
+    同一个 bot 下，群里的 member_openid 与私聊的 user_openid 是**同一套 id**，
+    所以群里直接比 openid 就够了：作者 openid == owner.json 记下的主人 openid → 主人。
+    groups/<gid>.json 的 owner_member_openid 是可选覆盖（手工纠正）：配了优先用它。
+    认不出发言人 / 作者是 bot → 不是主人（空 == 空 不算命中）。
+    """
+    if not isinstance(message, str) and message is not None:
+        author = getattr(message, "author", None)
+        if _attr(author, "bot", "is_bot", "isBot") is True:
+            return False
+    oid = _member_openid_of(message)
+    if not oid:
+        return False
+    gid = str(gid or "").strip()
+    if not gid:
+        return _is_master_key(botdir, "p" + oid)      # 私聊：还是老的会话键判定
+    want = _group_owner(botdir, gid) or _owner_openid(botdir)
+    return bool(want) and oid.upper() == want.upper()
 
 
 def _greeted_path(botdir):
@@ -1650,7 +1777,7 @@ def _migrate_words(botdir, appid=""):
                 aliases.setdefault(key, vv)
         if _save_json(ph_path, {"aliases": aliases}) and aliases:
             log("迁移称呼到本 bot：%s" % _aliases_sentence(aliases), appid)
-    fixed = _PRESET_GREETINGS.get(_persona_name(abs_dir))
+    fixed = _greet_preset(abs_dir)
     raw = _load_json(gr_path, None)
     d = dict(raw) if isinstance(raw, dict) else {}
     changed = not isinstance(raw, dict)
@@ -1685,7 +1812,7 @@ def _migrate_words(botdir, appid=""):
             len(fixed or d.get("slots") or [])), appid)
 
 
-def _words_rules(botdir, key=""):
+def _words_rules(botdir, key="", member_oid=""):
     """人格之后追加的**硬规则**（祈使句），按对话对象只给一个：主人 → master，其它 → others。
 
     位置固定在人格之后，而且用命令语气：内置预设人格与用户自定义人格都只在末尾
@@ -1693,16 +1820,32 @@ def _words_rules(botdir, key=""):
     非主人那条**永远**注入（没配 others 也注入）：真机事故就是配置为空时模型照旧喊「主人」，
     注入缺失等于没约束；发送前还有 _master_word_fix 再兜一道。
     主人那条不配 master 就不注入（不拿默认词硬塞）。
+    member_oid = 这一轮发言人的 openid（_group_send 从群消息里取）：群里主人靠它认。
     """
     a = _aliases(botdir)
-    if _is_master_key(botdir, key):
+    gid = _group_of_key(key)
+    member_oid = str(member_oid or "").strip()
+    if gid:
+        # 群里：主人按 openid 判（groups/<gid>.json 的 owner_member_openid 可覆盖）
+        is_master = _is_master_msg(botdir, gid, member_oid)
+        if is_master:
+            log("称呼：对象=主人（命中 owner openid 前 8 位 %s｜群=%s）"
+                % (_oid8(member_oid), _oid8(gid)))
+        else:
+            log("称呼：对象=其他人（群=%s｜作者前 8 位 %s）"
+                % (_oid8(gid), _oid8(member_oid) or "未知"))
+    elif _is_master_key(botdir, key):
+        is_master = True
         log("称呼：对象=主人（openid 前 8 位 %s）" % _oid8(_owner_openid(botdir)))
-        s = ("本轮对话对象就是主人本人。请用「%s」称呼对方，不要换别的称呼。"
-             % a["master"]) if a.get("master") else ""
     else:
+        is_master = False
         who = str(key or "")
         peer = who[1:] if who[:1] in ("p", "g", "c") else ""
         log("称呼：对象=其他人" + (("（openid 前 8 位 %s）" % _oid8(peer)) if peer else ""))
+    if is_master:
+        s = ("本轮对话对象就是主人本人。请用「%s」称呼对方，不要换别的称呼。"
+             % a["master"]) if a.get("master") else ""
+    else:
         if a.get("others"):
             s = ("本轮对话对象不是主人。禁止用「主人」称呼对方；请称呼对方为「%s」。"
                  % a["others"])
@@ -1716,6 +1859,11 @@ def _words_rules(botdir, key=""):
 
 
 _MASTER_WORD = "主人"
+
+# 这一轮群消息发言人的 openid：_group_send 在调 _reply 之前设、之后复位。
+# 群里主人判定要用它，而 _reply 的签名在单测里被 stub 成了固定形状 —— 用上下文变量带过去，
+# 不给老调用点加参数。
+_member_openid_ctx = contextvars.ContextVar("andbna_member_openid", default="")
 
 
 def _master_guard_on(base_dir=""):
@@ -1734,14 +1882,21 @@ def _master_guard_on(base_dir=""):
     return True
 
 
-def _master_word_fix(botdir, key, text):
+def _master_word_fix(botdir, key, text, member_oid=""):
     """发送前兜底：对方不是主人时，正文里不该出现「主人」。
 
-    → (新正文, 替换处数, others 配置值或 "")；主人私聊 / 本来就没有「主人」→ 原样返回。
+    → (新正文, 替换处数, others 配置值或 "")；主人 / 本来就没有「主人」→ 原样返回。
     没配 others 就把这个称呼换成「你」（直接删掉会把句子弄断，换个能读的代称更稳）。
+    主人判定与 _words_rules 共用一套（群里看 openid，私聊看会话键）。
     """
     s = str(text or "")
-    if not s or _MASTER_WORD not in s or _is_master_key(botdir, key):
+    if not s or _MASTER_WORD not in s:
+        return s, 0, ""
+    gid = _group_of_key(key)
+    if gid:
+        if _is_master_msg(botdir, gid, member_oid or _member_openid_ctx.get()):
+            return s, 0, ""
+    elif _is_master_key(botdir, key):
         return s, 0, ""
     others = str(_aliases(botdir).get("others") or "").strip()
     n = s.count(_MASTER_WORD)
@@ -2514,27 +2669,28 @@ def archive_export_text(botdir, max_rows=0):
     return chr(10).join(lines)
 
 
-def _system_prompt(botdir, key):
+def _system_prompt(botdir, key, member_oid=""):
     """系统提示词：人格 → 称呼硬规则 → 当前时间 → 群聊硬规则。
 
     人格走 _persona_for：该群配了 persona（groups/<gid>.json）就用群人格，否则仍是 bot 人格。
     """
     persona = _persona_for(botdir, key)
     sys = persona or "你是一个 QQ 群里的机器人，说话自然简短，像真人聊天。"
-    sys = sys + _words_rules(botdir, key)
+    sys = sys + _words_rules(botdir, key, member_oid)
     sys = sys + chr(10) + chr(10) + "现在是 %s。" % _now_text()
     sys = sys + _CHAT_RULES
     return sys
 
 
-def _build_messages(botdir, key, who, text, first=False, search_hint=False):
+def _build_messages(botdir, key, who, text, first=False, search_hint=False,
+                   member_oid=""):
     """system →（有摘要时）此前对话摘要 → 最近 12 条原文 → 这一条。
 
     first 参数只为兼容老调用点保留：首句不再注入问候语（问候改成时段随机主动私聊）。
     search_hint=True 时在 system 末尾补一段「要不要上网查」的规则（模型自判搜索用）。
     摘要由 _maybe_compress 在 _reply 里写盘，这里只读：读不到就还是纯最近 12 条。
     """
-    sys_text = _system_prompt(botdir, key)
+    sys_text = _system_prompt(botdir, key, member_oid)
     if search_hint:
         sys_text = sys_text + _WEB_HINT_RULE
     # 存档召回与联网并列：跟 web_search 开关无关（翻的是本机聊天记录，不花钱、不出网）
@@ -5640,6 +5796,21 @@ def _speech_mark(gid, appid, name, text=""):
             "text": str(text or ""), "ts": time.time()}
 
 
+_GROUP_MUTEX_SEC = 3.0      # 群级互斥：本群 3 秒内已经有本机别的 bot 发言成功 → 本轮放弃
+
+
+def _group_busy(gid, appid="", since=None):
+    """本群「刚刚」有没有**别的** bot 发言成功？→ (名字, 秒) / ("", 0)。
+
+    窗口 = max(本轮开始生成, 现在-3 秒) → 只看**这一轮开始之后**别的 bot 的发言。
+    所以「真人一句 → A 回 → 收到 A 的话再续一句」这种正常接龙不受影响（B 这一轮在 A
+    发言之后才开头）；被拦住的是「两条不同消息几乎同时进来，两个 bot 各自被总模型点名」。
+    """
+    now = time.time()
+    start = now if since is None else float(since)
+    return _speech_after(gid, max(start, now - _GROUP_MUTEX_SEC), appid)
+
+
 def _speech_after(gid, since, me_appid=""):
     """since 之后本群有没有**别的** bot 发言成功？→ (名字, 秒)；没有 → ("", 0)。"""
     with _gate_lock:
@@ -5930,7 +6101,7 @@ def _closing_hint(n):
 
 async def _group_send(appid, botdir, message, gid, who, model_in, images=None,
                       extra_sys="", closing=None):
-    """群回复的唯一出口：延迟 → 抢先检查 → 生成 → 发出去 → 记「刚说过」。
+    """群回复的唯一出口：延迟 → 抢先检查 → 生成 → 群级互斥 → 发出去 → 记「刚说过」。
 
     closing = {"bot","target","minutes"} 时是 end_topic 的收尾：发出去之后给这对
     关系上静默、把该 bot 的句数清零。→ 发出去的纯文本；放弃 / 失败 → ""。
@@ -5938,12 +6109,25 @@ async def _group_send(appid, botdir, message, gid, who, model_in, images=None,
     gconf = _gate_conf(_base_dir)
     if not await _reply_delay(appid, gid, gconf, _my_entry(appid)):
         return ""
+    t0 = time.time()          # 本轮开始生成：群级互斥只看这之后别的 bot 的发言
     try:
-        reply = await _reply(appid, botdir, "g" + gid, who, model_in, images=images,
-                             extra_sys=extra_sys)
+        tok = _member_openid_ctx.set(_member_openid_of(message))
+        try:
+            reply = await _reply(appid, botdir, "g" + gid, who, model_in, images=images,
+                                 extra_sys=extra_sys)
+        finally:
+            _member_openid_ctx.reset(tok)
         if not reply:
             return ""          # 出站清洗判空：这条不发（_reply 里已记「丢弃」日志）
         plain, at_ids = _resolve_at_tags(reply, _mentions_of(message))
+        # 群级互斥：总模型的决定是按「同一条消息」共享的（_gate_decide 的 8 秒窗口 key 带
+        # 正文哈希），两条不同消息同时进来会各自被判 reply → 两个 bot 同时说话。
+        # 所以在发送前再卡一道：本群这一轮已经有别的 bot 发出去了 → 本轮放弃。
+        busy_name, busy_ago = _group_busy(gid, appid, t0)
+        if busy_name:
+            log("群级互斥：本群 3 秒内已有 %s 发言，放弃（%.1f 秒前）"
+                % (busy_name, busy_ago), appid)
+            return ""
         _note_sent(appid, gid, plain)
         if at_ids:
             log("@ 发出：%d 个（群聊 markdown 消息）" % len(at_ids), appid)
@@ -6453,7 +6637,8 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
             log("联网：该群已关闭联网（groups/%s.json web_search=false），本条跳过触发词搜索"
                 % _oid8(gid_key), appid)
         auto_decide = web_on and bool(conf.get("search_auto_decide", True))
-        msgs = _build_messages(botdir, key, who, incoming, first=first, search_hint=auto_decide)
+        msgs = _build_messages(botdir, key, who, incoming, first=first, search_hint=auto_decide,
+                               member_oid=_member_openid_ctx.get())
         # extra_sys：群内最近消息（带名字标签）/ 收尾提示 —— 插在这一条之前当 system
         if extra_sys:
             msgs.insert(len(msgs) - 1, {"role": "system", "content": extra_sys})
@@ -6545,7 +6730,8 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
         log("回复清洗：原 %d 字 → 现 %d 字" % (raw_len, len(text)), appid)
         # ② 称呼兜底：对方不是主人时，「主人」不许发出去（master_word_guard 默认开）
         if _master_guard_on(_base_dir):
-            fixed, n_fix, others = _master_word_fix(botdir, key, text)
+            fixed, n_fix, others = _master_word_fix(
+                botdir, key, text, _member_openid_ctx.get())
             if n_fix:
                 if others:
                     log("称呼兜底：替换 %d 处「主人」→「%s」（对方非主人）"

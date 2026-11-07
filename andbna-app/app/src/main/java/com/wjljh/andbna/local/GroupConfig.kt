@@ -30,10 +30,20 @@ object GroupConfig {
         val dailyLimit: Int? = null,
         val webSearch: Boolean? = null,
         val enabled: Boolean = true,
+        /**
+         * 本群主人（可选覆盖，键名 owner_member_openid）。
+         *
+         * 正常情况下不需要它：同一个 bot 下群成员的 openid 与私聊 openid 是同一套，
+         * Python 侧直接比对「群里发言的人 == 私聊记录里的主人」就认得出主人。
+         * 这个字段只是「识别不到」时的手工覆盖通道（本轮没有 UI 入口）。
+         * null / 空 = 未设置。
+         */
+        val ownerMemberOpenid: String? = null,
     ) {
         /** 全部跟随 + 未静音：与「没有这份文件」等价。 */
         val isDefault: Boolean
-            get() = autoReply == null && dailyLimit == null && webSearch == null && enabled
+            get() = autoReply == null && dailyLimit == null && webSearch == null && enabled &&
+                ownerMemberOpenid.isNullOrBlank()
     }
 
     /** 群配置页一行：一个群 + 它的运行记录（最后一次活跃时间 / 条数）+ 有没有覆盖。 */
@@ -68,6 +78,8 @@ object GroupConfig {
             else o.optInt("daily_limit", 0).coerceAtLeast(0),
             webSearch = tri("web_search"),
             enabled = if (o.isNull("enabled")) true else o.optBoolean("enabled", true),
+            // 缺项 / null / 空串 = 未设置（org.json 的 optString 会把 JSON null 读成 "null"，先挡一层）
+            ownerMemberOpenid = str(o, "owner_member_openid").ifBlank { null },
         )
     }
 
@@ -88,6 +100,11 @@ object GroupConfig {
                 .put("daily_limit", conf.dailyLimit?.coerceAtLeast(0) ?: JSONObject.NULL)
                 .put("web_search", conf.webSearch ?: JSONObject.NULL)
                 .put("enabled", conf.enabled)
+                // 本群主人：Python 侧读的就是这个键，缺项 / null = 未设置
+                .put(
+                    "owner_member_openid",
+                    conf.ownerMemberOpenid?.trim()?.ifBlank { null } ?: JSONObject.NULL,
+                )
             file(ctx, appid, gid).writeText(o.toString(1), Charsets.UTF_8)
             null
         } catch (e: Exception) {
@@ -129,4 +146,8 @@ object GroupConfig {
         // 已覆盖的排前面（改过的正是想看的那几个），其余按最后活跃时间倒序（Python 已排好）
         return out.sortedByDescending { if (it.overridden) 1 else 0 }
     }
+
+    /** 读一个字符串字段：缺项 / JSON null / 字面量 "null" 一律当空串（org.json 会把它读成 "null"）。 */
+    private fun str(o: JSONObject, key: String): String =
+        if (o.isNull(key)) "" else o.optString(key, "").trim().let { if (it == "null") "" else it }
 }
