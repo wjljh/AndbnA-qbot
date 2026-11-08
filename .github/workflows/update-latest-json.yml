@@ -12,22 +12,29 @@ jobs:
   sync:
     runs-on: ubuntu-latest
     steps:
+      # release 事件默认检出的是 tag（detached HEAD），必须显式检出 main，
+      # 否则 git push 报「fatal: You are not currently on a branch」——v1.0.9 那次就是这样失败的。
       - uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
       - name: 拉取最新 Release 元数据
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p docs
-          gh api repos/${{ github.repository }}/releases/latest \
-            --jq '{tag_name: .tag_name, name: .name, body: .body,
-                   assets: [.assets[] | {name: .name, size: .size, browser_download_url: .browser_download_url}],
-                   published_at: .published_at}' > docs/latest.json
-          echo '--- docs/latest.json ---'
-          head -c 600 docs/latest.json
+          gh api "repos/${{ github.repository }}/releases/latest" \
+            --jq '{tag_name: .tag_name, name: .name, body: .body, assets: [.assets[] | {name: .name, size: .size, browser_download_url: .browser_download_url}], published_at: .published_at}' \
+            > docs/latest.json
+          head -c 400 docs/latest.json; echo
       - name: 提交变更
         run: |
           git config user.name  'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add docs/latest.json
-          git diff --cached --quiet && echo '无变化，跳过' || git commit -m 'chore: 更新 docs/latest.json（${GITHUB_REF_NAME}）'
-          git push
+          if git diff --cached --quiet; then
+            echo 'docs/latest.json 无变化，跳过提交'
+          else
+            git commit -m "chore: 更新 docs/latest.json（${{ github.event.release.tag_name || github.ref_name }}）"
+            git push origin HEAD:main
+          fi
