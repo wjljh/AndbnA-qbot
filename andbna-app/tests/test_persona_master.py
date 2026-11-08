@@ -7,7 +7,8 @@
   B) 群里「认主」：同一个 bot 下群里的 member_openid 与私聊的 user_openid 是**同一套 id**，
      作者 openid == owner.json 记的主人 → 主人称呼；groups/<gid>.json 的
      owner_member_openid 只是可选覆盖（手工纠正用）
-  C) 群级互斥：两条不同消息同时被总模型点名时，同一群 3 秒内只有一个 bot 真的发出去
+  C) 群级互斥：同一条消息被两个 bot 同时点名时只有一个真的发出去。键与 gid 无关 ——
+     真机上两个 bot 的 group_openid 按 bot 隔离，1.0.9 拿 gid 当键永不命中
 
     cd andbna-app && python3 tests/test_persona_master.py
 """
@@ -285,9 +286,14 @@ def test_b():
     check("B5e guard=false 时不写兜底日志", "称呼兜底" not in logtext(), logs())
 
 
-# ── C · 群级互斥：同一群 3 秒内只有一个 bot 真的发出去 ────────────────
+# ── C · 群级互斥：同一条消息只有一个 bot 真的发出去 ────────────────
+# 真机：同一个 QQ 群，两个 bot 看到的 group_openid **不一样**（按 bot 隔离）。
+GID_A = "group_openid_A"      # 惜月看到的群 openid
+GID_B = "group_openid_B"      # 大肥鱼看到的群 openid
+
+
 def test_c():
-    print("[C] 群级互斥：两条不同消息同时被点名时只有一个发出")
+    print("[C] 群级互斥：同一条消息被两个 bot 同时点名时只有一个发出")
     write_llm()
     write_bots([{"appid": "cA", "name": "桑多涅", "enabled": True},
                 {"appid": "cB", "name": "哥伦比娅", "enabled": True}])
@@ -296,36 +302,40 @@ def test_c():
     botB = mkbot("cB", "哥伦比娅")
 
     async def slow(appid, botdir, key, who, incoming, images=None, extra_sys=""):
-        # cA 先发；cB 还在生成（模拟两条消息各自被总模型点名、几乎同时完成）
+        # cA 先发；cB 还在生成（模拟同一条消息被两个 bot 各自点名、几乎同时完成）
         await asyncio.sleep(0.0 if appid == "cA" else 0.08)
         return "%s 说一句" % appid
 
-    async def both():
+    async def both(text):
+        # 两个 bot 的 gid 必须不同（真机就是不同）。1.0.9 的 gid 版互斥只在
+        # 「两个 bot 共享同一个 gid」时命中 —— 那个前提只存在于旧单测里，真机永不命中。
         await asyncio.gather(
-            br._group_send("cA", botA, FakeMsg("mc1", "第一句", FakeAuthor("h1")),
-                           GID, "", "第一句"),
-            br._group_send("cB", botB, FakeMsg("mc2", "第二句", FakeAuthor("h2")),
-                           GID, "", "第二句"),
+            br._group_send("cA", botA, FakeMsg("mc1", text, FakeAuthor("h1"), gid=GID_A),
+                           GID_A, "", text),
+            br._group_send("cB", botB, FakeMsg("mc2", text, FakeAuthor("h1"), gid=GID_B),
+                           GID_B, "", text),
         )
 
     reset_runtime()
     br._reply = slow
-    asyncio.run(both())
+    asyncio.run(both("同一句"))
     got = [kw.get("content") for kw in API.sent]
-    check("C1 同时被选中 → 同一群只发出一条", len(got) == 1, got)
-    check("C1b 另一个记「群级互斥…放弃」日志",
-          any("群级互斥：本群 3 秒内已有" in x and "放弃" in x for x in logs()), logs())
+    check("C1 同一条消息被两个 bot 同时点名（gid 不同）→ 只发出一条", len(got) == 1, got)
+    check("C1b 另一个记「群级互斥…放弃」日志（带会话键）",
+          any("群级互斥：本群 3 秒内已有" in x and "放弃" in x and "键=" in x
+              for x in logs()), logs())
 
     async def fast(appid, botdir, key, who, incoming, images=None, extra_sys=""):
         return "%s 接一句" % appid
 
     reset_runtime()
     br._reply = fast
-    asyncio.run(br._group_send("cA", botA, FakeMsg("mc3", "第一句", FakeAuthor("h3")),
-                              GID, "", "第一句"))
-    # 正常接龙：B 这一轮在 A 已经说完之后才开头（不是并发）→ 不该被拦
-    asyncio.run(br._group_send("cB", botB, FakeMsg("mc4", "桑多涅那句", FakeAuthor("oid_cA", bot=True)),
-                              GID, "桑多涅", "桑多涅那句"))
+    asyncio.run(br._group_send("cA", botA, FakeMsg("mc3", "第一句", FakeAuthor("h3"), gid=GID_A),
+                              GID_A, "", "第一句"))
+    # 正常接龙：B 这一轮在 A 已经说完之后才开头（触发它的是 A 那句，不是同一条消息）→ 不该被拦
+    asyncio.run(br._group_send("cB", botB,
+                              FakeMsg("mc4", "桑多涅那句", FakeAuthor("oid_cA", bot=True), gid=GID_B),
+                              GID_B, "桑多涅", "桑多涅那句"))
     check("C2 正常接龙（B 在 A 发言之后才开头）→ 照常发出，不被互斥误伤",
           len(API.sent) == 2, [kw.get("content") for kw in API.sent])
 

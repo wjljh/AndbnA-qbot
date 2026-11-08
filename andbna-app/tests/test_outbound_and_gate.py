@@ -179,9 +179,12 @@ def test_words():
     check("1a 非主人 → 祈使句硬规则 + others 配置值",
           "本轮对话对象不是主人" in rules and "禁止用「主人」称呼对方" in rules
           and "客人" in rules, rules)
-    check("1b 规则在人格之后（_system_prompt 以人格开头、规则收尾）",
-          br._system_prompt(bot, "g" + GID).startswith(br._persona(bot)),
-          br._system_prompt(bot, "g" + GID)[:20])
+    # 1.0.9：身份行排在最前（模型以前不知道自己叫什么），人格紧随其后、规则收尾
+    sysp = br._system_prompt(bot, "g" + GID)
+    check("1b 身份行 → 人格 → 规则（顺序固定）",
+          sysp.startswith("你叫「") and br._persona(bot) in sysp
+          and sysp.index(br._persona(bot)) < sysp.index("本轮对话对象不是主人"),
+          sysp[:20])
     check("1c 没配 others → 仍注入禁止「主人」，改叫「你」",
           "禁止用「主人」称呼对方" in br._words_rules(botdir("botB"), "g" + GID)
           and "「你」" in br._words_rules(botdir("botB"), "g" + GID))

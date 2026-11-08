@@ -79,7 +79,6 @@ fun LocalStatusContent(metrics: Metrics, onOpenDetail: () -> Unit = {}) {
         )
     }
     var probeText by remember { mutableStateOf("") }
-    var logText by remember { mutableStateOf("") }
     var msg by remember { mutableStateOf("") }
     var msgOk by remember { mutableStateOf(true) }
     var busy by remember { mutableStateOf(false) }
@@ -104,8 +103,8 @@ fun LocalStatusContent(metrics: Metrics, onOpenDetail: () -> Unit = {}) {
             BotService.start(ctx)
         }
         while (true) {
-            // 状态每 3 秒刷一次就够；日志每 9 秒拉一次
-            // —— 每次 logTail 都是一次跨 Chaquopy 的字符串复制，2 秒一次会明显卡
+            // 状态每 3 秒刷一次就够；日志不在这里拉（那是「日志」页的事，
+            // 每次 logTail 都是一次跨 Chaquopy 的字符串复制，放在常驻轮询里会明显卡）
             status = BotHost.stateText().also {
                 if (it.isNotBlank()) Prefs.put(ctx, "last_state", it)
             }
@@ -126,7 +125,7 @@ fun LocalStatusContent(metrics: Metrics, onOpenDetail: () -> Unit = {}) {
         PageColumn(metrics) {
             // 错误横幅在 hero 上方（spec 11 §2：hero 永远不染红）
             if (hasError) {
-                Note("bot 启动异常，看下面日志", ok = false)
+                Note("bot 启动异常，去「日志」页看原因", ok = false)
             }
 
             val curMode = ModeStore.get(ctx) ?: ModeStore.initial(ctx)
@@ -165,10 +164,10 @@ fun LocalStatusContent(metrics: Metrics, onOpenDetail: () -> Unit = {}) {
                             BotService.startByUser(ctx)
                             msgOk = true
                             msg = "已拉起前台服务（$botCount 个 bot）"
+                            // 日志只在「日志」页看（那边有筛选/导出）；这里只把状态读新
                             scope.launch {
                                 delay(1500)
                                 status = BotHost.stateText()
-                                logText = BotHost.logTail(150)
                             }
                         }
                     }

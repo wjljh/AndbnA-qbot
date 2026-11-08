@@ -269,8 +269,10 @@ def main():
               encoding="utf-8") as f:
         f.write("我是该群专门用的人格")
     sys_prompt = br._system_prompt(BOTDIR, "g" + GA)
+    # 1.0.9 起最前面还多一行身份（"你叫「…」。…"），所以不再要求以人格开头
     check("7 群人格已下线：恒用 bot 人格（老 groups/<gid>.persona.txt 被忽略）",
-          sys_prompt.startswith("我是 bot 全局人格"), sys_prompt[:24])
+          sys_prompt.startswith("你叫「") and "我是 bot 全局人格" in sys_prompt
+          and "我是该群专门用的人格" not in sys_prompt, sys_prompt[:24])
     check("7b 不再记「群人格找不到文件」日志（那段逻辑已删）",
           not any("群人格" in x for x in logs()),
           str([x for x in logs() if "群人格" in x][:1]))

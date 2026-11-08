@@ -421,6 +421,21 @@ object BotStore {
             sp(this).edit().putString("master_word_guard", if (v) "1" else "0").apply()
         }
 
+    /**
+     * 日志详细程度：simple（简洁，默认）/ detail（详细）。
+     *
+     * 真正的过滤在 Python 写日志时按 llm.json 的 log_level 完成，这里只负责落盘一份；
+     * 脏值 / 缺键一律回落到 simple，别让旧值把日志整个吞掉。
+     */
+    var Context.logLevel: String
+        get() = sp(this).getString("log_level", "").orEmpty().trim()
+            .let { if (it == "detail") "detail" else "simple" }
+        set(v) {
+            sp(this).edit()
+                .putString("log_level", if (v.trim() == "detail") "detail" else "simple")
+                .apply()
+        }
+
     /** 回复判定：llm=模型判断要不要插话，random=按闲聊概率掷骰子 */
     var Context.replyJudge: String
         get() = sp(this).getString("reply_judge", "llm").orEmpty().ifBlank { "llm" }
@@ -511,6 +526,8 @@ object BotStore {
             .put("master_word_guard", ctx.masterWordGuard)
             // 全局每日上限：群配置「跟随全局」时 Python 侧读这一档（0 = 无上限）
             .put("daily_limit", ctx.dailyLimit)
+            // 日志详细程度（simple / detail）：Python 写日志时按它决定是否带细节
+            .put("log_level", ctx.logLevel)
         try {
             val f = File(ctx.filesDir, "localbot/llm.json")
             f.parentFile?.mkdirs()
