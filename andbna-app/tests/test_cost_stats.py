@@ -54,7 +54,7 @@ class H(BaseHTTPRequestHandler):
 
 
 def main():
-    br.log = lambda m, appid="": None
+    br.log = lambda m, appid="", cat="系统", lv="simple": None
     srv = ThreadingHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     api = "http://127.0.0.1:%d/chat/completions" % srv.server_address[1]

@@ -146,6 +146,9 @@ def test_migrate():
 def test_inject():
     print("[2] 注入")
     base = tempfile.mkdtemp(prefix="andbna-words-")
+    # 本段断言「称呼 / 注入称呼」技术行 → 按 detail 跑
+    br._base_dir = base
+    write(os.path.join(base, "llm.json"), {"log_level": "detail"})
     bot = mkbot(base, "botA")
     clear_logs()
     rules = br._words_rules(bot, "gGROUP99")

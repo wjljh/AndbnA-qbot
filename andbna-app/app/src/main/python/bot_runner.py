@@ -31,9 +31,143 @@ def _stamp():
     return time.strftime("%m-%d %H:%M:%S")
 
 
-def log(msg, appid=""):
-    tag = ("[%s] " % appid) if appid else ""
-    line = "[%s] %s%s" % (_stamp(), tag, msg)
+# ── 日志：六类 + 两级详细度 ────────────────────────────────
+#
+# 一行 = [时间] [bot] 类别 · 一句话（没有 bot 的行省略 [bot]）。类别只有六个：
+#   消息：收到什么（作者 / 是否 @ 我 / 摘要）      判定：要不要回、谁回、为什么
+#   回复：发出什么、成功还是失败                  系统：启停 / 连接 / 人格 / 配置 / 调度
+#   更新：检查更新 / 下载 / 安装                  错误：任何失败与异常（总带原因）
+# 详细度取 llm.json 的 log_level：simple（默认）只出结论行，detail 才出技术行
+# （去重键 / 请求体字段 / 用量 / 称呼 / 总模型候选 / 发言人识别 / 余额 …）。
+# 错误类不受详细度影响 —— 出问题必须看得见。
+LOG_CATS = ("消息", "判定", "回复", "系统", "更新", "错误")
+_LOG_ERR = "错误"
+_LOG_SIMPLE, _LOG_DETAIL = "simple", "detail"
+_LOG_LEVELS = (_LOG_SIMPLE, _LOG_DETAIL)
+MSG_SNIP = 20               # 消息 / 回复摘要超过 20 字截断加 …
+_log_level_cache = {}       # llm.json 路径 -> ((mtime_ns, size), level)
+_log_level_lock = threading.Lock()
+_AT_LOG_RE = re.compile(r"<@!?([^>]*)>")
+
+
+def _log_level():
+    """当前详细度：<base_dir>/llm.json 的 log_level，缺项 / 坏值 → simple。
+
+    log() 是每条消息都要过的热路径，所以和 _global_daily_limit 同款吃缓存：
+    mtime + size 没变就不重读盘；改了文件下一条日志立刻按新详细度走。
+    """
+    if not _base_dir:
+        return _LOG_SIMPLE
+    path = os.path.join(str(_base_dir), "llm.json")
+    try:
+        st = os.stat(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    with _log_level_lock:
+        hit = _log_level_cache.get(path)
+        if hit and hit[0] == stamp:
+            return hit[1]
+    level = _LOG_SIMPLE
+    if stamp is not None:
+        try:
+            with open(path, encoding="utf-8") as f:
+                raw = json.load(f)
+        except Exception:
+            raw = {}
+        if isinstance(raw, dict):
+            v = str(raw.get("log_level") or "").strip().lower()
+            if v in _LOG_LEVELS:
+                level = v
+    with _log_level_lock:
+        _log_level_cache[path] = (stamp, level)
+    return level
+
+
+def _snip(text, maxlen=MSG_SNIP):
+    """压空白 + 截断：日志里只留摘要，超 maxlen 加 …。"""
+    s = re.sub(r"\s+", " ", str(text or "")).strip()
+    if maxlen and len(s) > maxlen:
+        s = s[:maxlen] + "…"
+    return s or "(空)"
+
+
+def _msg_summary(text, own_ids=(), maxlen=MSG_SNIP):
+    """消息摘要：<@id> → @我 / @别人（不打印 openid），再截断。"""
+    own = set(str(i or "").upper() for i in own_ids if i)
+
+    def _one(m):
+        tok = str(m.group(1) or "").strip().upper()
+        return "@我" if tok and tok in own else "@别人"
+
+    return _snip(_AT_LOG_RE.sub(_one, text), maxlen)
+
+
+def _msg_line(who, text, at="", own_ids=(), maxlen=MSG_SNIP):
+    """「消息」结论行：谁说的 + 有没有 @ 我 + 正文摘要。"""
+    head = str(who or "").strip() or "(未知)"
+    if at:
+        head += " " + ("@ " + at[1:] if at.startswith("@") else at)
+    return "%s：%s" % (head, _msg_summary(text, own_ids, maxlen))
+
+
+_log_name_cache = {}        # (base_dir, appid) -> (localbots.json 的 stamp, 显示名)
+_log_name_lock = threading.Lock()
+_log_name_busy = threading.local()
+
+
+def _bot_display(appid):
+    """日志里的 [bot]：本机清单的 name > 人格名 > appid（认不出就整个 appid）。
+
+    走 _roster 现成的 mtime 缓存：清单没变就只 stat 一次、不读盘也不重算名字
+    （每条消息都要打日志，这里不能读文件）。取名字途中又打日志 → 直接用 appid，防递归。
+    """
+    appid = str(appid or "")
+    if not appid:
+        return ""
+    if getattr(_log_name_busy, "on", False):
+        return appid
+    base = str(_base_dir or "")
+    key = (base, appid)
+    try:
+        stamp = _file_stamp(_localbots_path(base))
+    except Exception:
+        stamp = None
+    with _log_name_lock:
+        hit = _log_name_cache.get(key)
+        if hit and hit[0] == stamp:
+            return hit[1]
+    name = ""
+    _log_name_busy.on = True
+    try:
+        name = str((( _my_entry(appid) or {}).get("name")) or "").strip()
+        if not name:
+            botdir = _bot_dir(base, appid) if base else ""
+            name = (_persona_name(botdir) if botdir else "") or ""
+    except Exception:
+        name = ""
+    finally:
+        _log_name_busy.on = False
+    # _roster 什么都认不出时会给 appid 前 8 位，那等于没名字 → 用完整 appid
+    if not name or name == appid[:8]:
+        name = appid
+    with _log_name_lock:
+        _log_name_cache[key] = (stamp, name)
+    return name
+
+
+def log(msg, appid="", cat="系统", lv="simple"):
+    """记一行日志：[时间] [bot] 类别 · 一句话（[bot] 是显示名，不是 appid）。
+
+    cat ∈ LOG_CATS（未知按「系统」）；lv="detail" 只在 log_level=detail 时输出，
+    但「错误」永远输出。老的 log(msg, appid) 写法仍然可用（两个新参数都有默认值）。
+    """
+    if cat not in LOG_CATS:
+        cat = "系统"
+    if lv == _LOG_DETAIL and cat != _LOG_ERR and _log_level() != _LOG_DETAIL:
+        return
+    tag = ("[%s] " % _bot_display(appid)) if appid else ""
+    line = "[%s] %s%s · %s" % (_stamp(), tag, cat, msg)
     with _lock:
         _state["log"].append(line)
         if len(_state["log"]) > LOG_LIMIT:
@@ -78,7 +212,7 @@ def _save_json(path, obj):
         os.replace(tmp, path)
         return True
     except Exception as e:
-        log("写文件失败 %s: %r" % (path, e))
+        log("写文件失败 %s: %r" % (path, e), cat="错误")
         return False
 
 
@@ -108,7 +242,7 @@ def _backup_memory(botdir):
             pass
         return True
     except Exception as e:
-        log("记忆备份失败 %s: %r" % (src, e))
+        log("记忆备份失败 %s: %r" % (src, e), cat="错误")
         return False
 
 
@@ -169,7 +303,7 @@ def set_reply_judge(judge, prob):
         _judge["prob"] = max(0.0, min(1.0, float(str(prob or "").strip() or 0.3)))
     except Exception:
         _judge["prob"] = 0.3
-    log("回复判定：%s%s" % (_judge["mode"], "（概率 %.2f）" % _judge["prob"] if _judge["mode"] == "random" else ""))
+    log("回复判定：%s%s" % (_judge["mode"], "（概率 %.2f）" % _judge["prob"] if _judge["mode"] == "random" else ""), cat="系统")
     return "OK"
 
 
@@ -302,9 +436,9 @@ def _log_body(body):
     """请求体只记字段名 + 思考强度：识图那条带 base64 图片，整包不能进日志。"""
     fields = ",".join(body.keys())
     if "reasoning_effort" in body:
-        log("请求体字段：%s（reasoning_effort=%s）" % (fields, body["reasoning_effort"]))
+        log("请求体字段：%s（reasoning_effort=%s）" % (fields, body["reasoning_effort"]), cat="系统", lv="detail")
     else:
-        log("请求体字段：%s（未设置思考强度，不带 reasoning_effort）" % fields)
+        log("请求体字段：%s（未设置思考强度，不带 reasoning_effort）" % fields, cat="系统", lv="detail")
 
 
 # ── 成本统计（token / 余额差值 / 联网次数）──────────────────
@@ -384,7 +518,7 @@ def _usage_add(botdir, slot, usage):
         _save_json(_usage_path(botdir), _trim_usage(d))
         today_calls = day_map[slot]["calls"]
     log("用量记一笔：%s 入 %d / 出 %d（今日该用途第 %d 次调用）"
-        % (slot, pin, pout, today_calls), _usage_appid.get())
+        % (slot, pin, pout, today_calls), _usage_appid.get(), cat="系统", lv="detail")
     _balance_tick(botdir)          # 顺手看一眼余额（内部 10 分钟节流，后台线程）
 
 
@@ -412,7 +546,7 @@ def _usage_from_response(conf, d):
         u = d.get("usage") if isinstance(d, dict) else None
         _usage_add(botdir, (conf or {}).get("slot") or "reply", u or {})
     except Exception as e:
-        log("用量记账失败（忽略）：%r" % e)
+        log("用量记账失败（忽略）：%r" % e, cat="错误")
 
 
 def _balance_url(conf):
@@ -450,11 +584,11 @@ def _balance_query(conf):
         for it in infos or []:
             if str((it or {}).get("currency") or "").upper() == "CNY":
                 return round(float(it.get("total_balance")), 2)
-        log("余额查询：响应里没有 CNY 余额，金额留空")
+        log("余额查询：响应里没有 CNY 余额，金额留空", cat="系统", lv="detail")
         return None
     except Exception as e:
         # 不打印 URL 里的任何凭据（Key 在头里，从来没进过日志/文件）
-        log("余额查询失败（金额留空，不影响回复）：%r" % e)
+        log("余额查询失败（金额留空，不影响回复）：%r" % e, cat="错误")
         return None
 
 
@@ -480,9 +614,9 @@ def _balance_store(botdir, val):
     if new.get("ok"):
         log("余额：今日首条 %.2f / 当前 %.2f → 今日约 ¥%.2f（每 10 分钟查一次）"
             % (float(new["first"]), float(new["last"]),
-               max(0.0, float(new["first"]) - float(new["last"]))))
+               max(0.0, float(new["first"]) - float(new["last"]))), cat="系统", lv="detail")
     else:
-        log("余额：这次没取到，今日金额留空（10 分钟内不再重试）")
+        log("余额：这次没取到，今日金额留空（10 分钟内不再重试）", cat="系统", lv="detail")
     return new
 
 
@@ -519,7 +653,7 @@ def _balance_tick(botdir, conf=None):
     except Exception as e:
         with _balance_lock:
             _balance_running.discard(botdir)
-        log("余额查询线程起不来（忽略）：%r" % e)
+        log("余额查询线程起不来（忽略）：%r" % e, cat="错误")
 
 
 def _cost_money(botdir):
@@ -700,10 +834,10 @@ async def _should_reply(conf, text, level=""):
     if _judge["mode"] != "llm":
         import random as _random
         hit = _random.random() <= _judge["prob"]
-        log("判定（随机 %.2f）：%s" % (_judge["prob"], "接" if hit else "不接"))
+        log("判定（随机 %.2f）：%s" % (_judge["prob"], "接" if hit else "不接"), cat="判定")
         return hit
     if not conf:
-        log("判定跳过：模型配置没填（llm.json 缺 key / 地址）")
+        log("判定跳过：模型配置没填（llm.json 缺 key / 地址）", cat="判定")
         return False
     lv = level if level in _JUDGE_LEVELS else _judge_level(conf)
     jconf = _conf_for("judge") or conf
@@ -716,14 +850,14 @@ async def _should_reply(conf, text, level=""):
         hit = _parse_judge(raw)
         if hit is None:
             log("判定（模型 %s｜%s 档）：解析不出 1/0，原文前 80 字：%s → 按「接」处理"
-                % (jconf["model"], lv, brief))
+                % (jconf["model"], lv, brief), cat="判定")
             return True
-        log("判定（模型 %s｜%s 档）：%s → %s" % (jconf["model"], lv, brief, "接" if hit else "不接"))
+        log("判定（模型 %s｜%s 档）：%s → %s" % (jconf["model"], lv, brief, "接" if hit else "不接"), cat="判定")
         return hit
     except Exception as e:
         # 判定挂了不该等于沉默：eager / normal 按「接」，只有 conservative 按「不接」
         hit = lv != "conservative"
-        log("判定失败（%s 档按「%s」处理）：%r" % (lv, "接" if hit else "不接", e))
+        log("判定失败（%s 档按「%s」处理）：%r" % (lv, "接" if hit else "不接", e), cat="错误")
         return hit
 
 
@@ -805,17 +939,17 @@ def _image_data_url(url, appid="", filename=""):
             except Exception:
                 declared = 0
             if declared > _VISION_MAX_BYTES:
-                log("识图跳过：%s 有 %.1fMB，超过 10MB 上限" % (name, declared / 1048576.0), appid)
+                log("识图跳过：%s 有 %.1fMB，超过 10MB 上限" % (name, declared / 1048576.0), appid, cat="系统")
                 return None
             data = r.read(_VISION_MAX_BYTES + 1)
     except Exception as e:
-        log("识图跳过：%s 下载失败 %r" % (name, e), appid)
+        log("识图跳过：%s 下载失败 %r" % (name, e), appid, cat="错误")
         return None
     if len(data) > _VISION_MAX_BYTES:
-        log("识图跳过：%s 超过 10MB 上限（%d 字节）" % (name, len(data)), appid)
+        log("识图跳过：%s 超过 10MB 上限（%d 字节）" % (name, len(data)), appid, cat="系统")
         return None
     if not data:
-        log("识图跳过：%s 下下来是空文件" % name, appid)
+        log("识图跳过：%s 下下来是空文件" % name, appid, cat="系统")
         return None
     mime = ctype if ctype.startswith("image/") else _sniff_mime(data)
     return ("data:%s;base64,%s" % (mime, base64.b64encode(data).decode("ascii")), len(data), name)
@@ -831,7 +965,7 @@ def _describe_image(conf, data_url, appid="", name="图片", nbytes=0):
     import urllib.request
 
     model = _vision_model(conf)
-    log("识图：%s（%d KB）交给模型 %s" % (name, max(1, nbytes // 1024), model), appid)
+    log("识图：%s（%d KB）交给模型 %s" % (name, max(1, nbytes // 1024), model), appid, cat="系统", lv="detail")
     content = [
         {"type": "text", "text": _VISION_HINT},
         {"type": "image_url", "image_url": {"url": data_url}},
@@ -856,20 +990,20 @@ def _describe_image(conf, data_url, appid="", name="图片", nbytes=0):
         low = detail.lower()
         if code in (400, 413, 415, 422) or "image" in low or "vision" in low:
             log("识图失败：模型 %s 不支持图片输入（HTTP %d）：%s"
-                % (model, code, detail.replace(chr(10), " ")[:160]), appid)
+                % (model, code, detail.replace(chr(10), " ")[:160]), appid, cat="错误")
         else:
             log("识图失败：模型 %s 返回 HTTP %d：%s"
-                % (model, code, detail.replace(chr(10), " ")[:160]), appid)
+                % (model, code, detail.replace(chr(10), " ")[:160]), appid, cat="错误")
         return ""
     except Exception as e:
-        log("识图失败：%r（模型 %s）" % (e, model), appid)
+        log("识图失败：%r（模型 %s）" % (e, model), appid, cat="错误")
         return ""
     try:
         desc = _extract_text((d.get("choices") or [{}])[0].get("message") or {})
     except Exception:
         desc = ""
     if not desc:
-        log("识图失败：模型 %s 返回里没有 content" % model, appid)
+        log("识图失败：模型 %s 返回里没有 content" % model, appid, cat="错误")
         return ""
     desc = desc.replace(chr(10), " ").strip()
     # 有的接口对图片只回 200 + 一句「我看不到这张图」：那也是不支持图片输入，得写进日志
@@ -882,7 +1016,7 @@ def _describe_image(conf, data_url, appid="", name="图片", nbytes=0):
     ):
         if bad in low:
             log("识图失败：模型 %s 不支持图片输入（HTTP 200，模型回答：%s）"
-                % (model, desc[:60]), appid)
+                % (model, desc[:60]), appid, cat="错误")
             return ""
     return desc
 
@@ -907,7 +1041,7 @@ def verify_reasoning_effort(api, key, model, effort, base_dir=""):
         _log_path = os.path.join(str(base_dir), "local_bot.log")
 
     def _out(state, line, detail=""):
-        log("思考强度验证：%s" % line)
+        log("思考强度验证：%s" % line, cat="系统")
         return _json.dumps({"state": state, "line": line, "detail": detail}, ensure_ascii=False)
 
     api = str(api or "").strip()
@@ -922,7 +1056,7 @@ def verify_reasoning_effort(api, key, model, effort, base_dir=""):
     body_obj = _req_body({"reasoning_effort": effort}, model,
                          [{"role": "user", "content": "hi"}], 8, 0.0)
     body = _json.dumps(body_obj, ensure_ascii=False)
-    log("思考强度验证：POST %s 请求体 %s" % (api, body))
+    log("思考强度验证：POST %s 请求体 %s" % (api, body), cat="系统", lv="detail")
     req = urllib.request.Request(api, data=body.encode("utf-8"), method="POST", headers={
         "Content-Type": "application/json",
         "Authorization": "Bearer " + key,
@@ -944,7 +1078,7 @@ def verify_reasoning_effort(api, key, model, effort, base_dir=""):
         why = ("%s：%s" % (type(e).__name__, reason)) if reason is not None else str(e)
         return _out("fail", "失败：%s" % (why or type(e).__name__), body)
 
-    log("思考强度验证：HTTP %d 响应 %s" % (code, raw.replace(chr(10), " ")[:2000]))
+    log("思考强度验证：HTTP %d 响应 %s" % (code, raw.replace(chr(10), " ")[:2000]), cat="系统", lv="detail")
     head = raw.replace(chr(10), " ").strip()[:120] or "服务端没给原因"
     detail = "请求体：%s\n\nHTTP %d\n响应：%s" % (body, code, raw.strip()[:3000])
     if code == 200:
@@ -968,7 +1102,7 @@ async def _vision_suffix(appid, conf, images):
         log("识图：这一条有 %d 张图，只识第一张，其余忽略：%s" % (
             len(images),
             ", ".join((x.get("filename") or "图片") for x in images[1:4])[:80],
-        ), appid)
+        ), appid, cat="系统", lv="detail")
     got = []
     for a in images[:1]:
         part = await asyncio.to_thread(
@@ -983,7 +1117,7 @@ async def _vision_suffix(appid, conf, images):
         t0 = time.time()
         desc = await asyncio.to_thread(_describe_image, conf, data_url, appid, name, nbytes)
         if desc:
-            log("识图成功（%.1fs）：%s" % (time.time() - t0, desc[:60]), appid)
+            log("识图成功（%.1fs）：%s" % (time.time() - t0, desc[:60]), appid, cat="系统")
             descs.append(desc)
     if not descs:
         return ""
@@ -1125,11 +1259,11 @@ def _greet_preset(botdir):
         fixed = _PRESET_GREETINGS.get(name)
         if not fixed:
             log("问候判定：persona_meta.json 标了内置，但代码里没有「%s」的预设问候 → 按文件槽位"
-                % name)
+                % name, cat="系统")
         return fixed
     raw = _persona_name_raw(botdir)
     if raw.startswith("自定义：") or raw.startswith("自定义:"):
-        log("问候判定：persona_name.txt 带「自定义：」前缀 → 自定义人格（不按名字匹配）")
+        log("问候判定：persona_name.txt 带「自定义：」前缀 → 自定义人格（不按名字匹配）", cat="系统")
         return None
     root = _bot_root(botdir)
     with _lock:
@@ -1139,7 +1273,7 @@ def _greet_preset(botdir):
                 _persona_meta_missing_logged.clear()
             _persona_meta_missing_logged.add(root)
     if not seen:
-        log("问候判定：persona_meta.json 缺失，回退按名字匹配")
+        log("问候判定：persona_meta.json 缺失，回退按名字匹配", cat="系统")
     return _PRESET_GREETINGS.get(_persona_name(botdir))
 
 
@@ -1600,7 +1734,7 @@ def _slot_plan(botdir, date_s, slot, appid=""):
 _greet_skip_logged = {}
 
 
-def _greet_skip_once(botdir, date_s, key, msg, appid=""):
+def _greet_skip_once(botdir, date_s, key, msg, appid="", cat="系统", lv="simple"):
     k = "%s|%s|%s" % (_bot_root(botdir), date_s, key)
     with _lock:
         if k in _greet_skip_logged:
@@ -1608,7 +1742,7 @@ def _greet_skip_once(botdir, date_s, key, msg, appid=""):
         if len(_greet_skip_logged) > 240:
             _greet_skip_logged.clear()
         _greet_skip_logged[k] = True
-    log(msg, appid)
+    log(msg, appid, cat=cat, lv=lv)
 
 
 def _date_and_minutes(now=None):
@@ -1645,7 +1779,7 @@ async def _local_time_reply(appid, message, text, key="", group_openid=""):
     if not _is_time_cmd(text):
         return False
     now_s = _now_text()
-    log("本地指令 #时间：直接回 %s（不走模型）" % now_s, appid)
+    log("本地指令 #时间：直接回 %s（不走模型）" % now_s, appid, cat="回复")
     api = getattr(message, "_api", None)
     try:
         if str(key or "").startswith("p"):
@@ -1658,7 +1792,7 @@ async def _local_time_reply(appid, message, text, key="", group_openid=""):
                 msg_id=getattr(message, "id", ""), content=now_s,
                 msg_seq=_next_msg_seq(appid, getattr(message, "id", "")))
     except Exception as e:
-        log("回消息失败（本地指令）：%r" % e, appid)
+        log("回消息失败（本地指令）：%r" % e, appid, cat="错误")
     return True
 
 
@@ -1702,7 +1836,7 @@ async def _maybe_greet(client, appid, botdir, now=None):
                                  slot["name"], label), appid)
             return ""
         line = slot["lines"][rng.randrange(0, len(slot["lines"]))]
-        log("随机问候：开始发送（时段 %s｜窗口 %s｜%s）" % (slot["name"], label, line[:20]), appid)
+        log("随机问候：开始发送（时段 %s｜窗口 %s｜%s）" % (slot["name"], label, line[:20]), appid, cat="系统")
         did = ""
         if tgt.get("owner"):
             key = slot["name"] + "|owner"
@@ -1716,10 +1850,10 @@ async def _maybe_greet(client, appid, botdir, now=None):
                     await client.api.post_c2c_message(openid=owner, msg_type=0, content=line)
                     _greet_mark(botdir, date_s, key)
                     log("随机问候：发主人私聊 成功（openid 前 8 位 %s｜时段 %s｜窗口 %s）" % (
-                        _oid8(owner), slot["name"], label), appid)
+                        _oid8(owner), slot["name"], label), appid, cat="系统")
                     did = slot["name"]
                 except Exception as e:
-                    log("随机问候：发主人私聊 失败：%r" % e, appid)
+                    log("随机问候：发主人私聊 失败：%r" % e, appid, cat="错误")
         if tgt.get("groups"):
             groups = _known_groups(botdir)
             if not groups:
@@ -1730,16 +1864,16 @@ async def _maybe_greet(client, appid, botdir, now=None):
                     continue
                 if not _group_conf(botdir, gid)["enabled"]:
                     log("随机问候跳过：群 %s 已静音（groups/%s.json enabled=false）"
-                        % (_oid8(gid), _oid8(gid)), appid)
+                        % (_oid8(gid), _oid8(gid)), appid, cat="系统")
                     continue
                 try:
                     await client.api.post_group_message(group_openid=gid, msg_type=0, content=line)
                     _greet_mark(botdir, date_s, key)
                     log("随机问候：发群 %s… 成功（时段 %s｜窗口 %s）" % (
-                        _oid8(gid), slot["name"], label), appid)
+                        _oid8(gid), slot["name"], label), appid, cat="系统")
                     did = did or slot["name"]
                 except Exception as e:
-                    log("随机问候：发群 %s… 失败：%r" % (_oid8(gid), e), appid)
+                    log("随机问候：发群 %s… 失败：%r" % (_oid8(gid), e), appid, cat="错误")
                 await asyncio.sleep(_GROUP_SEND_GAP)
         if did:
             return did
@@ -1777,7 +1911,7 @@ def _migrate_words(botdir, appid=""):
                 key = "master" if any(s in str(k) for s in _MASTER_WORDS) else "others"
                 aliases.setdefault(key, vv)
         if _save_json(ph_path, {"aliases": aliases}) and aliases:
-            log("迁移称呼到本 bot：%s" % _aliases_sentence(aliases), appid)
+            log("迁移称呼到本 bot：%s" % _aliases_sentence(aliases), appid, cat="系统")
     fixed = _greet_preset(abs_dir)
     raw = _load_json(gr_path, None)
     d = dict(raw) if isinstance(raw, dict) else {}
@@ -1810,7 +1944,7 @@ def _migrate_words(botdir, appid=""):
             "已开启" if d.get("enabled") else "未开启（默认）",
             "、".join("%s %s+%dmin" % (s["name"], s["at"], s["window_min"])
                       for s in (fixed or _greetings_conf(abs_dir)["slots"])) or "未配置",
-            len(fixed or d.get("slots") or [])), appid)
+            len(fixed or d.get("slots") or [])), appid, cat="系统")
 
 
 def _words_rules(botdir, key="", member_oid=""):
@@ -1831,18 +1965,18 @@ def _words_rules(botdir, key="", member_oid=""):
         is_master = _is_master_msg(botdir, gid, member_oid)
         if is_master:
             log("称呼：对象=主人（命中 owner openid 前 8 位 %s｜群=%s）"
-                % (_oid8(member_oid), _oid8(gid)))
+                % (_oid8(member_oid), _oid8(gid)), cat="系统", lv="detail")
         else:
             log("称呼：对象=其他人（群=%s｜作者前 8 位 %s）"
-                % (_oid8(gid), _oid8(member_oid) or "未知"))
+                % (_oid8(gid), _oid8(member_oid) or "未知"), cat="系统", lv="detail")
     elif _is_master_key(botdir, key):
         is_master = True
-        log("称呼：对象=主人（openid 前 8 位 %s）" % _oid8(_owner_openid(botdir)))
+        log("称呼：对象=主人（openid 前 8 位 %s）" % _oid8(_owner_openid(botdir)), cat="系统", lv="detail")
     else:
         is_master = False
         who = str(key or "")
         peer = who[1:] if who[:1] in ("p", "g", "c") else ""
-        log("称呼：对象=其他人" + (("（openid 前 8 位 %s）" % _oid8(peer)) if peer else ""))
+        log("称呼：对象=其他人" + (("（openid 前 8 位 %s）" % _oid8(peer)) if peer else ""), cat="系统", lv="detail")
     if is_master:
         s = ("本轮对话对象就是主人本人。请用「%s」称呼对方，不要换别的称呼。"
              % a["master"]) if a.get("master") else ""
@@ -1855,7 +1989,7 @@ def _words_rules(botdir, key="", member_oid=""):
                  "请用对方的昵称称呼对方，不知道昵称就用「你」。")
     if not s:
         return ""
-    log("注入称呼：%s" % s)
+    log("注入称呼：%s" % s, cat="系统", lv="detail")
     return chr(10) + chr(10) + s
 
 
@@ -1996,7 +2130,7 @@ async def _maybe_compress(botdir, key, appid=""):
         last = _compress_try.get((botdir, key)) or 0
         if last and time.time() - last < _RETRY_GAP:
             log("上下文压缩跳过：key=%s 上次尝试在 %d 秒前（%d 分钟内不再重试）→ 本次按原逻辑发最近 %d 条"
-                % (key, int(time.time() - last), _RETRY_GAP // 60, _SUMMARY_KEEP), appid)
+                % (key, int(time.time() - last), _RETRY_GAP // 60, _SUMMARY_KEEP), appid, cat="系统", lv="detail")
             return False
         rows = _memory(botdir).get(key) or []
         window = _ctx_window()
@@ -2007,7 +2141,7 @@ async def _maybe_compress(botdir, key, appid=""):
             # 快到阈值时留一行（方便验收「没到 75% 不压缩」），平时不刷日志
             if est * 2 >= threshold:
                 log("上下文未达阈值：key=%s 约 %d tokens（阈值 %d，窗口 %d）→ 不压缩"
-                    % (key, est, threshold, window), appid)
+                    % (key, est, threshold, window), appid, cat="系统", lv="detail")
             return False
         n = len(rows)
         k = max(1, int(n * 2 / 3))
@@ -2017,7 +2151,7 @@ async def _maybe_compress(botdir, key, appid=""):
             start = 0          # 历史被裁剪过（>400 条时删掉最旧 100 条）→ 从头并
         chunk = rows[start:k]
         if not chunk:
-            log("上下文压缩跳过：key=%s 已覆盖到第 %d 条，没有新增内容可合并" % (key, start), appid)
+            log("上下文压缩跳过：key=%s 已覆盖到第 %d 条，没有新增内容可合并" % (key, start), appid, cat="系统", lv="detail")
             return False
         # 成本闸（触发条件②）：攒够新内容才允许再压一次，门槛取两者较大者
         if start:
@@ -2027,11 +2161,11 @@ async def _maybe_compress(botdir, key, appid=""):
             if pending_est < need_est:
                 log("上下文压缩跳过：key=%s 新增约 %d tokens < 门槛 %d"
                     "（窗口 %d，上次已并 %d 条）→ 不重复压缩"
-                    % (key, pending_est, need_est, window, start), appid)
+                    % (key, pending_est, need_est, window, start), appid, cat="系统", lv="detail")
                 return False
         sconf = _conf_for("summary")
         if not sconf:
-            log("上下文压缩跳过：模型配置没填（llm.json 缺 key / 地址）", appid)
+            log("上下文压缩跳过：模型配置没填（llm.json 缺 key / 地址）", appid, cat="系统", lv="detail")
             return False
         old_sum = str(old.get("summary") or "").strip()
         prompt = (
@@ -2049,11 +2183,11 @@ async def _maybe_compress(botdir, key, appid=""):
                 _call_llm_sync, sconf, [{"role": "user", "content": prompt}], 900, 0.2,
             )
         except Exception as e:
-            log("上下文压缩失败：%r（按原逻辑继续，不压缩）" % e, appid)
+            log("上下文压缩失败：%r（按原逻辑继续，不压缩）" % e, appid, cat="错误")
             return False
         new_sum = str(new_sum or "").strip().replace(chr(10), " ")
         if not new_sum:
-            log("上下文压缩失败：摘要模型 %s 没返回内容（按原逻辑继续）" % sconf["model"], appid)
+            log("上下文压缩失败：摘要模型 %s 没返回内容（按原逻辑继续）" % sconf["model"], appid, cat="错误")
             return False
         new_sum = new_sum[:_SUMMARY_MAX_CHARS]
         # 采纳闸：压完必须真的变小才落盘 —— 摘要把上下文撑大（历史短 / 模型话多）
@@ -2073,7 +2207,7 @@ async def _maybe_compress(botdir, key, appid=""):
             _compress_try[(botdir, key)] = time.time()
             log("上下文压缩无效：压缩后 %d tokens >= 压缩前 %d tokens 的 %d%%，本次放弃"
                 "（不落盘摘要、不写 state，%d 分钟内不再重试）"
-                % (after, before, int(_ACCEPT_RATIO * 100), _RETRY_GAP // 60), appid)
+                % (after, before, int(_ACCEPT_RATIO * 100), _RETRY_GAP // 60), appid, cat="系统", lv="detail")
             return False
         path = _summary_path(botdir, key)
         try:
@@ -2082,15 +2216,15 @@ async def _maybe_compress(botdir, key, appid=""):
             pass
         if not _save_json(path, {"summary": new_sum, "covered": k,
                                  "updated_at": int(time.time())}):
-            log("上下文压缩失败：摘要写盘失败（按原逻辑继续）", appid)
+            log("上下文压缩失败：摘要写盘失败（按原逻辑继续）", appid, cat="错误")
             return False
         log("上下文压缩：key=%s 原 %d 条/约 %d tokens（阈值 %d）→ 摘要 + 最近 %d 条"
             "（约 %d tokens｜摘要模型 %s｜%.1fs）"
             % (key, n, est, threshold, len(keep), after, sconf["model"], time.time() - t0),
-            appid)
+            appid, cat="系统", lv="detail")
         return True
     except Exception as e:
-        log("上下文压缩异常：%r（按原逻辑继续）" % e, appid)
+        log("上下文压缩异常：%r（按原逻辑继续）" % e, appid, cat="错误")
         return False
 
 
@@ -2213,7 +2347,7 @@ def _arc_setup_fts(conn, botdir):
     try:
         _arc_probe_fts5(conn)
     except Exception as e:
-        log("存档：FTS5 不可用（%r）→ 退回普通表 + text LIKE + ts 索引" % e, appid)
+        log("存档：FTS5 不可用（%r）→ 退回普通表 + text LIKE + ts 索引" % e, appid, cat="系统", lv="detail")
         return "LIKE"
     old = _arc_fts_sql(conn)
     old_mode = ("trigram" if "trigram" in old.lower() else "unicode61") if old else ""
@@ -2221,14 +2355,14 @@ def _arc_setup_fts(conn, botdir):
         _arc_make_triggers(conn)
         conn.commit()
         log("存档：FTS5(trigram) 可用 → %s 走 trigram 全文索引"
-            "（msg_fts MATCH，中文可子串查）" % _arc_path(botdir), appid)
+            "（msg_fts MATCH，中文可子串查）" % _arc_path(botdir), appid, cat="系统", lv="detail")
         return "trigram"
     if old:
         try:
             conn.execute("DROP TABLE msg_fts")      # 老索引整张丢掉，下面按新分词器重建
             conn.commit()
         except Exception as e:
-            log("存档：旧 FTS 表删不掉（%r）→ 本次不建索引，走 LIKE" % e, appid)
+            log("存档：旧 FTS 表删不掉（%r）→ 本次不建索引，走 LIKE" % e, appid, cat="系统", lv="detail")
             return "LIKE"
     mode = ""
     for tokenize, name in _ARC_FTS_SPECS:
@@ -2237,14 +2371,14 @@ def _arc_setup_fts(conn, botdir):
             mode = name
             break
         except Exception as e:
-            log("存档：FTS5(%s) 建不出来（%r）→ 试下一档" % (name, e), appid)
+            log("存档：FTS5(%s) 建不出来（%r）→ 试下一档" % (name, e), appid, cat="系统", lv="detail")
             try:
                 conn.execute("DROP TABLE IF EXISTS msg_fts")
             except Exception:
                 pass
     if not mode:
         log("存档：FTS5 不可用（trigram / unicode61 都建不出）→ 退回普通表 + text LIKE"
-            " + ts 索引", appid)
+            " + ts 索引", appid, cat="系统", lv="detail")
         return "LIKE"
     _arc_make_triggers(conn)
     conn.commit()
@@ -2255,15 +2389,15 @@ def _arc_setup_fts(conn, botdir):
             conn.execute("INSERT INTO msg_fts(msg_fts) VALUES('rebuild')")   # 从 msg 全量回填
             conn.commit()
     except Exception as e:
-        log("存档：索引回填失败（%r）→ 检索会补 LIKE" % e, appid)
+        log("存档：索引回填失败（%r）→ 检索会补 LIKE" % e, appid, cat="错误")
     if old_mode and old_mode != mode:
-        log("存档索引已升级为 %s，回填 %d 条（原 %s）" % (mode, n, old_mode), appid)
+        log("存档索引已升级为 %s，回填 %d 条（原 %s）" % (mode, n, old_mode), appid, cat="系统")
     elif mode == "trigram":
         log("存档：FTS5(trigram) 可用 → %s 走 trigram 全文索引"
-            "（msg_fts MATCH，中文可子串查）" % _arc_path(botdir), appid)
+            "（msg_fts MATCH，中文可子串查）" % _arc_path(botdir), appid, cat="系统", lv="detail")
     else:
         log("存档：FTS5(unicode61) 可用 → %s 走 unicode61 全文索引"
-            "（中文按整串匹配，检索会补 LIKE）" % _arc_path(botdir), appid)
+            "（中文按整串匹配，检索会补 LIKE）" % _arc_path(botdir), appid, cat="系统", lv="detail")
     return mode
 
 
@@ -2285,7 +2419,7 @@ def _arc_connect(botdir):
             import sqlite3
         except Exception as e:
             _arc_off = "sqlite3 不可用：%r" % e
-            log("消息存档关闭：%s（收发消息照常，只是不落库）" % _arc_off, appid)
+            log("消息存档关闭：%s（收发消息照常，只是不落库）" % _arc_off, appid, cat="系统")
             return None
         try:
             try:
@@ -2298,12 +2432,12 @@ def _arc_connect(botdir):
                 " chat_id TEXT, author_openid TEXT, author_name TEXT, ts INTEGER,"
                 " text TEXT, reply_text TEXT)")
         except Exception as e:
-            log("存档：打开 messages.db 失败（%r）→ 本次不落库" % e, appid)
+            log("存档：打开 messages.db 失败（%r）→ 本次不落库" % e, appid, cat="错误")
             return None
         try:
             mode = _arc_setup_fts(conn, botdir)
         except Exception as e:
-            log("存档：索引初始化失败（%r）→ 本次走 LIKE" % e, appid)
+            log("存档：索引初始化失败（%r）→ 本次走 LIKE" % e, appid, cat="错误")
             mode = "LIKE"
         if mode == "LIKE":
             try:
@@ -2326,7 +2460,7 @@ def _arc_start_worker():
         threading.Thread(target=_arc_loop, name="archive-flush", daemon=True).start()
     except Exception as e:
         _arc_worker["on"] = False
-        log("存档：flush 线程起不来（%r）→ 改为每条直接落盘" % e)
+        log("存档：flush 线程起不来（%r）→ 改为每条直接落盘" % e, cat="错误")
 
 
 def _arc_loop():
@@ -2336,11 +2470,11 @@ def _arc_loop():
         try:
             _arc_flush()
         except Exception as e:
-            log("存档：后台 flush 异常（忽略）：%r" % e)
+            log("存档：后台 flush 异常（忽略）：%r" % e, cat="错误")
         try:
             _arc_daily()
         except Exception as e:
-            log("存档：每日清理异常（忽略）：%r" % e)
+            log("存档：每日清理异常（忽略）：%r" % e, cat="错误")
 
 
 def _arc_daily(now=None):
@@ -2381,11 +2515,11 @@ def _arc_trim(botdir, days=0, per_chat=0):
             conn.commit()
             _arc_trim_ts[str(botdir)] = time.time()
         except Exception as e:
-            log("存档：滚动清理失败（忽略）：%r" % e, _arc_appid(botdir))
+            log("存档：滚动清理失败（忽略）：%r" % e, _arc_appid(botdir), cat="错误")
             return 0, 0
     if n_old or n_over:
         log("存档清理：保留 %d 天 / 每会话 %d 条 → 删掉 %d 条（超期 %d + 超量 %d）"
-            % (days, per_chat, n_old + n_over, n_old, n_over), _arc_appid(botdir))
+            % (days, per_chat, n_old + n_over, n_old, n_over), _arc_appid(botdir), cat="系统")
     return n_old, n_over
 
 
@@ -2440,7 +2574,7 @@ def _arc_flush(force=False):
                     _arc_last[(r["botdir"], r["chat_type"], r["chat_id"])] = rid
                 n += 1
             except Exception as e:
-                log("存档：写入失败（忽略）：%r" % e, _arc_appid(r["botdir"]))
+                log("存档：写入失败（忽略）：%r" % e, _arc_appid(r["botdir"]), cat="错误")
         for bd in set([r["botdir"] for r in rows]):
             try:
                 _arc_db[bd]["conn"].commit()
@@ -2474,7 +2608,7 @@ def _arc_reply(botdir, chat_type, chat_id, reply_text):
             info["conn"].commit()
             return True
         except Exception as e:
-            log("存档：补 reply_text 失败（忽略）：%r" % e, _arc_appid(key[0]))
+            log("存档：补 reply_text 失败（忽略）：%r" % e, _arc_appid(key[0]), cat="错误")
             return False
 
 
@@ -2529,7 +2663,7 @@ def archive_search(botdir, query, n=0):
                         " WHERE msg_fts MATCH ? ORDER BY m.ts DESC, m.id DESC LIMIT ?",
                         (mq, n)).fetchall()
             except Exception as e:
-                log("存档：FTS5 查询失败（%r）→ 本次退回 LIKE" % e, _arc_appid(botdir))
+                log("存档：FTS5 查询失败（%r）→ 本次退回 LIKE" % e, _arc_appid(botdir), cat="错误")
                 mode = "LIKE"
         if mode != "LIKE":
             if rows:
@@ -2631,10 +2765,10 @@ def archive_clear(botdir):
             except Exception:
                 pass
         except Exception as e:
-            log("存档：清空失败：%r" % e, _arc_appid(botdir))
+            log("存档：清空失败：%r" % e, _arc_appid(botdir), cat="错误")
             return json.dumps({"rows": 0, "bytes": _arc_bytes(_arc_path(botdir))})
     log("存档已清空：删掉 %d 条，文件现在 %d 字节（%s）"
-        % (n, _arc_bytes(_arc_path(botdir)), _arc_path(botdir)), _arc_appid(botdir))
+        % (n, _arc_bytes(_arc_path(botdir)), _arc_path(botdir)), _arc_appid(botdir), cat="系统")
     return json.dumps({"rows": n, "bytes": _arc_bytes(_arc_path(botdir))}, ensure_ascii=False)
 
 
@@ -2655,10 +2789,10 @@ def archive_export_text(botdir, max_rows=0):
                 "SELECT chat_type, author_openid, author_name, ts, text, reply_text FROM msg"
                 " ORDER BY ts ASC, id ASC LIMIT ?", (limit,)).fetchall()
     except Exception as e:
-        log("存档：导出失败：%r" % e, _arc_appid(botdir))
+        log("存档：导出失败：%r" % e, _arc_appid(botdir), cat="错误")
         return ""
     if len(rows) >= limit:
-        log("存档导出：只导了最早的 %d 行（上限），后面还有" % limit, _arc_appid(botdir))
+        log("存档导出：只导了最早的 %d 行（上限），后面还有" % limit, _arc_appid(botdir), cat="系统")
     lines = []
     for ct, oid, name, ts, text, reply in rows:
         when = time.strftime("%Y-%m-%d %H:%M", time.localtime(int(ts or 0)))
@@ -2777,11 +2911,11 @@ def _identity_line(botdir, persona=""):
             _ID_LOGGED.add(key)
     if fresh and body:
         if name not in body:
-            log("人格提示：正文未出现自我名「%s」，已在上方注入身份行" % name)
+            log("人格提示：正文未出现自我名「%s」，已在上方注入身份行" % name, cat="系统")
         other = _self_desc_other(name, body)
         if other:
             log("人格警告：正文自述为「%s」，与人格名「%s」不一致（用户可能选错人格）"
-                % (other, name))
+                % (other, name), cat="系统")
     return line + chr(10) + chr(10)
 
 
@@ -3014,7 +3148,7 @@ def _web_url(conf, path):
 
 def _plog(conf, msg, appid=""):
     """联网日志统一带后端前缀：联网(deepseek)：… / 联网(searxng)：… / 联网(custom)：…"""
-    log("联网(%s)：%s" % (_search_provider(conf), msg), appid)
+    log("联网(%s)：%s" % (_search_provider(conf), msg), appid, cat="系统", lv="detail")
 
 
 def _web_post(conf, path, body, appid="", tag="", provider="deepseek"):
@@ -3044,16 +3178,16 @@ def _web_post(conf, path, body, appid="", tag="", provider="deepseek"):
             detail = repr(e)
         log("联网(%s)：%s HTTP %d（%.1fs）%s"
             % (provider, tag, code, time.time() - t0,
-               detail.replace(chr(10), " ")[:160]), appid)
+               detail.replace(chr(10), " ")[:160]), appid, cat="系统", lv="detail")
         return False, "HTTP %d" % code
     except Exception as e:
-        log("联网(%s)：%s 失败 %r（%.1fs）" % (provider, tag, e, time.time() - t0), appid)
+        log("联网(%s)：%s 失败 %r（%.1fs）" % (provider, tag, e, time.time() - t0), appid, cat="错误")
         return False, "网络错误"
-    log("联网(%s)：%s HTTP %d（%.1fs）" % (provider, tag, code, time.time() - t0), appid)
+    log("联网(%s)：%s HTTP %d（%.1fs）" % (provider, tag, code, time.time() - t0), appid, cat="系统", lv="detail")
     try:
         d = json.loads(raw or "{}")
     except Exception:
-        log("联网(%s)：%s 响应不是 JSON（前 120 字）：%s" % (provider, tag, raw[:120]), appid)
+        log("联网(%s)：%s 响应不是 JSON（前 120 字）：%s" % (provider, tag, raw[:120]), appid, cat="系统", lv="detail")
         return False, "响应格式错误"
     return (True, d) if isinstance(d, dict) else (False, "响应格式错误")
 
@@ -3116,16 +3250,16 @@ def _http_get_json(url, headers, appid="", tag="", provider="deepseek"):
             detail = repr(e)
         log("联网(%s)：%s HTTP %d（%.1fs）%s"
             % (provider, tag, code, time.time() - t0, detail.replace(chr(10), " ")[:160]),
-            appid)
+            appid, cat="系统", lv="detail")
         return False, "HTTP %d" % code
     except Exception as e:
-        log("联网(%s)：%s 失败 %r（%.1fs）" % (provider, tag, e, time.time() - t0), appid)
+        log("联网(%s)：%s 失败 %r（%.1fs）" % (provider, tag, e, time.time() - t0), appid, cat="错误")
         return False, "网络错误"
-    log("联网(%s)：%s HTTP %d（%.1fs）" % (provider, tag, code, time.time() - t0), appid)
+    log("联网(%s)：%s HTTP %d（%.1fs）" % (provider, tag, code, time.time() - t0), appid, cat="系统", lv="detail")
     try:
         d = json.loads(raw or "{}")
     except Exception:
-        log("联网(%s)：%s 响应不是 JSON（前 120 字）：%s" % (provider, tag, raw[:120]), appid)
+        log("联网(%s)：%s 响应不是 JSON（前 120 字）：%s" % (provider, tag, raw[:120]), appid, cat="系统", lv="detail")
         return False, "响应格式错误"
     return True, d
 
@@ -3193,13 +3327,13 @@ def web_search(query, conf, appid="", count=_WEB_COUNT, meta=None, source="", ro
         return []
     provider = _search_provider(conf)
     if provider == "off":
-        log("联网(off)：搜索后端已关闭，不发请求", appid)
+        log("联网(off)：搜索后端已关闭，不发请求", appid, cat="系统")
         return []
     t0 = time.time()
     base = str(conf.get("search_base") or "").strip().rstrip("/")
     if provider == "searxng":
         if not base:
-            log("联网(searxng)：没填搜索地址（search_base），无法搜索", appid)
+            log("联网(searxng)：没填搜索地址（search_base），无法搜索", appid, cat="系统")
             return []
         url = base + "/search?q=" + urllib.parse.quote(q) + "&format=json"
         _usage_search(_usage_dir(appid))
@@ -3208,7 +3342,7 @@ def web_search(query, conf, appid="", count=_WEB_COUNT, meta=None, source="", ro
         rows = _norm_hits((d.get("results") if isinstance(d, dict) else d) or []) if ok else []
     elif provider == "custom":
         if not base:
-            log("联网(custom)：没填搜索地址（search_base），无法搜索", appid)
+            log("联网(custom)：没填搜索地址（search_base），无法搜索", appid, cat="系统")
             return []
         if "{query}" in base:
             url = base.replace("{query}", urllib.parse.quote(q))
@@ -3225,14 +3359,14 @@ def web_search(query, conf, appid="", count=_WEB_COUNT, meta=None, source="", ro
                           appid, "search「%s」" % q[:24], "deepseek")
         rows = _norm_hits(d.get("results") or []) if ok else []
     if not ok:
-        log("联网(%s)：搜索失败（后端 %s），按没结果处理" % (provider, provider), appid)
+        log("联网(%s)：搜索失败（后端 %s），按没结果处理" % (provider, provider), appid, cat="错误")
         return []
     if meta is not None:
         meta["ok"] = True
     log("联网(%s)：%s%s「%s」→ 命中 %d 条（%.1fs）"
         % (provider, _WEB_SRC.get(source, "搜索"),
            ("（第 %d 轮）" % round_no) if round_no else "",
-           q[:24], len(rows), time.time() - t0), appid)
+           q[:24], len(rows), time.time() - t0), appid, cat="系统")
     return rows
 
 
@@ -3243,18 +3377,18 @@ def web_fetch(url, conf, appid=""):
         return ""
     provider = _search_provider(conf)
     if provider == "off":
-        log("联网(off)：搜索后端已关闭，不抓取", appid)
+        log("联网(off)：搜索后端已关闭，不抓取", appid, cat="系统")
         return ""
     if provider != "deepseek":
         log("联网(%s)：这个后端不支持抓正文（#读 需要 DeepSeek 官方 Search/Fetch）"
-            % provider, appid)
+            % provider, appid, cat="系统")
         return ""
     _usage_search(_usage_dir(appid))
     ok, d = _web_post(conf, "/tools/fetch", {"url": u}, appid, "fetch %s" % u[:24], provider)
     if not ok:
         return ""
     content = str(d.get("content") or "").strip()
-    log("联网(%s)：fetch %s → %d 字" % (provider, u[:40], len(content)), appid)
+    log("联网(%s)：fetch %s → %d 字" % (provider, u[:40], len(content)), appid, cat="系统", lv="detail")
     return content
 
 
@@ -3441,14 +3575,14 @@ async def _search_answer_styled(appid, botdir, hits, query, conf, left=_SRCH_MAX
             _WEB_STYLE_MAXTOK, 0.8,
         )
     except Exception as e:
-        log("联网：合成回答失败 %r（模型 %s）" % (e, sconf["model"]), appid)
+        log("联网：合成回答失败 %r（模型 %s）" % (e, sconf["model"]), appid, cat="错误")
         return "", False, ""
     want = _WEB_MARK_RE.search(raw or "")
     if want:
         return "", True, (want.group(1) or "").strip()[:120]
     answer, idx = _split_answer(raw)
     if not answer:
-        log("联网：合成回答没返回内容（模型 %s）" % sconf["model"], appid)
+        log("联网：合成回答没返回内容（模型 %s）" % sconf["model"], appid, cat="错误")
         return "", False, ""
     url = ""
     shown = _shown_hits(hits)
@@ -3456,7 +3590,7 @@ async def _search_answer_styled(appid, botdir, hits, query, conf, left=_SRCH_MAX
         url = _strip_tracking(shown[idx - 1].get("url") or "")
     log("联网：已合成一句回答（%d 字｜模型 %s｜%.1fs｜引用第 %d 条%s）"
         % (len(answer), sconf["model"], time.time() - t0, idx,
-           "：" + url[:40] if url else "（没选链接）"), appid)
+           "：" + url[:40] if url else "（没选链接）"), appid, cat="系统")
     return answer + (chr(10) + url if url else ""), False, ""
 
 
@@ -3489,12 +3623,12 @@ async def _no_result_reply(appid, botdir, query, conf, rounds=1, hits=None):
         raw = await asyncio.to_thread(_call_llm_sync, sconf,
                                      [{"role": "user", "content": prompt}], 200, 0.8)
     except Exception as e:
-        log("联网：没查到的说辞没生成（%r）→ 用固定文案" % e, appid)
+        log("联网：没查到的说辞没生成（%r）→ 用固定文案" % e, appid, cat="系统")
         return ""
     out = _style_answer(_strip_search_marks(raw), 140)
     if not out:
         return ""
-    log("联网：没查到时已按人设回一句（模型 %s）" % sconf["model"], appid)
+    log("联网：没查到时已按人设回一句（模型 %s）" % sconf["model"], appid, cat="系统")
     return out
 
 
@@ -3524,14 +3658,14 @@ async def _fetch_reply_styled(appid, botdir, content, url, conf):
             _FETCH_OUT_CHARS * 2, 0.6,
         )
     except Exception as e:
-        log("联网：网页转述失败 %r（模型 %s → 退回原始贴法）" % (e, sconf["model"]), appid)
+        log("联网：网页转述失败 %r（模型 %s → 退回原始贴法）" % (e, sconf["model"]), appid, cat="错误")
         return ""
     body = _clean_reply(raw, _FETCH_OUT_CHARS)
     if not body:
-        log("联网：网页转述没返回内容（模型 %s → 退回原始贴法）" % sconf["model"], appid)
+        log("联网：网页转述没返回内容（模型 %s → 退回原始贴法）" % sconf["model"], appid, cat="错误")
         return ""
     log("联网：网页已按人设转述（%d 字｜模型 %s｜%.1fs）"
-        % (len(body), sconf["model"], time.time() - t0), appid)
+        % (len(body), sconf["model"], time.time() - t0), appid, cat="系统")
     return body + chr(10) + _strip_tracking(url)
 
 
@@ -3570,7 +3704,7 @@ async def _ask_next_query(appid, botdir, conf, user_query, tries, left):
         raw = await asyncio.to_thread(_call_llm_sync, sconf,
                                      [{"role": "user", "content": prompt}], 120, 0.6)
     except Exception as e:
-        log("联网：换关键词的追问失败 %r" % e, appid)
+        log("联网：换关键词的追问失败 %r" % e, appid, cat="错误")
         return ""
     m = _WEB_MARK_RE.search(raw or "")
     return (m.group(1) or "").strip()[:120] if m else ""
@@ -3592,7 +3726,7 @@ async def _manual_search_answer(appid, botdir, conf, arg):
             # 这一轮没命中：问模型要不要换个关键词（最多查 _SRCH_MAX 轮）
             nxt = await _ask_next_query(appid, botdir, conf, arg, tries, _SRCH_MAX - r)
             if not nxt:
-                log("联网：搜索 %d 轮未得结果，按「不清楚」回复" % r, appid)
+                log("联网：搜索 %d 轮未得结果，按「不清楚」回复" % r, appid, cat="系统")
                 return "", "none", hits
             last_q = nxt
             tries.append(nxt)
@@ -3604,7 +3738,7 @@ async def _manual_search_answer(appid, botdir, conf, arg):
         if not wants:
             return "", "fail", hits       # 模型调用失败/空回答
         last_q = q
-    log("联网：搜索 %d 轮未得结果，按「不清楚」回复" % _SRCH_MAX, appid)
+    log("联网：搜索 %d 轮未得结果，按「不清楚」回复" % _SRCH_MAX, appid, cat="系统")
     return "", "exhausted", hits
 
 
@@ -3623,7 +3757,7 @@ async def _local_web_cmd(appid, message, text, key="", group_openid="", botdir="
         return False
     if not _is_owner_msg(botdir, message, key):
         # 不是主人：# 不当指令，整句（含 #）原样交给普通聊天，模型照人设回
-        log("联网：非主人使用 # 指令，降级为普通聊天（不触发）", appid)
+        log("联网：非主人使用 # 指令，降级为普通聊天（不触发）", appid, cat="系统")
         return False
     api = getattr(message, "_api", None)
     conf = _llm_conf(_base_dir) if _base_dir else None
@@ -3639,22 +3773,22 @@ async def _local_web_cmd(appid, message, text, key="", group_openid="", botdir="
                     group_openid=group_openid, msg_type=0,
                     msg_id=getattr(message, "id", ""), content=reply)
         except Exception as e:
-            log("回消息失败（联网指令）：%r" % e, appid)
+            log("回消息失败（联网指令）：%r" % e, appid, cat="错误")
 
     if not arg:
         await _send("用法：#搜 关键词（我上网看看再答你）｜#读 网址（看完说两句）")
         return True
     if conf is None:
-        log("联网指令跳过：模型配置没填（llm.json 缺 key / 地址）", appid)
+        log("联网指令跳过：模型配置没填（llm.json 缺 key / 地址）", appid, cat="系统")
         return False
     if not conf.get("web_search_enabled", True):
-        log("联网指令 %s 跳过：联网搜索已关闭（web_search_enabled=0），一个请求都不发" % kind, appid)
+        log("联网指令 %s 跳过：联网搜索已关闭（web_search_enabled=0），一个请求都不发" % kind, appid, cat="系统")
         await _send("联网搜索关着呢，去设置里打开再问我吧。")
         return True
     if not _group_web_on(botdir, group_openid):
         # 主人也不行：群配置里显式关了联网，这条指令一个请求都不发
         log("联网指令 #%s 被拒：该群已关闭联网（groups/%s.json web_search=false，主人也不行）"
-            % ("搜" if kind == "search" else "读", _oid8(group_openid)), appid)
+            % ("搜" if kind == "search" else "读", _oid8(group_openid)), appid, cat="系统")
         await _send("这个群关掉了联网，去「bot 详情 → 群配置」里打开再问我吧。")
         return True
     style_on = bool(conf.get("search_persona_style", True))
@@ -3673,7 +3807,7 @@ async def _local_web_cmd(appid, message, text, key="", group_openid="", botdir="
                 await _send(none_line or _NO_RESULT_FALLBACK)
                 return True
             if not hits:
-                log("联网指令 #搜「%s」接口失败，交给正常回复" % arg[:30], appid)
+                log("联网指令 #搜「%s」接口失败，交给正常回复" % arg[:30], appid, cat="错误")
                 return False
             # 有资料但模型没给出可用回答：退回原始列表贴法（用户至少看到结果）
             reply = _search_reply_text(hits)
@@ -3688,23 +3822,23 @@ async def _local_web_cmd(appid, message, text, key="", group_openid="", botdir="
             return False
         reply = _search_reply_text(hits)
         log("联网指令 手动 #搜（主人）「%s」：回 %d 条（原始列表贴法，人设化加工已关"
-            " search_persona_style=0）" % (arg[:30], min(len(hits), _WEB_REPLY_MAX)), appid)
+            " search_persona_style=0）" % (arg[:30], min(len(hits), _WEB_REPLY_MAX)), appid, cat="系统")
         await _send(reply)
         return True
     content = await asyncio.to_thread(web_fetch, arg, conf, appid)
     reply = await _fetch_reply_styled(appid, botdir, content, arg, conf) if style_on else ""
     if reply:
         log("联网指令 #读 %s：人设化加工（≤%d 字摘要 + 原链接）" % (arg[:40], _FETCH_OUT_CHARS),
-            appid)
+            appid, cat="系统")
         await _send(reply)
         return True
     reply = _fetch_reply_text(content)
     if not reply:
-        log("联网指令 #读 %s 没读到正文，交给正常回复" % arg[:40], appid)
+        log("联网指令 #读 %s 没读到正文，交给正常回复" % arg[:40], appid, cat="错误")
         return False
     log("联网指令 #读 %s：回前 %d 字（原始贴法%s）"
         % (arg[:40], min(len(content), _WEB_FETCH_CHARS),
-           "，人设化加工已关 search_persona_style=0" if not style_on else ""), appid)
+           "，人设化加工已关 search_persona_style=0" if not style_on else ""), appid, cat="系统")
     await _send(reply)
     return True
 
@@ -3888,23 +4022,23 @@ async def _send_all_groups(client, t, botdir=""):
     appid = str(t.get("appid") or "")
     groups = _known_groups(botdir)
     if not groups:
-        log("定时消息跳过：还没记录到已加入的群（先让 bot 在群里被 @ 一次再等下一轮）", appid)
+        log("定时消息跳过：还没记录到已加入的群（先让 bot 在群里被 @ 一次再等下一轮）", appid, cat="系统")
         return False
     sent = 0
     failed = 0
     for oid in groups:
         if not _group_conf(botdir, oid)["enabled"]:
             log("定时消息跳过：群 %s 已静音（groups/%s.json enabled=false）"
-                % (_oid8(oid), _oid8(oid)), appid)
+                % (_oid8(oid), _oid8(oid)), appid, cat="系统")
             continue
         try:
             await client.api.post_group_message(group_openid=oid, msg_type=0, content=text)
             sent += 1
         except Exception as e:
             failed += 1
-            log("群发失败（%s）：%r" % (str(oid)[:12], e), appid)
+            log("群发失败（%s）：%r" % (str(oid)[:12], e), appid, cat="错误")
         await asyncio.sleep(_GROUP_SEND_GAP)
-    log("定时消息群发：%d/%d 个群成功" % (sent, len(groups)), appid)
+    log("定时消息群发：%d/%d 个群成功" % (sent, len(groups)), appid, cat="系统")
     return sent > 0
 
 
@@ -3942,7 +4076,7 @@ _timers_offline_logged = set()
 async def _sched_loop(client, appid, botdir):
     """每 30 秒扫一次任务表。只在 bot 自己的循环里跑，不跨线程。"""
     import time as _t
-    log("定时/问候调度已起（每 30 秒一轮）", appid)
+    log("定时/问候调度已起（每 30 秒一轮）", appid, cat="系统")
     try:
         while True:
             await asyncio.sleep(30)
@@ -3952,7 +4086,7 @@ async def _sched_loop(client, appid, botdir):
                     # 有历史任务也不执行：定时消息这块已经从编辑页删掉，改由「定时问候」承担
                     if appid not in _timers_offline_logged:
                         _timers_offline_logged.add(appid)
-                        log("定时消息已下线（改由定时问候承担），本次不执行；tasks.json 还有 %d 条，文件保留未删" % len(arr), appid)
+                        log("定时消息已下线（改由定时问候承担），本次不执行；tasks.json 还有 %d 条，文件保留未删" % len(arr), appid, cat="系统")
                     arr = []
                 if not isinstance(arr, list):
                     continue
@@ -3975,9 +4109,9 @@ async def _sched_loop(client, appid, botdir):
                         ok = await _send_task(client, t, botdir)
                         log("定时消息%s：%s" % (
                             "发出" if ok else "跳过（目标缺失，或群列表还没记录到）",
-                            str(t.get("text") or "")[:30]), appid)
+                            str(t.get("text") or "")[:30]), appid, cat="系统")
                     except Exception as e:
-                        log("定时消息失败：%r" % e, appid)
+                        log("定时消息失败：%r" % e, appid, cat="错误")
                     # 每天一次：推到明天同一时刻
                     t["next"] = due + 86400
                     t["last"] = now
@@ -3988,11 +4122,11 @@ async def _sched_loop(client, appid, botdir):
                 try:
                     await _maybe_greet(client, appid, botdir)
                 except Exception as e:
-                    log("随机问候出错：%r" % e, appid)
+                    log("随机问候出错：%r" % e, appid, cat="错误")
             except Exception as e:
-                log("调度出错：%r" % e, appid)
+                log("调度出错：%r" % e, appid, cat="错误")
     except asyncio.CancelledError:
-        log("定时/问候调度被取消", appid)
+        log("定时/问候调度被取消", appid, cat="系统")
         raise
 
 
@@ -4010,7 +4144,7 @@ def _fix_botpy_logging(datadir):
         _bl.DEFAULT_FILE_HANDLER["level"] = _logging.WARNING
         return True
     except Exception as e:
-        log("改 botpy 日志路径失败（忽略）：%r" % e)
+        log("改 botpy 日志路径失败（忽略）：%r" % e, cat="错误")
         return False
 
 
@@ -4206,9 +4340,9 @@ def _dedupe_message(appid, message, source):
     key = _dedup_key(message)[0]
     field = _unique_msg_id(message)[0] or "无"
     if dup:
-        log("去重：去重键=%s（%s）已处理过，跳过（来源=%s）" % (mid, key, source), appid)
+        log("去重：去重键=%s（%s）已处理过，跳过（来源=%s）" % (mid, key, source), appid, cat="判定", lv="detail")
     else:
-        log("去重键=%s（字段=%s）" % (key, field), appid)
+        log("去重键=%s（字段=%s）" % (key, field), appid, cat="判定", lv="detail")
     return dup
 
 
@@ -4303,7 +4437,7 @@ def _dump_gateway_raw(botdir, event, payload):
             f.write(line + "\n")
         _raw_state["n"] += 1
     except Exception as e:
-        log("写 gateway_raw.jsonl 失败（忽略）：%r" % e)
+        log("写 gateway_raw.jsonl 失败（忽略）：%r" % e, cat="错误")
 
 
 class _GroupMsg:
@@ -4361,7 +4495,7 @@ def _install_group_message_parser():
             try:
                 _msg = _GroupMsg(getattr(self, "api", None), payload)
             except Exception as e:
-                _log_soft("组群消息解析失败：%r" % e)
+                _log_soft("组群消息解析失败：%r" % e, cat="错误")
                 return None
             self._dispatch("group_message_create", _msg)
             return None
@@ -4370,14 +4504,14 @@ def _install_group_message_parser():
         _bc.ConnectionState._andbna_group_parsed = True
         return True
     except Exception as e:
-        log("注册 group_message_create 解析器失败：%r" % e)
+        log("注册 group_message_create 解析器失败：%r" % e, cat="错误")
         return False
 
 
-def _log_soft(msg):
+def _log_soft(msg, cat="系统", lv="simple"):
     """解析器跑在 botpy 的调用栈里，拿不到 appid；写进总日志即可。"""
     try:
-        log(msg)
+        log(msg, cat=cat, lv=lv)
     except Exception:
         pass
 
@@ -4546,7 +4680,7 @@ def _app_access_token(appid, secret):
         with urllib.request.urlopen(req, timeout=8) as r:
             raw = json.loads(r.read().decode("utf-8", "replace"))
     except Exception as e:
-        log("群资料：取 token 失败 %r" % e)
+        log("群资料：取 token 失败 %r" % e, cat="错误")
         return ""
     token = str(raw.get("access_token") or "")
     try:
@@ -4554,7 +4688,7 @@ def _app_access_token(appid, secret):
     except (TypeError, ValueError):
         ttl = 7200
     if not token:
-        log("群资料：token 响应里没有 access_token（%s）" % str(raw)[:120])
+        log("群资料：token 响应里没有 access_token（%s）" % str(raw)[:120], cat="错误")
         return ""
     with _gc_token_lock:
         _gc_tokens[appid] = (token, now + max(60, ttl))
@@ -4581,7 +4715,7 @@ def group_info(appid, secret, gid):
         with urllib.request.urlopen(req, timeout=8) as r:
             raw = json.loads(r.read().decode("utf-8", "replace"))
     except Exception as e:
-        log("群资料：%s 读取失败 %r" % (_oid8(gid), e))
+        log("群资料：%s 读取失败 %r" % (_oid8(gid), e), cat="错误")
         return json.dumps({"ok": False, "error": "请求失败：%r" % e}, ensure_ascii=False)
     name = str(raw.get("group_name") or "").strip()
     try:
@@ -4687,7 +4821,7 @@ def set_group_autochat(appid="", override="", global_on=None):
     log("群里自动接话：全局%s｜该 bot 覆盖=%s｜生效：%s" % (
         "开" if _autochat["on"] else "关（只回 @）",
         _autochat_override_label(key),
-        "开" if _group_autochat_state(key, {})[0] else "关（只回 @）"))
+        "开" if _group_autochat_state(key, {})[0] else "关（只回 @）"), cat="系统")
     return "OK"
 
 
@@ -4721,7 +4855,7 @@ def _hint_autochat_once(appid=""):
     if _autochat_hinted or _group_autochat_state(appid, {})[0]:
         return False
     _autochat_hinted = True
-    log("提示：群里自动接话关闭，当前只回 @（可在设置里打开「群里自动接话」）", appid)
+    log("提示：群里自动接话关闭，当前只回 @（可在设置里打开「群里自动接话」）", appid, cat="系统")
     return True
 
 
@@ -4782,16 +4916,16 @@ def _learn_own_ids(botdir, content):
         # 一条 "@A @B" 会让 A 和 B 各收到一个 @ 事件，正文里两个 id 都在。
         # 判不出哪个是自己 → 这次一条都不学（学错就是永久抢答）。
         log("学 own_ids：正文里有 %d 个不同提及（%s），判不出哪个是自己 → 本次不学"
-            % (len(found), ",".join(sorted(found))[:60]))
+            % (len(found), ",".join(sorted(found))[:60]), cat="系统", lv="detail")
         return set()
     others = _known_bots(botdir)
     keep = found - others
     drop = found & others
     if drop:
-        log("学 own_ids：正文里的 %s 是已知其它 bot 的 id，丢弃" % ",".join(sorted(drop))[:60])
+        log("学 own_ids：正文里的 %s 是已知其它 bot 的 id，丢弃" % ",".join(sorted(drop))[:60], cat="系统", lv="detail")
     added = _note_own_ids(botdir, keep)
     if added:
-        log("学 own_ids：%s（来源：可信 @ 事件）" % ",".join(sorted(added))[:80])
+        log("学 own_ids：%s（来源：可信 @ 事件）" % ",".join(sorted(added))[:80], cat="系统", lv="detail")
     return added
 
 
@@ -4802,7 +4936,7 @@ def _candidates(appid, botdir):
     others = _known_bots(botdir)
     if others and (ids & others):
         drop = ids & others
-        log("候选 id 里混进已知其它 bot 的 id，已剔除：%s" % ",".join(sorted(drop))[:60])
+        log("候选 id 里混进已知其它 bot 的 id，已剔除：%s" % ",".join(sorted(drop))[:60], cat="系统", lv="detail")
         ids -= drop
     return ids
 
@@ -4849,7 +4983,7 @@ def _note_own_author(botdir, ids):
     new = ids - old
     if new:
         _save_json(_own_author_path(botdir), {"ids": sorted(old | new)})
-        log("学到自己的 author id：%s（来源：本 bot 内容的回声）" % ",".join(sorted(new))[:80])
+        log("学到自己的 author id：%s（来源：本 bot 内容的回声）" % ",".join(sorted(new))[:80], cat="系统", lv="detail")
 
 
 # ── 字段读取 ──────────────────────────────────────────────
@@ -4942,7 +5076,7 @@ def _learn_from_mentions(botdir, mentions):
                 keep.add(v)
     added = _note_own_ids(botdir, keep)
     if added:
-        log("学 own_ids：%s（来源：mentions.is_you=true）" % ",".join(sorted(added))[:80])
+        log("学 own_ids：%s（来源：mentions.is_you=true）" % ",".join(sorted(added))[:80], cat="系统", lv="detail")
     return added
 
 
@@ -5029,6 +5163,20 @@ def _at_semantics(appid, botdir, message):
     line = "@ 语义：作者=%s｜提及=%s（%d 个）" % (
         who, "/".join(kinds) if kinds else "无人", len(kinds))
     return body, meta, line
+
+
+def _my_id_set(appid, botdir):
+    """本 bot 自己的 openid 集合：appid / robot id + 从可信 @ 事件学到的。"""
+    return set(_self_id_set(appid)) | set(_own_ids(botdir))
+
+
+def _at_tag(appid, botdir, message):
+    """这条消息的 @ 标记：@我 / @别人 / 空串（没 @）。"""
+    content = str(getattr(message, "content", "") or "")
+    mentions = _mentions_of(message)
+    if not mentions and not _AT_ANY_RE.search(content):
+        return ""
+    return "@我" if _own_mention_ids(appid, botdir, mentions) else "@别人"
 
 
 _AT_ANY_RE = re.compile(r"<@!?([^>]*)>")    # 正文里任意 <@…>（openid 不必是纯 hex）
@@ -5376,14 +5524,14 @@ def persona_summary_sync(botdir, appid="", force=False):
         return cached
     conf = _llm_conf(_base_dir) if _base_dir else None
     if conf is None:
-        log("人格摘要跳过生成：模型配置没填（llm.json 缺 key / 地址）→ 先用原文兜底", appid)
+        log("人格摘要跳过生成：模型配置没填（llm.json 缺 key / 地址）→ 先用原文兜底", appid, cat="系统")
         return cached or text[:_SUMMARY_FALLBACK]
     for i in range(3):
         out = ""
         try:
             out = str(_summary_call(conf, text, appid) or "").strip()
         except Exception as e:
-            log("人格摘要生成失败（第 %d/3 次）：%r" % (i + 1, e), appid)
+            log("人格摘要生成失败（第 %d/3 次）：%r" % (i + 1, e), appid, cat="错误")
         if out:
             try:
                 with open(spath, "w", encoding="utf-8") as f:
@@ -5391,14 +5539,14 @@ def persona_summary_sync(botdir, appid="", force=False):
                 with open(hpath, "w", encoding="utf-8") as f:
                     f.write(want)
             except OSError as e:
-                log("人格摘要写盘失败（忽略）：%r" % e, appid)
-            log("人格摘要已生成：%d 字（人格 %d 字，hash %s）" % (len(out), len(text), want[:8]), appid)
+                log("人格摘要写盘失败（忽略）：%r" % e, appid, cat="错误")
+            log("人格摘要已生成：%d 字（人格 %d 字，hash %s）" % (len(out), len(text), want[:8]), appid, cat="系统")
             return out
         if i < 2:
             time.sleep(1.0 if i == 0 else 3.0)      # 指数退避 1s / 3s
     fb = cached or text[:_SUMMARY_FALLBACK]
     log("人格摘要 3 次都失败 → 先用原文前 %d 字兜底（不写 hash，下次有网再补生成）"
-        % _SUMMARY_FALLBACK, appid)
+        % _SUMMARY_FALLBACK, appid, cat="错误")
     if not cached:
         try:
             with open(spath, "w", encoding="utf-8") as f:
@@ -5414,7 +5562,7 @@ def _summary_warm(botdir, appid=""):
         try:
             persona_summary_sync(botdir, appid)
         except Exception as e:
-            log("人格摘要后台生成出错（忽略）：%r" % e, appid)
+            log("人格摘要后台生成出错（忽略）：%r" % e, appid, cat="错误")
     threading.Thread(target=_run, daemon=True).start()
     return "OK"
 
@@ -5615,7 +5763,7 @@ def _log_gate_candidates(appid, cand):
         else:
             marks.append("%s(自动接话关，已排除)" % r["name"])
     if marks:
-        log("总模型候选：" + "、".join(marks), appid)
+        log("总模型候选：" + "、".join(marks), appid, cat="判定", lv="detail")
 
 
 def _my_entry(appid, roster=None):
@@ -5718,7 +5866,7 @@ def _note_own_bot_id(botdir, ids, appid):
         _save_json(path, table)
         added += len(diff)
         log("学到自己的 author id：%s（来源：本 bot 内容的回声，已写入 %s）"
-            % (",".join(diff)[:80], os.path.basename(path)), appid)
+            % (",".join(diff)[:80], os.path.basename(path)), appid, cat="系统", lv="detail")
     return added
 
 
@@ -5758,7 +5906,7 @@ def _sender_of(botdir, message, roster=None):
     if left > 0:
         log("发言人识别：author=%s → %s" % (
             _oid8(oid) or "(无)",
-            ("bot(%s)" % out[0]) if out[3] else "真人"), "")
+            ("bot(%s)" % out[0]) if out[3] else "真人"), "", cat="系统", lv="detail")
     return out
 
 
@@ -5915,7 +6063,7 @@ def _downgrade_note(gid, n, limit, appid=""):
             return False
         _gate_state["downgrade"][gid] = bucket
     log("真人本小时已 %d 条 > 软上限 %d → 本群判定降为 conservative（groups/%s，不硬拒）"
-        % (n, limit, _oid8(gid)), appid)
+        % (n, limit, _oid8(gid)), appid, cat="判定")
     return True
 
 
@@ -6222,7 +6370,7 @@ def _gate_claim(appid, gid, text):
                    "dec": None, "ts": now, "used": {str(appid)}}
             _gate_rec[key] = rec
     log("总模型共享键：%s%s（群里=%s）"
-        % (_session_log(hit), "" if mine else " 复用先到者的决定", _oid8(gid) or "?"), appid)
+        % (_session_log(hit), "" if mine else " 复用先到者的决定", _oid8(gid) or "?"), appid, cat="判定", lv="detail")
     return rec, mine
 
 
@@ -6238,10 +6386,10 @@ def _gate_log(dec, appid=""):
     """总模型的日志格式（验收要贴的四行之一）：reply(名字｜原因) / skip(原因) / end_topic(...)。"""
     act = dec["action"]
     if act == "skip":
-        log("总模型：skip(%s)" % (dec.get("why") or "无原因"), appid)
+        log("总模型：skip(%s)" % (dec.get("why") or "无原因"), appid, cat="判定")
     else:
         tag = "end_topic" if act == "end_topic" else "reply"
-        log("总模型：%s(%s｜%s)" % (tag, dec.get("bot") or "?", dec.get("why") or "无原因"), appid)
+        log("总模型：%s(%s｜%s)" % (tag, dec.get("bot") or "?", dec.get("why") or "无原因"), appid, cat="判定")
     return dec
 
 
@@ -6257,20 +6405,20 @@ async def _gate_run(appid, gid, gconf, roster, level):
     cap = gconf["bot_max_turns"]
     conf = _conf_for("judge")
     if conf is None:
-        log("总模型跳过：判定槽位没有模型配置（llm.json 缺 key / 地址）→ 退回自判", appid)
+        log("总模型跳过：判定槽位没有模型配置（llm.json 缺 key / 地址）→ 退回自判", appid, cat="判定")
         return {"action": "fallback", "bot": "", "why": "没有模型配置"}
     _log_gate_candidates(appid, roster)
     prompt = _gate_prompt(appid, gid, gconf, roster, level)
     try:
         raw = await _gate_model(conf, prompt)
     except Exception as e:
-        log("总模型失败，退回自判（%r）" % e, appid)
+        log("总模型失败，退回自判（%r）" % e, appid, cat="错误")
         return {"action": "fallback", "bot": "", "why": str(e)[:60]}
     all_names = [r["name"] for r in _enabled_roster(_base_dir)] or list(names)
     dec = _parse_gate(raw, names, all_names)
     if dec is None:
         log("总模型失败，退回自判（输出解析不出 JSON：%s）"
-            % (str(raw or "").strip().replace(chr(10), " ")[:80] or "(空)"), appid)
+            % (str(raw or "").strip().replace(chr(10), " ")[:80] or "(空)"), appid, cat="错误")
         return {"action": "fallback", "bot": "", "why": "解析失败"}
     # ① 静默关系：模型点了正在静默的那一对 → 当成 skip（成对静默是硬约束）
     if dec["action"] != "skip" and last and _silenced(gid, dec["bot"], last):
@@ -6299,7 +6447,7 @@ async def _gate_decide(appid, gid, text, gconf, roster, level):
     if not mine:
         dec = await _gate_wait(rec)
         if dec is None:
-            log("总模型：等其它 bot 的判定超时 → 退回自判", appid)
+            log("总模型：等其它 bot 的判定超时 → 退回自判", appid, cat="判定")
             return {"action": "fallback", "bot": "", "why": "等共享判定超时"}
         return dec
     dec = await _gate_run(appid, gid, gconf, roster, level)
@@ -6325,7 +6473,7 @@ async def _reply_delay(appid, skey, gconf, entry=None):
     if gconf["gate_enabled"]:
         name, ago = _speech_after(skey, t0, appid)
         if name:
-            log("延迟期间已被其它 bot 抢先，放弃（%s 在 %.1f 秒前发过）" % (name, ago), appid)
+            log("延迟期间已被其它 bot 抢先，放弃（%s 在 %.1f 秒前发过）" % (name, ago), appid, cat="判定")
             return False
     return True
 
@@ -6394,15 +6542,17 @@ async def _post_group(api, appid, gid, mid, content="", markdown=None):
             raise
         new = _next_msg_seq(appid, mid)
         log("发送重试：msgseq 冲突，换 seq 重试（%d → %d｜msg_id=%s）"
-            % (seq, new, (str(mid or "") or "无")[-8:]), appid)
+            % (seq, new, (str(mid or "") or "无")[-8:]), appid, cat="回复")
         kw["msg_seq"] = new
         try:
             await api.post_group_message(**kw)
         except Exception as e2:
-            log("发送失败（msgseq 冲突重试后仍失败）：%r" % e2, appid)
+            log("发送失败（msgseq 冲突重试后仍失败）：%r" % e2, appid, cat="错误")
             return False
         seq = new
-    log("发送：msg_id=%s｜seq=%d｜%d 字" % ((str(mid or "") or "无")[-8:], seq, body_len), appid)
+    shown = _snip((markdown or {}).get("content") if markdown is not None else content)
+    log("发送：%s（msg_id=%s｜seq=%d｜%d 字）"
+        % (shown, (str(mid or "") or "无")[-8:], seq, body_len), appid, cat="回复")
     return True
 
 
@@ -6436,24 +6586,24 @@ async def _group_send(appid, botdir, message, gid, who, model_in, images=None,
         busy_name, busy_ago = _group_busy(skey, appid, t0)
         if busy_name:
             log("群级互斥：本群 3 秒内已有 %s 发言，放弃（%.1f 秒前｜键=%s）"
-                % (busy_name, busy_ago, _session_log(skey)), appid)
+                % (busy_name, busy_ago, _session_log(skey)), appid, cat="判定")
             return ""
         _note_sent(appid, gid, plain)
         mid = _unique_msg_id(message)[1]
         if at_ids:
-            log("@ 发出：%d 个（群聊 markdown 消息）" % len(at_ids), appid)
+            log("@ 发出：%d 个（群聊 markdown 消息）" % len(at_ids), appid, cat="回复")
             try:
                 ok = await _post_group(message._api, appid, gid, mid,
                                        markdown={"content": _at_markdown(plain, at_ids)})
             except Exception as e_at:
-                log("@ 消息发送失败（%r）→ 退回纯文本" % e_at, appid)
+                log("@ 消息发送失败（%r）→ 退回纯文本" % e_at, appid, cat="错误")
                 ok = await _post_group(message._api, appid, gid, mid, content=plain)
         else:
             ok = await _post_group(message._api, appid, gid, mid, content=plain)
         if not ok:
             return ""          # 发不出去就不算说过：不记「刚说过」，本轮到此为止
     except Exception as e:
-        log("回群失败：%r" % e, appid)
+        log("回群失败：%r" % e, appid, cat="错误")
         return ""
     _speech_mark(skey, appid, _my_name(appid), plain)
     if closing:
@@ -6464,9 +6614,9 @@ async def _group_send(appid, botdir, message, gid, who, model_in, images=None,
         until = _silence_set(gid, me, target, int(closing.get("minutes") or 0))
         if until:
             log("静默生效：%s→%s %d 分钟（到点自动解除，只放内存）"
-                % (me, target, int(closing.get("minutes") or 0)), appid)
+                % (me, target, int(closing.get("minutes") or 0)), appid, cat="判定")
         else:
-            log("收尾完成：%s 本链句数清零（没有成对目标，不上静默）" % (me or "?"), appid)
+            log("收尾完成：%s 本链句数清零（没有成对目标，不上静默）" % (me or "?"), appid, cat="判定")
     return plain
 
 
@@ -6512,24 +6662,24 @@ async def _gated_turn(appid, botdir, message, gid, from_name, text, gconf, roste
     if act == "fallback":
         name, _ago = _speech_after(_session_key(text), time.time() - 3.0, appid)
         log("总模型失败，退回自判：bot 的话自判不接%s"
-            % ("；且本群 3 秒内已有 %s 发言 → 本轮放弃" % name if name else " → 本轮放弃"), appid)
+            % ("；且本群 3 秒内已有 %s 发言 → 本轮放弃" % name if name else " → 本轮放弃"), appid, cat="判定")
         return
     if dec["bot"] != my_name:
         picked = str(dec.get("bot") or "")
         if act != "skip" and picked and picked not in cand_names:
             # 同一条规则：点名的 bot 不在候选里（没在跑 / 该群自动接话关着）→ 本轮没人接
             log("总模型：点名 %s，但 %s 的自动接话关闭/未运行 → 本轮放弃"
-                % (picked, picked), appid)
+                % (picked, picked), appid, cat="判定")
             return
         if act == "end_topic" and dec.get("bot"):
-            log("总模型：end_topic 点名 %s 收尾，本 bot 不动" % dec["bot"], appid)
+            log("总模型：end_topic 点名 %s 收尾，本 bot 不动" % dec["bot"], appid, cat="判定")
         return
     if _silenced(gid, my_name, from_name):
-        log("跳过：%s→%s 成对静默中，本轮不接" % (my_name, from_name), appid)
+        log("跳过：%s→%s 成对静默中，本轮不接" % (my_name, from_name), appid, cat="判定")
         return
     ok, why_rate = _gate_rate(appid, gid)
     if not ok:
-        log("%s（群=%s｜作者=%s）" % (why_rate, _oid8(gid), from_name), appid)
+        log("%s（群=%s｜作者=%s）" % (why_rate, _oid8(gid), from_name), appid, cat="判定")
         return
     extra, closing = "", None
     if act == "end_topic":
@@ -6564,15 +6714,23 @@ async def _handle_group(appid, botdir, message, tag):
     text = (getattr(message, "content", "") or "").strip()
     # 同一个消息 id 只处理一次；但键里带上正文哈希 —— id 万一被复用，不同内容不会被吃掉
     if not _mark_seen(("%s|%s" % (mid, _hash_text(text)[:12])) if mid else ""):
-        log("%s：重复 id=%s，跳过（同一事件同时推了 @ / 普通两种）" % (tag, mid[:12]), appid)
+        log("%s：重复 id=%s，跳过（同一事件同时推了 @ / 普通两种）" % (tag, mid[:12]), appid, cat="判定")
         return
     if not trusted_at:
         _dump_gateway_raw(botdir, "group_message_create", getattr(message, "raw", None) or {})
     gid = str(getattr(message, "group_openid", "") or "")
-    brief = "%s｜id=%s｜群=%s｜内容=%s" % (tag, mid[:12], gid[:8], text[:40])
+    brief = "%s｜id=%s｜群=%s｜内容=%s" % (
+        tag, mid[:12], gid[:8], _msg_summary(text, _my_id_set(appid, botdir)))
     # 总模型的开关与名单每条消息现读：启停 bot / 改开关之后，下一条消息就按新配置走
     gconf = _gate_conf(_base_dir)
     roster = _enabled_roster(_base_dir)
+    my_name = _my_name(appid)
+    from_name, _from_appid, author_oid, from_bot = _sender_of(botdir, message, roster)
+    body = _strip_mentions(text)
+    # 收到什么：simple 下每条消息的第一行（谁说的 + 有没有 @ 我 + 摘要），先看收到什么再看回不回
+    log(_msg_line(from_name if from_bot else (_oid8(author_oid) or from_name), text,
+                  _at_tag(appid, botdir, message), _my_id_set(appid, botdir)),
+        appid, cat="消息")
     # 总模型候选 = enabled **且**当前有运行实例：点名一个没在跑的 bot 等于白花钱且没人接。
     # 运行中不足两个 → 按现有规则不走总模型（各 bot 各判各的）。
     # 群配置先读：总模型候选要按「该 bot 在这个群里的自动接话」筛（见 _gate_candidates）
@@ -6582,13 +6740,11 @@ async def _handle_group(appid, botdir, message, tag):
     cand_names = set(r["name"] for r in cand)
     if gconf["gate_enabled"] and len(roster) >= 2 and len(cand) < 2:
         if not cand:
-            log("总模型跳过：候选 bot 的群里自动接话都关着（只回 @）｜%s" % brief, appid)
+            log("总模型跳过：候选 bot 的群里自动接话都关着（只回 @）｜%s" % brief, appid,
+                cat="判定", lv="detail")
         else:
             log("总模型不走：运行中的 bot 只有 %d 个（启用 %d 个）→ 退回各判各的"
-                % (len(cand), len(roster)), appid)
-    my_name = _my_name(appid)
-    from_name, _from_appid, author_oid, from_bot = _sender_of(botdir, message, roster)
-    body = _strip_mentions(text)
+                % (len(cand), len(roster)), appid, cat="判定", lv="detail")
 
     # ── 群内互相可见：先把这一条记进群上下文（真人 [作者 名字]，bot [名字]）
     _ctx_note(appid, gid,
@@ -6609,7 +6765,7 @@ async def _handle_group(appid, botdir, message, tag):
     # 闸 5 · 群级配置（<botdir>/groups/<gid>.json）：整群静音直接掐掉，后面几道闸都不用走
     # （gc 在上面就算好了：总模型候选要按它判「该群的自动接话」）
     if not gc["enabled"]:
-        log("跳过：该群已静音（groups/%s.json enabled=false）｜%s" % (_oid8(gid), brief), appid)
+        log("跳过：该群已静音（groups/%s.json enabled=false）｜%s" % (_oid8(gid), brief), appid, cat="判定")
         return
 
     # 句数：真人发言把所有 bot 计数清零；bot 发言只给自己 +1
@@ -6634,13 +6790,13 @@ async def _handle_group(appid, botdir, message, tag):
     why = _bot_author(botdir, message)
     if why:
         if not gate_on:
-            log("%s（%s）" % (why, brief), appid)
+            log("%s（%s）" % (why, brief), appid, cat="判定")
             return
         if echo:
-            log("跳过：疑似复读本 bot 内容（%s）" % brief, appid)
+            log("跳过：疑似复读本 bot 内容（%s）" % brief, appid, cat="判定")
             return
         if not from_bot:
-            log("%s｜作者是 bot 但认不出是谁（%s）→ 不接" % (why, brief), appid)
+            log("%s｜作者是 bot 但认不出是谁（%s）→ 不接" % (why, brief), appid, cat="判定")
             return
         # 认不出是谁的 bot 也允许续：它只是个「[其他bot] 说了话」的上下文，回不回归总模型判
         await _gated_turn(appid, botdir, message, gid, from_name or "其他bot", body,
@@ -6650,7 +6806,7 @@ async def _handle_group(appid, botdir, message, tag):
     # 闸 1 · 回环：命中就说明这条是我们自己刚说的话被推回来，顺手记下自己的 author id
     if echo:
         _note_own_author(botdir, _author_ids(message))
-        log("跳过：疑似复读本 bot 内容（%s）" % brief, appid)
+        log("跳过：疑似复读本 bot 内容（%s）" % brief, appid, cat="判定")
         return
 
     # 闸 3 · @ 判定（fail-closed）+ 总模型
@@ -6664,16 +6820,16 @@ async def _handle_group(appid, botdir, message, tag):
     if gate_on:
         # ── 多 bot：总模型决定这一轮谁说
         if at_state == "unknown":
-            log("跳过：判不出是否 @ 本 bot（%s｜%s）" % (why_at, brief), appid)
+            log("跳过：判不出是否 @ 本 bot（%s｜%s）" % (why_at, brief), appid, cat="判定")
             return
         if at_state == "yes":
             # 真人 @ 了本 bot：总模型不参与，直接由本 bot 回（对方要求的行为）
-            log("总模型跳过：真人 @ 了本 bot（直接回）｜%s" % brief, appid)
+            log("总模型跳过：真人 @ 了本 bot（直接回）｜%s" % brief, appid, cat="判定")
         elif _at_others(appid, botdir, message):
             if not _mentions_of(message) and _MENTION_RE.search(text):
-                log("总模型跳过：正文 @ 了别人（mentions 为空）｜%s" % brief, appid)
+                log("总模型跳过：正文 @ 了别人（mentions 为空）｜%s" % brief, appid, cat="判定")
             else:
-                log("总模型跳过：本条 @ 的是别人（由被 @ 的 bot 回）｜%s" % brief, appid)
+                log("总模型跳过：本条 @ 的是别人（由被 @ 的 bot 回）｜%s" % brief, appid, cat="判定")
             return
         else:
             dec = await _gate_decide(appid, gid, text, gconf, cand, level)
@@ -6683,33 +6839,33 @@ async def _handle_group(appid, botdir, message, tag):
                 name, _ago = _speech_after(_session_key(text), time.time() - 3.0, appid)
                 if name:
                     log("总模型失败，退回自判；但本群 3 秒内已有 %s 发言 → 本轮放弃"
-                        % name, appid)
+                        % name, appid, cat="判定")
                     return
                 conf_j = _llm_conf(_base_dir) if _base_dir else None
                 named = _name_hit(botdir, text) if (
                     conf_j is None or conf_j.get("name_hit_as_call", True)) else ""
                 auto_on, auto_src = _group_autochat_state(appid, gc)
                 if named:
-                    log("名字命中（%s）→ 直回（总模型失败，退回自判）｜%s" % (named, brief), appid)
+                    log("名字命中（%s）→ 直回（总模型失败，退回自判）｜%s" % (named, brief), appid, cat="判定")
                 elif not auto_on:
                     log("总模型失败，退回自判：既没被叫、群里自动接话也关着（判定来源：%s）"
-                        "→ 本轮放弃（%s）" % (auto_src, brief), appid)
+                        "→ 本轮放弃（%s）" % (auto_src, brief), appid, cat="判定")
                     return
                 elif not await _should_reply(conf_j, text, level):
-                    log("总模型失败，退回自判：自判不接这句（%s）" % brief, appid)
+                    log("总模型失败，退回自判：自判不接这句（%s）" % brief, appid, cat="判定")
                     return
                 else:
-                    log("总模型失败，退回自判：自判接这句（%s）" % brief, appid)
+                    log("总模型失败，退回自判：自判接这句（%s）" % brief, appid, cat="判定")
             elif act == "skip" or dec["bot"] != my_name:
                 picked = str(dec.get("bot") or "")
                 if act != "skip" and picked and picked not in cand_names:
                     # 点名的 bot 不在候选里（没在跑 / 该群自动接话关着）：没人会接这一轮
                     log("总模型：点名 %s，但 %s 的自动接话关闭/未运行 → 本轮放弃（%s）"
-                        % (picked, picked, brief), appid)
+                        % (picked, picked, brief), appid, cat="判定")
                     return
                 if act != "skip":
                     log("总模型：%s 点名 %s，本 bot 不动（%s）"
-                        % (act, picked or "?", brief), appid)
+                        % (act, picked or "?", brief), appid, cat="判定")
                 return
             else:
                 # 总模型点了本 bot：还要过「群里自动接话」这道用户开关（老逻辑同样要过），
@@ -6719,7 +6875,7 @@ async def _handle_group(appid, botdir, message, tag):
                     (_llm_conf(_base_dir) or {}).get("name_hit_as_call", True)) else ""
                 if not named and not auto_on:
                     log("跳过：总模型点了本 bot，但「群里自动接话」关闭（判定来源：%s）｜%s"
-                        % (auto_src, brief), appid)
+                        % (auto_src, brief), appid, cat="判定")
                     return
             if act == "end_topic":
                 # 到上限：注入「用你的语气自然收尾」，发完给这对关系上静默、句数清零
@@ -6731,16 +6887,16 @@ async def _handle_group(appid, botdir, message, tag):
         # ── 老逻辑（各 bot 自判）：与 1.0.7 一致，只有档位会因真人超软上限降到 conservative
         if not trusted_at:
             if at_state == "unknown":
-                log("跳过：判不出是否 @ 本 bot（%s｜%s）" % (why_at, brief), appid)
+                log("跳过：判不出是否 @ 本 bot（%s｜%s）" % (why_at, brief), appid, cat="判定")
                 return
             if at_state == "no":
                 # 没 @ 我但 @ 了别人（含「mentions 为空、正文却有 <@hex>」）：fail-closed，
                 # 连名字命中和自动接话都不算 —— 别人头上的 @ 绝不抢
                 if _at_others(appid, botdir, message):
                     if not _mentions_of(message) and _MENTION_RE.search(text):
-                        log("跳过：正文 @ 了别人（mentions 为空），本条不回｜%s" % brief, appid)
+                        log("跳过：正文 @ 了别人（mentions 为空），本条不回｜%s" % brief, appid, cat="判定")
                     else:
-                        log("跳过：本条 @ 的是别人（由被 @ 的 bot 回）｜%s" % brief, appid)
+                        log("跳过：本条 @ 的是别人（由被 @ 的 bot 回）｜%s" % brief, appid, cat="判定")
                     return
                 conf_j = _llm_conf(_base_dir) if _base_dir else None
                 # 名字命中前置（name_hit_as_call，默认开）：正文里出现人格名或称呼 = 被叫
@@ -6748,27 +6904,27 @@ async def _handle_group(appid, botdir, message, tag):
                 if conf_j is None or conf_j.get("name_hit_as_call", True):
                     called = _name_hit(botdir, text)
                 if called:
-                    log("名字命中（%s）→ 直回（%s）" % (called, brief), appid)
+                    log("名字命中（%s）→ 直回（%s）" % (called, brief), appid, cat="判定")
                 else:
                     # 三层判定：群配置显式值 > 该 bot 覆盖 > 全局（日志写清是哪一层判的）
                     auto_on, auto_src = _group_autochat_state(appid, gc)
                     if not auto_on:
                         log("跳过：未 @ 本 bot（%s），且「群里自动接话」关闭（判定来源：%s）"
-                            "→ 默认只回 @（%s）" % (why_at, auto_src, brief), appid)
+                            "→ 默认只回 @（%s）" % (why_at, auto_src, brief), appid, cat="判定")
                         return
-                    log("自动接话开（判定来源：%s）｜%s" % (auto_src, brief), appid)
+                    log("自动接话开（判定来源：%s）｜%s" % (auto_src, brief), appid, cat="判定")
                     if not await _should_reply(conf_j, text, level):
-                        log("跳过：回复判定不接这句（%s）" % brief, appid)
+                        log("跳过：回复判定不接这句（%s）" % brief, appid, cat="判定")
                         return
-                    log("回复判定接这句（%s）" % brief, appid)
+                    log("回复判定接这句（%s）" % brief, appid, cat="判定")
 
     # 闸 4 · 限流 + 熔断（只有真要回才占额度）
     ok, why_rate = _gate_rate(appid, gid)
     if not ok:
         if why_rate.startswith("熔断"):
-            log("！！！ %s ！！！（%s）" % (why_rate, brief), appid)
+            log("！！！ %s ！！！（%s）" % (why_rate, brief), appid, cat="判定")
         else:
-            log("%s（%s）" % (why_rate, brief), appid)
+            log("%s（%s）" % (why_rate, brief), appid, cat="系统")
         return
 
     # 闸 6 · 群级每日额度（groups/<gid>.json daily_limit 三态）：超了静默
@@ -6784,10 +6940,9 @@ async def _handle_group(appid, botdir, message, tag):
         ok_quota, used = _group_quota_take(botdir, gid, limit)
         if not ok_quota:
             log("跳过：该群今日已回 %d 条，达到上限 %d 条（来源：%s）→ 今日不再回复｜%s"
-                % (used, limit, limit_src, brief), appid)
+                % (used, limit, limit_src, brief), appid, cat="判定")
             return
 
-    log("%s：%s" % (tag, text[:60]), appid)
     # 存档：过了作者过滤与复读闸的消息一律入库 —— 不为了这条要回复，只为以后能被回忆
     _arc_put(botdir, "group", gid, (author_oid or ""), body)
     try:
@@ -6795,15 +6950,15 @@ async def _handle_group(appid, botdir, message, tag):
         for _id in _author_ids(message):
             _note_sender(botdir, _id, gid)
     except Exception as e:
-        log("采集 openid 失败（忽略）：%r" % e, appid)
+        log("采集 openid 失败（忽略）：%r" % e, appid, cat="错误")
     # 图片附件：这一条消息可能同时带图（QQ 把图放在 attachments 里带 url）
     images = _attachments_of(message)
     if images:
         log("收到 %d 张图片附件（%s）" % (
-            len(images), "，".join([a.get("filename") or "未命名" for a in images])[:60]), appid)
+            len(images), "，".join([a.get("filename") or "未命名" for a in images])[:60]), appid, cat="消息", lv="detail")
     # @ 语义：<@hex> 换成「你 / 作者本人 / 用户xxxxxxxx」，再在消息前加一行元信息。
     at_body, at_meta, at_line = _at_semantics(appid, botdir, message)
-    log(at_line, appid)
+    log(at_line, appid, cat="判定", lv="detail")
     model_in = (at_meta + chr(10) + at_body) if at_body else at_meta
     # 本地指令先判：过了四道闸就算「该回这条」，回时间不必打扰模型
     if await _local_time_reply(appid, message, body, group_openid=gid):
@@ -6836,18 +6991,18 @@ def _make_client(appid, secret, botdir, gen=None):
                 (",".join(sorted(_own_ids(botdir))[:4]) or "(空，等可信 @ 事件学习)"),
                 "开" if _group_autochat_state(appid, {})[0] else "关（默认只回 @）",
                 "开" if _autochat["on"] else "关",
-                _autochat_override_label(appid)), appid)
+                _autochat_override_label(appid)), appid, cat="判定", lv="detail")
             # 定时消息 + 随机问候：上线后起一个循环，隔 30 秒看一次任务表
             try:
                 _spawn_sched(_sched_loop(self, appid, botdir))
             except Exception as e:
-                log("定时消息调度没起来：%r" % e, appid)
+                log("定时消息调度没起来：%r" % e, appid, cat="错误")
             with _lock:
                 if appid in _bots:
                     _bots[appid]["status"] = "已上线 · %s" % name
                     _bots[appid]["name"] = name
                     _bots[appid]["online_at"] = time.time()
-            log("已上线：「%s」" % name, appid)
+            log("已上线：「%s」" % name, appid, cat="系统")
 
         async def on_at_message_create(self, message):
             if _stale(appid, gen):
@@ -6855,7 +7010,8 @@ def _make_client(appid, secret, botdir, gen=None):
             if _dedupe_message(appid, message, "频道"):
                 return
             text = (getattr(message, "content", "") or "").strip()
-            log("频道@：%s" % text[:60], appid)
+            log(_msg_line(_oid8((_author_ids(message) or [""])[0]) or "频道@", text,
+                          "@我", _my_id_set(appid, botdir)), appid, cat="消息")
             try:
                 say = await _reply(appid, botdir, "c" + str(message.channel_id), "", text,
                                    images=_attachments_of(message))
@@ -6865,7 +7021,7 @@ def _make_client(appid, secret, botdir, gen=None):
                     channel_id=message.channel_id, msg_id=message.id, content=say,
                 )
             except Exception as e:
-                log("回频道失败：%r" % e, appid)
+                log("回频道失败：%r" % e, appid, cat="错误")
 
         async def on_group_at_message_create(self, message):
             if _stale(appid, gen):
@@ -6889,8 +7045,9 @@ def _make_client(appid, secret, botdir, gen=None):
             text = (getattr(message, "content", "") or "").strip()
             images = _attachments_of(message)
             if images:
-                log("私聊收到 %d 张图片附件" % len(images), appid)
-            log("私聊：%s" % text[:60], appid)
+                log("私聊收到 %d 张图片附件" % len(images), appid, cat="消息", lv="detail")
+            log(_msg_line(_oid8((_author_ids(message) or [""])[0]) or "私聊", text,
+                          "", _my_id_set(appid, botdir)), appid, cat="消息")
             # 存档：私聊收到的每一条都记（会话 id 就是对方的 user_openid）
             _arc_put(botdir, "c2c", str(getattr(message.author, "user_openid", "") or ""),
                      (_author_ids(message) or [""])[0], text)
@@ -6899,7 +7056,7 @@ def _make_client(appid, secret, botdir, gen=None):
                 for _id in _author_ids(message):
                     _note_chat(botdir, "c2c", _id)
             except Exception as e:
-                log("采集 openid 失败（忽略）：%r" % e, appid)
+                log("采集 openid 失败（忽略）：%r" % e, appid, cat="错误")
             # 本地指令（#时间 / 现在几点）：不经过模型，直接回本地时间
             if await _local_time_reply(
                     appid, message, text,
@@ -6924,13 +7081,13 @@ def _make_client(appid, secret, botdir, gen=None):
                     msg_id=message.id, content=say,
                 )
             except Exception as e:
-                log("回私聊失败：%r" % e, appid)
+                log("回私聊失败：%r" % e, appid, cat="错误")
 
     try:
         intents = botpy.Intents(public_guild_messages=True, public_messages=True)
     except TypeError:
         intents = botpy.Intents(public_guild_messages=True)
-        log("当前 botpy 不支持 public_messages，只开频道事件", appid)
+        log("当前 botpy 不支持 public_messages，只开频道事件", appid, cat="系统")
     return Bot(intents=intents)
 
 
@@ -6948,7 +7105,7 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
     conf = _llm_conf(_base_dir) if _base_dir else None
     if images:
         if conf is None:
-            log("识图跳过：模型配置没填（llm.json 缺 key / 地址），这条按纯文本处理", appid)
+            log("识图跳过：模型配置没填（llm.json 缺 key / 地址），这条按纯文本处理", appid, cat="系统")
         else:
             # 识图槽位（vision_model，留空 = 主模型）：实际用的就是 conf["model"]
             extra = await _vision_suffix(appid, _conf_for("vision") or conf, images)
@@ -6969,7 +7126,7 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
         web_on = bool(conf.get("web_search_enabled", True)) and group_web
         if not group_web and _needs_web(incoming or ""):
             log("联网：该群已关闭联网（groups/%s.json web_search=false），本条跳过触发词搜索"
-                % _oid8(gid_key), appid)
+                % _oid8(gid_key), appid, cat="系统")
         auto_decide = web_on and bool(conf.get("search_auto_decide", True))
         msgs = _build_messages(botdir, key, who, incoming, first=first, search_hint=auto_decide,
                                member_oid=_member_openid_ctx.get())
@@ -6990,7 +7147,7 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
             rmode, rrows = await asyncio.to_thread(archive_search, botdir, rq, _ARC_RECALL_N)
             log("存档召回：key=%s 「%s」→ %s" % (
                 key, rq, ("命中 %d 条（%s）" % (len(rrows), rmode)) if rrows
-                else ("未命中（%s）" % (rmode or "无库"))), appid)
+                else ("未命中（%s）" % (rmode or "无库"))), appid, cat="系统", lv="detail")
             second = (_recall_block(rrows) + _RECALL_STOP) if rrows else _RECALL_EMPTY
             text = await asyncio.to_thread(
                 _call_llm_sync, conf, list(msgs) + [
@@ -7008,11 +7165,11 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
             hits = _dedup_hits(hits + await _self_web_context(appid, conf, q, rounds))
             if hits:
                 log("联网：模型自判要查「%s」→ 第 %d 轮（累计 %d 条资料）"
-                    % (q[:30], rounds, len(_shown_hits(hits))), appid)
+                    % (q[:30], rounds, len(_shown_hits(hits))), appid, cat="系统")
                 second = (_hits_block(hits) + _WEB_HINT_STOP
                           + chr(10) + _search_more_rule(_SRCH_MAX - rounds))
             else:
-                log("联网：模型自判要查「%s」→ 第 %d 轮没搜到" % (q[:30], rounds), appid)
+                log("联网：模型自判要查「%s」→ 第 %d 轮没搜到" % (q[:30], rounds), appid, cat="系统")
                 second = ("（刚查了，一条资料都没搜到：按你确实知道的回答；不确定就说不知道，"
                           "不要编造。" + chr(10) + _search_more_rule(_SRCH_MAX - rounds) + "）")
             msgs2 = list(msgs) + [
@@ -7024,11 +7181,11 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
         if rounds:
             # 用满 5 轮还在要资料 / 一条都没查到 → 收尾，不再花钱搜
             if asked or not hits:
-                log("联网：搜索 %d 轮未得结果，按「不清楚」回复" % rounds, appid)
+                log("联网：搜索 %d 轮未得结果，按「不清楚」回复" % rounds, appid, cat="系统")
             text = _strip_search_marks(text)
             if not text:
                 log("自判搜索后没有可用正文 → 让人格说一句「不清楚」（模型 %s）" % conf["model"],
-                    appid)
+                    appid, cat="系统")
                 text = await asyncio.to_thread(
                     _call_llm_sync, conf,
                     list(msgs) + [{"role": "system",
@@ -7041,14 +7198,14 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
             text = _strip_search_marks(text)
         if not text and not rounds:
             # 第一轮只说「我要查」但资料已经由触发词搜来了（或自判已关）：补一次纯回答
-            log("回复只剩 <search> 标记没有正文 → 要求它直接回答", appid)
+            log("回复只剩 <search> 标记没有正文 → 要求它直接回答", appid, cat="回复")
             text = await asyncio.to_thread(
                 _call_llm_sync, conf,
                 list(msgs) + [{"role": "system",
                               "content": "直接用一句话回答对方，不要输出任何 <search> 标记。"}])
         # 和判定/识图/摘要同一个格式：日志里写清回复实际用的模型
         log("回复（模型 %s）：%s" % (conf["model"],
-                                    (text or "(空)")[:40].replace(chr(10), " ")), appid)
+                                    (text or "(空)")[:40].replace(chr(10), " ")), appid, cat="回复")
         if not text:
             text = "（模型没返回内容）"
         raw_len = len(text)
@@ -7056,12 +7213,12 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
         before = text
         text = sanitize_reply(text)
         if text != before.strip():
-            log("出站清洗：删掉指令/思考片段（%d → %d 字）" % (len(before), len(text)), appid)
+            log("出站清洗：删掉指令/思考片段（%d → %d 字）" % (len(before), len(text)), appid, cat="回复")
         if not text:
-            log("出站清洗：内容为空，丢弃", appid)
+            log("出站清洗：内容为空，丢弃", appid, cat="回复")
             return ""
         text = _clean_reply(text)
-        log("回复清洗：原 %d 字 → 现 %d 字" % (raw_len, len(text)), appid)
+        log("回复清洗：原 %d 字 → 现 %d 字" % (raw_len, len(text)), appid, cat="回复", lv="detail")
         # ② 称呼兜底：对方不是主人时，「主人」不许发出去（master_word_guard 默认开）
         if _master_guard_on(_base_dir):
             fixed, n_fix, others = _master_word_fix(
@@ -7069,17 +7226,17 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
             if n_fix:
                 if others:
                     log("称呼兜底：替换 %d 处「主人」→「%s」（对方非主人）"
-                        % (n_fix, others), appid)
+                        % (n_fix, others), appid, cat="回复")
                 else:
                     log("称呼兜底：删除 %d 处「主人」→「你」（对方非主人，未配置称呼）"
-                        % n_fix, appid)
+                        % n_fix, appid, cat="回复")
                 text = fixed
         _remember(botdir, key, "assistant", text)
         # 存档：把这一轮发出去的话补到「刚收到那条」的 reply_text 上（一行 = 原文 ⇢ 回复）
         _arc_reply_by_key(botdir, key, text)
         return text
     except Exception as e:
-        log("调模型失败：%r" % e, appid)
+        log("调模型失败：%r" % e, appid, cat="错误")
         return "（模型调用失败：%s）" % str(e)[:60]
 
 
@@ -7110,7 +7267,7 @@ def _stale(appid, gen):
         first = key not in _stale_seen
         _stale_seen.add(key)
     if first:
-        log("忽略：来自已停止实例的事件", appid)
+        log("忽略：来自已停止实例的事件", appid, cat="系统")
     return True
 
 
@@ -7129,7 +7286,7 @@ async def _safe_close(client, appid=""):
         if asyncio.iscoroutine(r):
             await r
     except Exception as e:
-        log("close() 出错（忽略）：%r" % e, appid)
+        log("close() 出错（忽略）：%r" % e, appid, cat="错误")
 
 
 def _run_bot(appid, secret, botdir, gen=None):
@@ -7147,7 +7304,7 @@ def _run_bot(appid, secret, botdir, gen=None):
         except Exception:
             pass
         _fix_botpy_logging(botdir)
-        log("准备连接…", appid)
+        log("准备连接…", appid, cat="系统")
         client = _make_client(appid, secret, botdir, gen)
         with _lock:
             mine = _own(appid, gen)
@@ -7156,13 +7313,13 @@ def _run_bot(appid, secret, botdir, gen=None):
                 _bots[appid]["client"] = client
         if not mine:
             # 启动过程中就被 stop_one 停掉了：别再连了，否则这条连接没人能停
-            log("已停止：启动过程中收到停止指令，不再连接", appid)
+            log("已停止：启动过程中收到停止指令，不再连接", appid, cat="系统")
             return
-        log("开始 run()（阻塞直到连接结束）", appid)
+        log("开始 run()（阻塞直到连接结束）", appid, cat="系统")
         client.run(appid=appid, secret=secret)
         with _lock:
             mine = _own(appid, gen)
-        log("run() 返回（%s）" % ("连接已结束" if mine else "实例已被停止"), appid)
+        log("run() 返回（%s）" % ("连接已结束" if mine else "实例已被停止"), appid, cat="系统")
         with _lock:
             if mine:
                 _bots[appid]["status"] = "连接已结束"
@@ -7173,10 +7330,10 @@ def _run_bot(appid, secret, botdir, gen=None):
             # 这条线程是被 stop_one 停掉的：loop.stop() 会让 botpy 里的
             # run_until_complete 抛 RuntimeError(Event loop stopped before Future completed)
             # —— 那是「停成功」的回执，不是启动失败
-            log("run() 已退出（实例已被停止）：%s" % e, appid)
+            log("run() 已退出（实例已被停止）：%s" % e, appid, cat="系统")
         else:
-            log("启动失败：%s" % e, appid)
-            log(traceback.format_exc()[:1200], appid)
+            log("启动失败：%s" % e, appid, cat="错误")
+            log(traceback.format_exc()[:1200], appid, cat="错误")
             with _lock:
                 if _own(appid, gen):
                     _bots[appid]["status"] = "启动失败：%s" % str(e)[:60]
@@ -7208,7 +7365,7 @@ def start_one(appid, secret, base_dir):
     try:
         _migrate_words(botdir, appid)
     except Exception as e:
-        log("文案迁移出错（忽略）：%r" % e, appid)
+        log("文案迁移出错（忽略）：%r" % e, appid, cat="错误")
     if not _log_path:
         _log_path = os.path.join(base_dir, "local_bot.log")
         try:
@@ -7221,7 +7378,7 @@ def start_one(appid, secret, base_dir):
     try:
         _arc_boot(botdir)
     except Exception as e:
-        log("消息存档初始化失败（忽略，收发照常）：%r" % e, appid)
+        log("消息存档初始化失败（忽略，收发照常）：%r" % e, appid, cat="错误")
     # 「群里只回 @」的一次性提示：状态页那行小字是界面侧，日志这边只在本次进程写一条
     _hint_autochat_once(appid)
     # 人格摘要：导入人格 / 编辑保存后（Kotlin 会 restart）在这里补生成，后台线程、不挡启动。
@@ -7265,16 +7422,16 @@ def stop_one(appid):
         info["client"] = None
         info["loop"] = None
         info["stopped_at"] = time.time()
-    log("收到停止指令", appid)
+    log("收到停止指令", appid, cat="系统")
     if loop is None or not loop.is_running():
-        log("已停止（该实例没连上过，事件将被忽略）", appid)
+        log("已停止（该实例没连上过，事件将被忽略）", appid, cat="系统")
         return "OK"
     # ② 关 http/gateway：close() 是协程，必须投递到它自己那个 loop 上 await
     fut = None
     try:
         fut = asyncio.run_coroutine_threadsafe(_safe_close(c, appid), loop)
     except Exception as e:
-        log("投递 close() 出错（忽略）：%r" % e, appid)
+        log("投递 close() 出错（忽略）：%r" % e, appid, cat="错误")
     # ③ 等 close() 跑完再停 loop —— 交给一个短命线程，不阻塞调用方
     #    （Kotlin 的 stop_all 是从主线程调的，同步等 3 秒会卡界面）
     threading.Thread(target=_finish_stop, args=(appid, loop, fut), daemon=True).start()
@@ -7296,13 +7453,13 @@ def restart_one(appid, secret, base_dir, reason="手动重启"):
     stop_one(appid)
     secret = str(secret or "").strip()
     if not secret:
-        log("已停止 bot %s（原因：%s），但本机清单里拿不到 AppSecret，没能重新拉起" % (appid, reason))
+        log("已停止 bot %s（原因：%s），但本机清单里拿不到 AppSecret，没能重新拉起" % (appid, reason), cat="系统")
         return "已停止 bot %s，但缺 AppSecret 没能重新拉起" % appid
     r = start_one(appid, secret, base_dir)
     if r != "OK":
-        log("重启 bot %s 失败（原因：%s）：%s" % (appid, reason, r))
+        log("重启 bot %s 失败（原因：%s）：%s" % (appid, reason, r), cat="错误")
         return "重启 bot %s 失败：%s" % (appid, r)
-    log("已重启 bot %s（原因：%s）" % (appid, reason))
+    log("已重启 bot %s（原因：%s）" % (appid, reason), cat="系统")
     return "已重启 bot %s（原因：%s）" % (appid, reason)
 
 
@@ -7318,7 +7475,7 @@ def start_all(bots_json, base_dir):
             import json as _json
             bots_json = _json.loads(bots_json or "[]")
         except Exception as e:
-            log("解析 bot 清单失败：%r" % e)
+            log("解析 bot 清单失败：%r" % e, cat="错误")
             bots_json = []
     if not isinstance(bots_json, list):
         bots_json = []
@@ -7350,15 +7507,15 @@ def _finish_stop(appid, loop, fut):
         if fut is not None:
             fut.result(timeout=3)          # http/gateway 真的关掉
     except Exception as e:
-        log("等 close() 超时/出错（继续停 loop）：%r" % e, appid)
+        log("等 close() 超时/出错（继续停 loop）：%r" % e, appid, cat="错误")
     try:
         loop.call_soon_threadsafe(loop.stop)
     except Exception as e:
-        log("停 loop 出错（忽略）：%r" % e, appid)
+        log("停 loop 出错（忽略）：%r" % e, appid, cat="错误")
     end = time.time() + 3.0
     while time.time() < end and loop.is_running():
         time.sleep(0.02)
-    log("已停止（loop 已停，旧实例事件将被忽略）", appid)
+    log("已停止（loop 已停，旧实例事件将被忽略）", appid, cat="系统")
 
 
 def stop_all():
@@ -7368,7 +7525,7 @@ def stop_all():
         try:
             stop_one(appid)
         except Exception as e:
-            log("停止 %s 出错（继续停其它）：%r" % (appid, e), appid)
+            log("停止 %s 出错（继续停其它）：%r" % (appid, e), appid, cat="错误")
     return "OK"
 
 
@@ -7509,7 +7666,7 @@ def memory_delete_many(botdir, keys):
             hits.append((hit, h[hit]))
     if not hits:
         log("记忆删除：%s 都不存在，剩余 %d 条（现有键：%s）" % (
-            ",".join(raws)[:80], _memory_rows(h), ",".join(sorted(h)[:6])[:160]))
+            ",".join(raws)[:80], _memory_rows(h), ",".join(sorted(h)[:6])[:160]), cat="系统")
         return "没有这个会话：%s" % ",".join(raws)[:80]
     items = [{"key": hit, "rows": rows} for hit, rows in hits]
     for hit, _rows in hits:
@@ -7522,12 +7679,12 @@ def memory_delete_many(botdir, keys):
         _clear_undo(botdir)         # 一个键都没删成，undo 也别留，省得界面给人假希望
         left = _memory_rows(h)
         log("记忆删除失败：%s 写不进去，剩余 %d 条（%s 没删掉）" % (
-            _memory_path(botdir), left, ",".join(x[0] for x in hits)[:120]))
+            _memory_path(botdir), left, ",".join(x[0] for x in hits)[:120]), cat="错误")
         return "删除失败：磁盘写入错误，" + ",".join(x[0] for x in hits)[:80] + " 没删掉（剩余 %d 条）" % left
     left = _memory_rows(h)
     gone = sum(len(rows) if isinstance(rows, list) else 0 for _hit, rows in hits)
     log("记忆删除：%s，剩余 %d 条（删掉 %d 条，%s）" % (
-        ",".join(x[0] for x in hits)[:120], left, gone, botdir))
+        ",".join(x[0] for x in hits)[:120], left, gone, botdir), cat="系统")
     text = "已删除 %d 段记忆（剩余 %d 条）" % (len(hits), left)
     if miss:
         text += "，%d 个键没找到" % len(miss)
@@ -7539,9 +7696,9 @@ def memory_clear(botdir):
     # 清空 = 所有键一次删光；undo 只记单键删除，所以这里不提供撤销（也不做滚动备份）
     _clear_undo(botdir)
     if not _save_json(_memory_path(botdir), {}):
-        log("记忆清空失败：%s 写不进去，%d 条还在" % (botdir, _memory_rows(h)))
+        log("记忆清空失败：%s 写不进去，%d 条还在" % (botdir, _memory_rows(h)), cat="错误")
         return "清空失败：磁盘写入错误，%d 条还在" % _memory_rows(h)
-    log("记忆清空：%s，清掉 %d 条" % (botdir, _memory_rows(h)))
+    log("记忆清空：%s，清掉 %d 条" % (botdir, _memory_rows(h)), cat="系统")
     return "已清空 %d 条" % _memory_rows(h)
 
 
@@ -7601,7 +7758,7 @@ def _clear_undo(botdir):
             os.remove(p)
         return True
     except Exception as e:
-        log("清撤销文件失败 %s: %r" % (_undo_path(botdir), e))
+        log("清撤销文件失败 %s: %r" % (_undo_path(botdir), e), cat="错误")
         return False
 
 
@@ -7626,11 +7783,11 @@ def memory_undo(botdir):
         h[key] = rows + cur
         back += len(rows)
     if not _save_json(_memory_path(botdir), h):
-        log("记忆撤销失败：%s 写不进去，%d 段没恢复" % (_memory_path(botdir), len(items)))
+        log("记忆撤销失败：%s 写不进去，%d 段没恢复" % (_memory_path(botdir), len(items)), cat="错误")
         return "撤销失败：磁盘写入错误，%d 段没恢复" % len(items)
     _clear_undo(botdir)
     log("记忆撤销：%s 恢复 %d 段 / %d 条，剩余 %d 条" % (
-        ",".join(it["key"] for it in items)[:120], len(items), back, _memory_rows(h)))
+        ",".join(it["key"] for it in items)[:120], len(items), back, _memory_rows(h)), cat="系统")
     return "已撤销 %d 段记忆（共 %d 条）" % (len(items), back)
 
 

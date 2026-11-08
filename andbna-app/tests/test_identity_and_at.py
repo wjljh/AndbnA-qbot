@@ -114,7 +114,8 @@ def write_llm(**over):
     conf = {"api": "http://127.0.0.1:9/chat/completions", "key": "test-key",
             "model": "deepseek-chat", "web_search_enabled": False,
             "gate_enabled": True, "bot_max_turns": 6, "bot_silence_minutes": 10,
-            "human_hourly_limit": 400, "reply_delay_min_ms": 0, "reply_delay_max_ms": 0}
+            "human_hourly_limit": 400, "reply_delay_min_ms": 0, "reply_delay_max_ms": 0,
+            "log_level": "detail"}
     conf.update(over)
     write_json(os.path.join(BASE, "llm.json"), conf)
 

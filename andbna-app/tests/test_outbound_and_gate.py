@@ -103,6 +103,7 @@ def write_llm(**over):
             "model": "deepseek-chat", "web_search_enabled": False,
             "gate_enabled": True, "bot_max_turns": 6, "bot_silence_minutes": 10,
             "human_hourly_limit": 40, "reply_delay_min_ms": 0, "reply_delay_max_ms": 0}
+    conf["log_level"] = "detail"
     conf.update(over)
     write_json(os.path.join(BASE, "llm.json"), conf)
 

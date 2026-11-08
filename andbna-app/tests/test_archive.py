@@ -49,8 +49,17 @@ def rows(botdir, sql, args=()):
     return br._arc_connect(botdir)["conn"].execute(sql, args).fetchall()
 
 
+def _detail_base():
+    """本文件断言的是技术行（FTS5 探测 / 存档召回），所以按 detail 跑。"""
+    d = tempfile.mkdtemp(prefix="arc_cfg_")
+    with open(os.path.join(d, "llm.json"), "w", encoding="utf-8") as f:
+        json.dump({"log_level": "detail"}, f)
+    return d
+
+
 def main():
     global CALLS
+    br._base_dir = _detail_base()
     # ── ① 探测：主机 SQLite 有 FTS5 → 建虚表 + 三个触发器 ──────────
     d1 = newdir("arc_fts_")
     info = br._arc_connect(d1)
@@ -253,6 +262,8 @@ def main():
     base = newdir("arc_base_")
     botdir = os.path.join(base, APPID)
     os.makedirs(botdir, exist_ok=True)
+    with open(os.path.join(base, "llm.json"), "w", encoding="utf-8") as f:
+        json.dump({"log_level": "detail"}, f)
     br._base_dir = base
     br.set_llm("sk-test", "http://127.0.0.1:9/v1", "test-model")
     msgs = br._build_messages(botdir, "g" + "gR", "", "在上周谁提过张伟？", search_hint=True)

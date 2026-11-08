@@ -104,6 +104,7 @@ def write_llm(**over):
         "human_hourly_limit": 40,
         "reply_delay_min_ms": 0,
         "reply_delay_max_ms": 0,
+        "log_level": "detail",
     }
     conf.update(over)
     with open(os.path.join(BASE, "llm.json"), "w", encoding="utf-8") as f:

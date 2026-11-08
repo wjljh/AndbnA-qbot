@@ -125,6 +125,7 @@ def write_llm(**over):
             "model": "deepseek-chat", "web_search_enabled": False,
             "gate_enabled": True, "bot_max_turns": 6, "bot_silence_minutes": 10,
             "human_hourly_limit": 40, "reply_delay_min_ms": 0, "reply_delay_max_ms": 0}
+    conf["log_level"] = "detail"
     conf.update(over)
     write_json(os.path.join(BASE, "llm.json"), conf)
 
@@ -204,8 +205,17 @@ def test_a():
 OWNER = "OWNER_OPENID_1234"
 
 
+def _detail_dir():
+    """B 段断言的是技术行（称呼 / 注入称呼），所以按 detail 跑。"""
+    d = tempfile.mkdtemp(prefix="pm_cfg_")
+    with open(os.path.join(d, "llm.json"), "w", encoding="utf-8") as f:
+        json.dump({"log_level": "detail"}, f)
+    return d
+
+
 def test_b():
     print("[B] 群里认主：作者 openid == 主人 openid（groups 配置只是可选覆盖）")
+    br._base_dir = _detail_dir()
     phrases = {"aliases": {"master": "阿爸", "others": "客人"}}
     owner_file = {"user_openid": OWNER, "member_openid": OWNER}
     bot = mkbot("b1", "桑多涅", owner=owner_file, phrases=phrases)
