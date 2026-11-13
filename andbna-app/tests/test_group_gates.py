@@ -163,7 +163,8 @@ def main():
 
     # ── f. 4 个 bot 互相复读：A 的话被 B/C/D 收到 → 全跳 ───────────
     reset()
-    a_text = "A 说的话"
+    # 回声判定要求归一化后 ≥ 6 字（短句撞车率太高，见 br._ECHO_MIN_LEN）
+    a_text = "A 说的话很长很长"
     for i, bot in enumerate(["botB_openid", "botC_openid", "botD_openid"]):
         run(FakeMsg("m_f%d" % i, a_text, FakeAuthor(bot, bot=True), at_mentions()))
     # 就算 author.bot 缺失、openid 也没记过，只要内容与本 bot 发过的一致也不回

@@ -1207,6 +1207,20 @@ def _str_list(raw):
     return out
 
 
+# Kotlin 落盘的 persona_meta.json.name 带档位后缀（「鲸鱼娘-完整」），_PRESET_GREETINGS 的键
+# 不带 —— 查表前一律用这套规则去后缀。
+_TIER_SUFFIXES = ("-完整", "-精华", "-精简")
+
+
+def _strip_tier(name):
+    """去掉人格档位后缀：「鲸鱼娘-完整」→「鲸鱼娘」；没有后缀原样（去空白）返回。"""
+    s = str(name or "").strip()
+    for suf in _TIER_SUFFIXES:
+        if s.endswith(suf):
+            return s[: -len(suf)].strip()
+    return s
+
+
 def _persona_name(botdir):
     """persona_name.txt 里的角色名（去掉「自定义：」前缀与 -完整/-精华/-精简 后缀）。"""
     try:
@@ -1214,10 +1228,7 @@ def _persona_name(botdir):
             name = f.read().strip().replace("自定义：", "").strip()
     except Exception:
         return ""
-    for suf in ("-完整", "-精华", "-精简"):
-        if name.endswith(suf):
-            return name[: -len(suf)]
-    return name
+    return _strip_tier(name)
 
 
 # persona_meta.json：人格的**来源标记**（Kotlin 侧在应用人格时写），
@@ -1241,6 +1252,22 @@ def _persona_name_raw(botdir):
         return ""
 
 
+# 命中内置预设只记一次（每 bot 每进程）：真机复盘要看得见「命中预设」，
+# 只剩失败日志的话，分不清是命中了还是掉了档。
+_preset_hit_logged = set()
+
+
+def _log_preset_hit(botdir, name):
+    root = _bot_root(botdir)
+    with _lock:
+        if root in _preset_hit_logged:
+            return
+        if len(_preset_hit_logged) > 240:
+            _preset_hit_logged.clear()
+        _preset_hit_logged.add(root)
+    log("问候判定：命中内置预设「%s」（persona_meta.json 标了内置）→ 文案取代码" % name, cat="系统")
+
+
 def _greet_preset(botdir):
     """→ 内置预设的固定时段（list）或 None；**唯一**的内置判定点。
 
@@ -1255,11 +1282,21 @@ def _greet_preset(botdir):
     if meta:
         if not bool(meta.get("builtin")):
             return None
-        name = str(meta.get("name") or "").strip() or _persona_name(botdir)
-        fixed = _PRESET_GREETINGS.get(name)
+        # 真机事故：meta 的 name 带档位后缀（「鲸鱼娘-完整」）→ 直接查表永远查不到 →
+        # 掉到文件槽位，而内置人格的槽位 lines 是空的 → 一条问候都发不出去。
+        raw = str(meta.get("name") or "").strip()
+        key = _strip_tier(raw)
+        fixed = _PRESET_GREETINGS.get(key) if key else None
         if not fixed:
+            # 兜底：meta 的名字和 persona_name.txt 可能不一致（改名 / 手工迁移），按文件再查一次
+            alt = _persona_name(botdir)
+            key = alt or key
+            fixed = _PRESET_GREETINGS.get(key) if key else None
+        if fixed:
+            _log_preset_hit(botdir, key)
+        else:
             log("问候判定：persona_meta.json 标了内置，但代码里没有「%s」的预设问候 → 按文件槽位"
-                % name, cat="系统")
+                % (raw or _persona_name(botdir)), cat="系统")
         return fixed
     raw = _persona_name_raw(botdir)
     if raw.startswith("自定义：") or raw.startswith("自定义:"):
@@ -1811,7 +1848,12 @@ async def _maybe_greet(client, appid, botdir, now=None):
         _greet_skip_once(botdir, date_s, "off", "随机问候跳过：未开启", appid)
         return ""
     if not cfg["slots"]:
-        _greet_skip_once(botdir, date_s, "noslot", "随机问候跳过：未配置时段", appid)
+        if cfg.get("preset"):
+            _greet_skip_once(botdir, date_s, "noslot", "随机问候跳过：未配置时段", appid)
+        else:
+            # 非预设人格又没填 lines：旧日志只说「未配置时段」，看不出是「文案空」还是「时段没配」
+            _greet_skip_once(botdir, date_s, "noline",
+                             "问候：没有可用文案（非预设人格且槽位未填 lines）→ 本轮跳过", appid)
         return ""
     tgt = cfg.get("targets") or {"owner": True, "groups": True}
     if not tgt.get("owner") and not tgt.get("groups"):
@@ -4974,16 +5016,64 @@ def _own_author(botdir):
     return set(str(x) for x in rows) if isinstance(rows, list) else set()
 
 
-def _note_own_author(botdir, ids):
-    """自己的 author id：只能从「我们发出去那条内容的回声」的作者里学到。"""
-    ids = set(str(x) for x in ids if x)
-    if not ids:
-        return
+# 本进程里以 author.bot=False 出现过的 openid：own_author.json 自愈用来对照。
+# 只在内存里（不落盘）：它只是「这个 id 是真人」的证据，不是配置。
+_HUMAN_AUTHORS = set()
+
+
+def _note_human_author(ids):
+    """记下「以真人身份出现过」的 openid。"""
+    with _gate_lock:
+        for i in ids or []:
+            if i:
+                _HUMAN_AUTHORS.add(str(i))
+        if len(_HUMAN_AUTHORS) > 400:
+            _HUMAN_AUTHORS.clear()
+
+
+def _heal_own_author(botdir, appid=""):
+    """启动自愈：own_author.json 里混进人类 openid 就剔除（剔空连文件一起删）。
+
+    1.1.x 真机事故：回声分支把主人的 openid 写成「本 bot 自己的 author id」，之后主人
+    的所有消息都被闸 2 当回声跳过。own_author.json 现在只作诊断用途，脏数据留着只会
+    继续误导排查，所以启动时清洗：known_bots.json（那是别的 bot，不该算自己）、本进程见过
+    的真人 author id、主人 openid（私聊本 bot 的第一个人，一定是真人），以及任何不在
+    bot_ids.json 里的 id（那才是「自己的 id」唯一正当的去处）。
+    """
+    path = _own_author_path(botdir)
     old = _own_author(botdir)
-    new = ids - old
-    if new:
-        _save_json(_own_author_path(botdir), {"ids": sorted(old | new)})
-        log("学到自己的 author id：%s（来源：本 bot 内容的回声）" % ",".join(sorted(new))[:80], cat="系统", lv="detail")
+    if not old:
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            log("own_author.json 是空的 → 已删除", appid, cat="系统", lv="detail")
+        return set()
+    with _gate_lock:
+        humans = set(_HUMAN_AUTHORS)
+    humans |= _known_bots(botdir)
+    owner = _owner_openid(botdir)
+    if owner:
+        humans.add(owner)
+    drop = old & humans
+    # own_author.json 唯一的写入点曾经是回声分支，而能走到那里的作者都不是 bot ——
+    # 换句话说，躺在这个文件里的 id 本来就都是人类 openid。真正的「自己的 id」只可能
+    # 来自 bot_ids.json（author.bot=true + 内容命中回声才写），所以不在那张表里的也剔除。
+    trusted = set(_bot_ids(botdir)) | set([str(appid)]) if appid else set(_bot_ids(botdir))
+    drop |= set(x for x in old if x not in trusted)
+    if not drop:
+        return set()
+    keep = old - drop
+    if keep:
+        _save_json(path, {"ids": sorted(keep)})
+    else:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    log("自己 author id 自愈：剔除 %d 个（疑似人类 openid）" % len(drop), appid, cat="系统")
+    return drop
 
 
 # ── 字段读取 ──────────────────────────────────────────────
@@ -5287,7 +5377,12 @@ def _at_me(appid, botdir, message):
 
 
 def _bot_author(botdir, message):
-    """作者是 bot / 已知 bot / 本 bot 自己 → 返回跳过原因；否则空串。"""
+    """作者是 bot / 已知 bot → 返回跳过原因；否则空串。
+
+    own_author.json **不参与**这里的判断（1.1.x 真机事故：它被写进人类 openid 后，
+    主人发的每条消息都被当成「本 bot 自己」跳过）。回声由 _is_echo 负责，
+    bot 作者由 author.bot / known_bots.json 负责。
+    """
     a = getattr(message, "author", None)
     ids = _author_ids(message)
     if _attr(a, "bot", "is_bot", "isBot") is True:
@@ -5296,9 +5391,6 @@ def _bot_author(botdir, message):
     known = _known_bots(botdir)
     if known and any(i in known for i in ids):
         return "跳过：作者是 bot（信号：known_bots.json）"
-    mine = _own_author(botdir)
-    if mine and any(i in mine for i in ids):
-        return "跳过：作者是 bot（信号：本 bot 自己的 author id）"
     return ""
 
 
@@ -5333,9 +5425,14 @@ def _note_sent(appid, gid, text):
             box.pop(0)
 
 
+# 回声判定要求的最短归一化长度：短句（「嗯」「定位到了」）撞车率太高，
+# 真机事故就是主人的一句话和 bot 刚说的一模一样 → 被当回声，还把主人 openid 记成了自己。
+_ECHO_MIN_LEN = 6
+
+
 def _is_echo(appid, gid, text):
     """收到的内容与本 bot 刚发出的某条归一化后一致 → 别的 bot 在复读。"""
-    if not _norm_text(text):
+    if len(_norm_text(text)) < _ECHO_MIN_LEN:
         return False
     h = _hash_text(text)
     with _gate_lock:
@@ -5899,6 +5996,7 @@ def _sender_of(botdir, message, roster=None):
         out = "其他bot", "", oid, True
     else:
         out = "", "", oid, False
+        _note_human_author(ids)      # 真人 openid：own_author.json 自愈的对照表
     with _gate_lock:
         left = _gate_state["who_log"]
         if left > 0:
@@ -6803,9 +6901,9 @@ async def _handle_group(appid, botdir, message, tag):
                          gconf, roster, my_name)
         return
 
-    # 闸 1 · 回环：命中就说明这条是我们自己刚说的话被推回来，顺手记下自己的 author id
+    # 闸 1 · 回环：命中就说明这条是我们自己刚说的话被推回来 —— 只跳过，**不学 author id**：
+    # 走到这里说明作者不是 bot（上面那道闸已经放行），学下去就是把人类 openid 记成自己。
     if echo:
-        _note_own_author(botdir, _author_ids(message))
         log("跳过：疑似复读本 bot 内容（%s）" % brief, appid, cat="判定")
         return
 
@@ -7366,6 +7464,10 @@ def start_one(appid, secret, base_dir):
         _migrate_words(botdir, appid)
     except Exception as e:
         log("文案迁移出错（忽略）：%r" % e, appid, cat="错误")
+    try:
+        _heal_own_author(botdir, appid)
+    except Exception as e:
+        log("own_author.json 自愈出错（忽略）：%r" % e, appid, cat="错误")
     if not _log_path:
         _log_path = os.path.join(base_dir, "local_bot.log")
         try:

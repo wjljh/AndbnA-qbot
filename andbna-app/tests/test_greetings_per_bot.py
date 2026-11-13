@@ -296,7 +296,9 @@ def test_greet():
     clear_logs()
     got7 = asyncio.get_event_loop().run_until_complete(br._maybe_greet(client, "botG", bot, now=plan_off + 1))
     check("slots 空 → 不发", got7 == "" and len(client.api.c2c) == sent_before)
-    check("跳过日志：未配置时段", "随机问候跳过：未配置时段" in logs(), logs())
+    # 非预设人格 + 槽位没填 lines：日志要说清「没有可用文案」，不能只说「未配置时段」
+    check("跳过日志：没有可用文案", "问候：没有可用文案（非预设人格且槽位未填 lines）→ 本轮跳过" in logs(),
+          logs())
     shutil.rmtree(base, ignore_errors=True)
 
 
