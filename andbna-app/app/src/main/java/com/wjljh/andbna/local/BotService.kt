@@ -797,17 +797,55 @@ object BotHost {
         lastError.ifBlank { "未启动" }
     }
 
-    /** Python 侧给的每个 bot 的运行快照（JSON） */
+    /** Python 侧给的每个 bot 的运行快照（JSON）；顺手捎带一次群名补齐（内部节流） */
     fun snapshot(): String = try {
+        nameBeat()
         module?.callAttr("snapshot")?.toString() ?: "[]"
     } catch (e: Throwable) {
         "[]"
     }
 
     fun logTail(n: Int = 150): String = try {
+        nameBeat()
         module?.callAttr("log_text", n)?.toString() ?: ""
     } catch (e: Throwable) {
         ""
+    }
+
+    // ── 群名补齐的心跳：收到群消息之后的兜底触发点 ──
+
+    /** 心跳间隔：10 分钟一次（一次最多 5 个群 × 200ms，30 QPM 下毫无压力） */
+    private const val NAME_BEAT_MS = 10L * 60 * 1000
+
+    private var nameBeatAt = 0L
+    private val nameBeatScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /**
+     * 「收到该群消息之后也补一次群名」的触发点。
+     *
+     * 消息全在 Python 进程里，Kotlin 侧拿不到逐条事件；所以挂在**本来就在轮询的读口**上：
+     * 日志页 / 状态页每秒读 [logTail]，bot 列表页读 [snapshot]。有人来看数据就顺手补一次 ——
+     * 群里刚说过话的群，过一会儿打开记忆页/群配置页就有名字了。
+     *
+     * 两道闸：① 整体 [NAME_BEAT_MS] 才跑一次；② 真正的请求仍走 GroupNames.fill 的限流
+     * （只补没缓存的群、一次最多 5 个、串行、间隔 200ms），失败静默。整段在 IO 协程里，不挡读口。
+     */
+    private fun nameBeat() {
+        val c = ctx ?: return
+        val now = System.currentTimeMillis()
+        if (nameBeatAt > 0L && now - nameBeatAt < NAME_BEAT_MS) return
+        nameBeatAt = now
+        nameBeatScope.launch {
+            try {
+                BotStore.load(c).forEach { b ->
+                    val arr = org.json.JSONObject(idsFor(c, b.appid)).optJSONArray("groups")
+                    val gids = (0 until (arr?.length() ?: 0))
+                        .mapNotNull { arr?.optJSONObject(it)?.optString("id") }
+                    if (gids.isNotEmpty()) GroupNames.fill(c, b.appid, gids)
+                }
+            } catch (_: Throwable) {
+            }
+        }
     }
 
     fun probe(): String = try {

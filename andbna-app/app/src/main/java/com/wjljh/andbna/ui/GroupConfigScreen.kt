@@ -182,12 +182,9 @@ private fun GroupListPage(
     }
 }
 
-/** 群行标题：有缓存就写群名，没有就写「群 + openid 前 8 位」。 */
-private fun groupTitle(gid: String, name: GroupNames.Entry?): String {
-    val cached = name?.name.orEmpty()
-    if (cached.isNotBlank()) return cached
-    return "群 " + gid.take(8) + if (gid.length > 8) "…" else ""
-}
+/** 群行标题：有缓存就写群名，没有就写「群 + openid 前 8 位」（整串 openid 不上界面）。 */
+private fun groupTitle(gid: String, name: GroupNames.Entry?): String =
+    GroupNames.label(gid, name?.name.orEmpty())
 
 /** 群行副标题：「openid 前 8 位 · N 人」；人数取不到就只写 openid 前 8 位。 */
 private fun groupSummary(gid: String, name: GroupNames.Entry?): String {
@@ -250,7 +247,7 @@ private fun GroupEditScreen(
                 val restarted = conf != baseline && BotRestarts.requestOne(ctx, appid, "群配置保存")
                 onSaved(
                     (if (conf.isDefault) "已保存：所有项都是跟随，覆盖已删除（这个群回到 bot 全局）"
-                    else "已保存：" + groupTitle(gid, null) + " 的覆盖") +
+                    else "已保存：" + GroupNames.label(gid, name) + " 的覆盖") +
                         if (restarted) "，正在重启该 bot…" else "",
                 )
             } else {
@@ -274,7 +271,8 @@ private fun GroupEditScreen(
             TopAppBar(
                 title = "群配置",
                 largeTitle = "群配置",
-                subtitle = if (name.isBlank()) "群 " + gid.take(8) else name + " · " + gid.take(8),
+                subtitle = if (name.isBlank()) GroupNames.label(gid, "")
+                else name + " · " + gid.take(8),
                 navigationIcon = {
                     IconButton(onClick = onBack) {
                         Icon(

@@ -61,8 +61,8 @@ fun ModePickScreen(
         topBar = {
             if (allowBack) {
                 SmallTopAppBar(
-                    title = "选择运行模式",
-                    subtitle = "改完会立即生效",
+                    title = "运行模式",
+                    subtitle = "改完立刻生效",
                     navigationIcon = {
                         IconButton(onClick = onBack) {
                             Icon(
@@ -74,7 +74,7 @@ fun ModePickScreen(
                     },
                 )
             } else {
-                SmallTopAppBar(title = "欢迎使用 AndbnA", subtitle = "先选一个运行方式")
+                SmallTopAppBar(title = "欢迎用 AndbnA", subtitle = "先挑一种跑法")
             }
         },
     ) { pad ->
@@ -86,7 +86,7 @@ fun ModePickScreen(
                 item(key = "modes") {
                     PanelGroupCard {
                         Text(
-                            text = "选一个用着最省心的，随时能改。",
+                            text = "挑一个顺手的，以后随时能换。",
                             fontSize = PanelTokens.InfoValueSize,
                             color = PanelColors.onSurfaceVariantSummary,
                             modifier = Modifier.padding(bottom = PanelTokens.ContentGap),
@@ -101,7 +101,7 @@ fun ModePickScreen(
                                 // 点一下就生效，不再二次确认；root / ADB 要先验证
                                 onClick = {
                                     if (mode.key == "root" && !RootHost.hasRoot()) {
-                                        blocked = "请授予 root 权限后重启应用"
+                                        blocked = "没拿到 root：在 KernelSU / Magisk 里授权，再重启 App"
                                     } else if (mode == RunMode.ADB) {
                                         // ADB 不能静默写盘：授权 + 绑定都成功才算切过去
                                         if (!busy) {
@@ -130,7 +130,7 @@ fun ModePickScreen(
                 if (!allowBack) {
                     item(key = "foot") {
                         Text(
-                            text = "选好以后就按这个模式开跑，想换在「设置 → 运行模式」里改。",
+                            text = "选完就按这个跑。想换，去「设置 → 运行模式」。",
                             fontSize = 11.sp,
                             color = PanelColors.onSurfaceVariantSummary,
                             modifier = Modifier.padding(horizontal = 4.dp),

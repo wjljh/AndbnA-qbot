@@ -134,7 +134,7 @@ fun LogScreen(metrics: Metrics, onBack: () -> Unit) {
                 }
                 "已导出（${shown.length} 字）"
             } catch (e: Exception) {
-                "导出失败：${e.message}"
+                "导出没成：${e.message}，换个位置再存一次"
             }
         }
     }
@@ -144,7 +144,7 @@ fun LogScreen(metrics: Metrics, onBack: () -> Unit) {
     fun shareLog() {
         val it = Intent(Intent.ACTION_SEND).apply {
             type = "text/plain"
-            putExtra(Intent.EXTRA_TEXT, shown.ifBlank { "（日志是空的）" })
+            putExtra(Intent.EXTRA_TEXT, shown.ifBlank { "（日志还没内容）" })
         }
         runCatching { ctx.startActivity(Intent.createChooser(it, "分享日志")) }
     }
@@ -164,7 +164,7 @@ fun LogScreen(metrics: Metrics, onBack: () -> Unit) {
         ctx.logLevel = v
         scope.launch {
             withContext(Dispatchers.IO) { BotStore.writeLlmJson(ctx) }
-            msg = if (v == "detail") "详细程度：详细（新日志才带上细节）"
+            msg = if (v == "detail") "详细程度：详细（只对新产生的日志生效）"
             else "详细程度：简洁"
             tick++
         }
@@ -255,7 +255,7 @@ private fun LogBodyMiuix(
         OverlayDropdownPreference(
             insideMargin = prefInside,
             title = "详细程度",
-            summary = "简洁只留一行结论，详细带判定与出错细节",
+            summary = "简洁只留一行结论，详细带上判定和出错细节",
             startAction = { RowIcon(Icons.Rounded.Speed, iconTint) },
             items = LOG_LEVEL_LABELS,
             selectedIndex = levelIndex,
@@ -264,7 +264,7 @@ private fun LogBodyMiuix(
         OverlayDropdownPreference(
             insideMargin = prefInside,
             title = "类别筛选",
-            summary = "只看某一类；解析不出类别的行算「系统」",
+            summary = "只看一类；认不出类别的行算「系统」",
             startAction = { RowIcon(Icons.Rounded.FilterList, iconTint) },
             items = LOG_CATEGORIES,
             selectedIndex = categoryIndex,
@@ -276,7 +276,7 @@ private fun LogBodyMiuix(
         ArrowPreference(
             insideMargin = prefInside,
             title = "保存日志",
-            summary = "存到系统里自己挑的位置",
+            summary = "存到你挑的位置",
             startAction = { RowIcon(Icons.Rounded.CheckCircle, iconTint) },
             onClick = onSave,
         )
@@ -317,7 +317,7 @@ private fun LogBodyMaterial(
         item {
             SegmentedDropdownItem(
                 title = "详细程度",
-                summary = "简洁只留一行结论，详细带判定与出错细节",
+                summary = "简洁只留一行结论，详细带上判定和出错细节",
                 icon = Icons.Filled.Speed,
                 items = LOG_LEVEL_LABELS,
                 selectedIndex = levelIndex,
@@ -327,7 +327,7 @@ private fun LogBodyMaterial(
         item {
             SegmentedDropdownItem(
                 title = "类别筛选",
-                summary = "只看某一类；解析不出类别的行算「系统」",
+                summary = "只看一类；认不出类别的行算「系统」",
                 icon = Icons.Filled.FilterList,
                 items = LOG_CATEGORIES,
                 selectedIndex = categoryIndex,
@@ -339,7 +339,7 @@ private fun LogBodyMaterial(
         item {
             SegmentedArrowItem(
                 title = "保存日志",
-                summary = "存到系统里自己挑的位置",
+                summary = "存到你挑的位置",
                 icon = Icons.Filled.CheckCircle,
                 onClick = onSave,
             )
@@ -371,7 +371,7 @@ private fun LogBodyMaterial(
 private fun LogText(shown: String) {
     if (shown.isBlank()) {
         Text(
-            "日志是空的",
+            "还没有日志",
             fontSize = 14.sp,
             color = PanelColors.onSurfaceVariantSummary,
         )

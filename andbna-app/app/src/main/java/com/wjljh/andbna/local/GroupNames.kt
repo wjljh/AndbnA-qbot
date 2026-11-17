@@ -23,6 +23,12 @@ object GroupNames {
     /** 相邻两次请求的间隔 */
     const val GAP_MS: Long = 200L
 
+    /** 同一个群「取不到」的日志最多每条隔多久写一行（10 分钟），免得轮询把日志页刷满 */
+    private const val FAIL_NOTE_GAP_MS: Long = 10L * 60 * 1000
+
+    /** gid 前 8 位 → 上次写「取不到」的时间（只在内存里，重启就重来） */
+    private val failNotes = java.util.concurrent.ConcurrentHashMap<String, Long>()
+
     /** 一个群的缓存项；[name] 为空视为「没缓存」（下次再试）。 */
     data class Entry(val name: String = "", val members: Int = 0, val ts: Long = 0L) {
         fun fresh(now: Long = System.currentTimeMillis()): Boolean =
@@ -71,21 +77,71 @@ object GroupNames {
     suspend fun fill(ctx: Context, appid: String, ids: List<String>, max: Int = BATCH): Int {
         val now = System.currentTimeMillis()
         val cached = load(ctx, appid)
-        val todo = ids.filter { !(cached[it]?.fresh(now) ?: false) }.distinct().take(max)
+        val todo = ids.map { it.trim() }.filter { it.isNotBlank() }
+            .filter { !(cached[it]?.fresh(now) ?: false) }.distinct().take(max)
         var got = 0
         todo.forEachIndexed { i, gid ->
             if (i > 0) delay(GAP_MS)
             val raw = BotHost.groupInfo(ctx, appid, gid)
-            if (raw.isBlank()) return@forEachIndexed
-            val o = runCatching { JSONObject(raw) }.getOrNull() ?: return@forEachIndexed
-            if (!o.optBoolean("ok", false)) return@forEachIndexed
+            val o = runCatching { JSONObject(raw) }.getOrNull()
+            if (o == null) {
+                noteFail(gid, "")
+                return@forEachIndexed
+            }
+            if (!o.optBoolean("ok", false)) {
+                val err = o.optString("error", "")
+                noteFail(gid, err)
+                // 频控（429）/ 没权限（403）：这一轮别再往下打了，越打越慢
+                if (httpCode(err) in BLOCKING_CODES) return got
+                return@forEachIndexed
+            }
             val name = o.optString("name", "").trim()
-            if (name.isBlank()) return@forEachIndexed
+            if (name.isBlank()) {
+                noteFail(gid, "响应里没有群名")
+                return@forEachIndexed
+            }
             put(ctx, appid, gid, name, o.optInt("members", 0))
             got++
         }
         return got
     }
+
+    /**
+     * 群显示名：有群名就写群名，取不到就「群 + openid 前 8 位」——
+     * 界面上任何地方都不摊开整串 openid（太长、也看不出是什么群）。
+     */
+    fun label(gid: String, name: String): String =
+        if (name.isNotBlank()) name.trim() else "群 " + gid.trim().take(8)
+
+    /** 会话键的短形式：g/p 前缀 + openid 前 8 位（私聊以前是 take(18)，也一并压短）。 */
+    fun shortKey(key: String): String {
+        val k = key.trim()
+        if (k.isEmpty()) return ""
+        return k.take(1) + k.drop(1).take(8)
+    }
+
+    /** 一行日志：群名：<gid 前 8 位> 取不到（HTTP xxx），同一个群 10 分钟内只写一次。 */
+    private fun noteFail(gid: String, error: String) {
+        val id8 = gid.trim().take(8)
+        val now = System.currentTimeMillis()
+        val prev = failNotes[id8]
+        if (prev != null && now - prev < FAIL_NOTE_GAP_MS) return
+        failNotes[id8] = now
+        val code = httpCode(error)
+        val why = if (code > 0) "HTTP " + code
+        else error.trim().take(40).ifBlank { "无响应" }
+        BotHost.logNote("群名：" + id8 + " 取不到（" + why + "）")
+    }
+
+    /** 从 Python 的错误串里抠 3 位状态码（urllib 的 HTTP Error 401 / Status: 429）。 */
+    private fun httpCode(error: String): Int {
+        val m = Regex("(?i)(?:http[^0-9]{0,12}|status[^0-9]{0,3}|状态码[^0-9]{0,3})([0-9]{3})")
+            .find(error.trim()) ?: return 0
+        return m.groupValues[1].toIntOrNull() ?: 0
+    }
+
+    /** 命中就别再往下打了：429 频控 / 403 没权限，同一次批量里继续只会更糟。 */
+    private val BLOCKING_CODES = setOf(403, 429)
 
     private fun entryJson(e: Entry): JSONObject = JSONObject()
         .put("name", e.name)

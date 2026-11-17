@@ -82,7 +82,7 @@ fun HeroDetailScreen(
     val askNotif = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (!granted) msg = "没给通知权限，通知栏看不到运行状态"
+        if (!granted) msg = "没给通知权限：通知栏看不到运行状态，去系统设置里开"
     }
 
     // 读文件 + 解析 JSON 放 IO：组合期一次，不在每次重组执行
@@ -93,7 +93,7 @@ fun HeroDetailScreen(
 
     fun pick(m: RunMode) {
         if (m.key == "root" && !RootHost.hasRoot()) {
-            errMsg = "请授予 root 权限后重启应用"
+            errMsg = "没拿到 root：在 KernelSU / Magisk 里授权，再重启 App"
             return
         }
         errMsg = ""
@@ -160,7 +160,7 @@ fun HeroDetailScreen(
             item(key = "modes") {
                 PanelGroupCard {
                     Text(
-                        text = "换模式后要重启服务才生效",
+                        text = "换完模式要重启服务才生效",
                         fontSize = PanelTokens.InfoValueSize,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(bottom = PanelTokens.ContentGap),
@@ -193,7 +193,7 @@ fun HeroDetailScreen(
                             text = "启动",
                             onClick = {
                                 if (botCount == 0) {
-                                    msg = "没有启用中的 bot，去「Bot」页添加"
+                                    msg = "一个 bot 都没启用：去「Bot」页添加并启用"
                                 } else {
                                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                                         askNotif.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -249,7 +249,7 @@ fun HeroDetailScreen(
                             onClick = {
                                 scope.launch {
                                     val t = withContext(Dispatchers.IO) { BotHost.logTail(120) }
-                                    msg = if (t.isBlank()) "日志是空的" else t.takeLast(600)
+                                    msg = if (t.isBlank()) "还没有日志" else t.takeLast(600)
                                 }
                             },
                         )

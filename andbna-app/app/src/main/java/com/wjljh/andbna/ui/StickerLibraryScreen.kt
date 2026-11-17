@@ -148,7 +148,7 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
             items = list
             msg = when {
                 out.added.isNotEmpty() && out.errors.isEmpty() ->
-                    "已导入 " + out.added.size + " 张：请填写描述（描述为空不会进候选）"
+                    "已导入 " + out.added.size + " 张：给每张写个描述（空着不会进候选）"
                 out.added.isNotEmpty() ->
                     "已导入 " + out.added.size + " 张；另有 " + out.errors.size + " 张没导入：" + out.errors.first()
                 else -> "没导入：" + (out.errors.firstOrNull() ?: "没有可用的图片")
@@ -207,7 +207,7 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
                         PanelEmptyState(
                             icon = Icons.Rounded.Image,
                             title = "还没有表情：点右下角导入",
-                            body = "支持 png / jpg / gif / webp / bmp，单张 ≤5 MB，整库 ≤200 MB",
+                            body = "能用的格式：png / jpg / gif / webp / bmp。单张 ≤5 MB，整个库 ≤200 MB。",
                         )
                     }
                 } else {
@@ -472,7 +472,7 @@ private fun StickerEditDialog(
                         text = "保存",
                         onClick = {
                             if (desc.isBlank()) {
-                                err = "描述不能为空：空着它不会进候选，等于没导入"
+                                err = "描述空着不行：空着不会进候选，等于没导入。写一句再保存"
                             } else {
                                 onSave(desc, splitTags(tags))
                             }

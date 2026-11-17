@@ -513,7 +513,7 @@ private fun ColumnScope.WelcomeStep() {
     StepHero(
         icon = OnboardIcons.Welcome,
         title = "欢迎使用 AndbnA",
-        body = "这是一个把 QQ 机器人整套跑在手机里的 App：Python 运行时打包在 APK 内，由本机前台服务托管，不依赖模块，也不收集任何数据。",
+        body = "QQ 机器人整套跑在手机里。Python 运行时打包在 APK 内，由本机前台服务托管，不依赖模块，也不收任何数据。",
     )
     PanelGroupCard {
         WELCOME_POINTS.forEachIndexed { index, point ->
@@ -577,7 +577,7 @@ private fun ColumnScope.AtRuleStep() {
     StepHero(
         icon = OnboardIcons.AtRule,
         title = "群聊里它默认只回 @",
-        body = "群里被 @ 才开口，这是默认行为；要不要它自己接话，开关在 bot 编辑页里。",
+        body = "群里被 @ 才开口，这是默认的。要不要它自己接话，开关在 bot 编辑页。",
     )
     PanelGroupCard {
         AT_RULE_POINTS.forEachIndexed { index, point ->
@@ -612,7 +612,7 @@ private fun ColumnScope.AtRuleStep() {
         }
     }
     Text(
-        text = "点「知道了」继续，这两处开关随时能在 Bot 编辑页里改。",
+        text = "点「知道了」继续。这两处开关随时能在 Bot 编辑页改。",
         fontSize = PanelTokens.OnboardWelcomeSize,
         lineHeight = PanelTokens.OnboardHeroBodyLineHeight,
         color = PanelColors.onSurfaceVariantSummary,
@@ -632,7 +632,7 @@ private fun ColumnScope.ModeStep(
     StepHero(
         icon = OnboardIcons.KeepAlive,
         title = "挑一种保活方式",
-        body = "运行内核三种模式完全一样（Python 打包在 APK 里，bot 跑在 App 进程内），差别只在于有没有额外保活权限。",
+        body = "三种模式的内核完全一样（Python 打包在 APK 里，bot 跑在 App 进程内），差的只是有没有额外保活权限。",
     )
     if (notice.isNotBlank()) {
         PanelNotice(text = notice)
@@ -903,7 +903,7 @@ private fun ColumnScope.AdbCommandCard() {
 
 /** 拒绝之后显示的声明：两句话，说清「只用来显示运行状态、关掉不影响 bot」。 */
 private const val NOTIF_STATEMENT =
-    "通知只用来显示「bot 运行中」状态，方便你确认服务还在跑；关掉不影响 bot 工作，可在系统设置里随时改。"
+    "通知只用来显示「bot 运行中」，方便确认服务还在跑。关掉不影响 bot 干活，随时能在系统设置里改。"
 
 /**
  * 引导里的「通知权限」块。
@@ -1017,7 +1017,7 @@ private class ModelStepVm(ctx: Context) {
                 msg = "读到 " + out.models.size + " 个模型，点一个填进主模型"
             } else {
                 models = emptyList()
-                msg = "读取模型失败：" + out.error
+                msg = "没读到模型：" + out.error + "。地址和 Key 再核一遍"
             }
         }
     }
@@ -1040,7 +1040,7 @@ private fun ColumnScope.ModelStep(
     StepHero(
         icon = OnboardIcons.Model,
         title = "接入模型",
-        body = "这一步现在就能配，也可以稍后再配：没配 Key 的 bot 只回连通测试，不会真的回消息。",
+        body = "现在配、以后配都行。没配 Key 的 bot 只回连通测试，不会真的回消息。",
     )
     SectionCard(metrics, title = "接口") {
         PanelEllipsisField(
@@ -1179,7 +1179,7 @@ private fun ColumnScope.DoneStep(mode: RunMode, probe: ProbeResult, modelConfigu
         )
     }
     Text(
-        text = "点「开始使用」进主页；想重看这段引导，在「设置 → 重看使用引导」里点一下即可。",
+        text = "点「开始使用」进主页。想重看，在「设置 → 重看使用引导」里点一下。",
         fontSize = PanelTokens.OnboardWelcomeSize,
         lineHeight = PanelTokens.OnboardHeroBodyLineHeight,
         color = PanelColors.onSurfaceVariantSummary,

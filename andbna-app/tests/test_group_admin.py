@@ -738,7 +738,7 @@ def case_contract():
 
 # ── M 内置人格的欢迎语锁死（自定义人格才允许用户写）────────────
 
-BUILTIN_SANDONGE = "（冷冷扫了一眼）进来就安静点，规矩比人多。"
+BUILTIN_SANDONGE = "（头也没抬，笔尖还在算）来了就自己找地方。先说好，别碰我的法洁欧。"
 GENERIC_FALLBACK = "（抬眼）来了？随便坐，别拘束。"
 
 
@@ -782,7 +782,7 @@ def case_welcome_locked():
     asyncio.run(br.group_admin_member_add(BOT_A, d, ev))
     text = sent_texts()[-1] if API.sent else ""
     check("M3 自定义人格（meta builtin=false）→ 用文件里的 text（名字撞内置也不锁）",
-          "我自己写的欢迎" in text and "尾鳍轻轻摆" not in text, "text=%s" % text)
+          "我自己写的欢迎" in text and "新来的鱼片" not in text, "text=%s" % text)
 
     # 3) 自定义人格 + 文件 text 为空 → 通用兜底
     reset()
@@ -802,7 +802,7 @@ def case_welcome_locked():
     tick(m, GID_A, m.content)
     text = sent_texts()[-1] if API.sent else ""
     check("M5 首次发言欢迎兜底同样锁死内置文案（猫娘）",
-          "（耳朵一竖）喵？新面孔，先报个名字吧。" in text and "随便改的" not in text,
+          "（耳朵抖了抖，凑近嗅了一下）嗯？新来的。坐吧喵，我不咬人的。" in text and "随便改的" not in text,
           "text=%s" % text)
     try:
         os.remove(os.path.join(d, "persona_meta.json"))

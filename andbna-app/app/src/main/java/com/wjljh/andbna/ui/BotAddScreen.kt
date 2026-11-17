@@ -110,7 +110,7 @@ fun BotAddScreen(metrics: Metrics, onBack: () -> Unit, onCreated: (String) -> Un
         onImported = { n ->
             personas = PersonaAssets.listAll(ctx)
             persona = PersonaAssets.CUSTOM_PREFIX + n
-            msg = "已导入自定义人格：" + n
+            msg = "人格导进来了：" + n
         },
         onMessage = { msg = it },
     )
@@ -119,7 +119,7 @@ fun BotAddScreen(metrics: Metrics, onBack: () -> Unit, onCreated: (String) -> Un
     fun create() {
         val id = appid.trim()
         if (id.isBlank()) {
-            msg = "AppID 不能为空"
+            msg = "AppID 没填，填一个再创建"
             return
         }
         // 读盘 / 写盘（含密钥加密）都在 IO：点一下「创建」不再卡主线程
@@ -178,7 +178,7 @@ fun BotAddScreen(metrics: Metrics, onBack: () -> Unit, onCreated: (String) -> Un
                     label = "AppID",
                     value = appid,
                     onValueChange = { appid = it.trim() },
-                    hint = "平台的 AppID（数字）",
+                    hint = "开放平台上那个数字 AppID",
                     numeric = true,
                 )
                 // 名字在添加页就能填（用户反馈「添加界面没有名字编辑选项」：
@@ -188,7 +188,7 @@ fun BotAddScreen(metrics: Metrics, onBack: () -> Unit, onCreated: (String) -> Un
                     label = "名字",
                     value = name,
                     onValueChange = { name = it },
-                    hint = "给这个 bot 起个名字，留空则显示 AppID",
+                    hint = "起个名字，留空就显示 AppID",
                 )
                 HorizontalDivider(
                     modifier = Modifier.padding(vertical = 12.dp),
@@ -197,7 +197,7 @@ fun BotAddScreen(metrics: Metrics, onBack: () -> Unit, onCreated: (String) -> Un
                 )
                 BotFormSwitchRow(
                     title = "启用",
-                    summary = if (enabled) "创建后启用，启动服务即上线" else "先停用，之后在卡片上打开",
+                    summary = if (enabled) "建完就启用，服务一起来就上线" else "先关着，之后在卡片上打开",
                     checked = enabled,
                     onCheckedChange = { enabled = it },
                 )
@@ -217,7 +217,7 @@ fun BotAddScreen(metrics: Metrics, onBack: () -> Unit, onCreated: (String) -> Un
                     PersonaAssets.deleteCustom(ctx, full)
                     personas = PersonaAssets.listAll(ctx)
                     if (persona == full) persona = ""
-                    msg = "已删除自定义人格：" + full.removePrefix(PersonaAssets.CUSTOM_PREFIX)
+                    msg = "人格已删：" + full.removePrefix(PersonaAssets.CUSTOM_PREFIX)
                 },
             )
 
@@ -279,7 +279,7 @@ fun BotAddScreen(metrics: Metrics, onBack: () -> Unit, onCreated: (String) -> Un
                 TopAppBar(
                     title = title,
                     largeTitle = title,
-                    subtitle = "AppID 与已有 bot 相同时等于改它",
+                    subtitle = "AppID 跟已有的 bot 一样，就是改那个",
                     navigationIcon = {
                         IconButton(onClick = onBack) {
                             Icon(

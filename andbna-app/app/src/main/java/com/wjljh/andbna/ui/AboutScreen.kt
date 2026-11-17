@@ -143,7 +143,7 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
                     SuperRow(
                         icon = Icons.Filled.Refresh,
                         title = "立即检查",
-                        subtitle = checkNote.ifBlank { "忽略 30 分钟节流，马上查一次更新" },
+                        subtitle = checkNote.ifBlank { "不管 30 分钟的节流，马上查一次" },
                         onClick = {
                             if (!checking) {
                                 checking = true
@@ -156,7 +156,7 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
                                             c.note
                                         }
                                         Updater.Result.Latest -> c.note
-                                        Updater.Result.Failed -> "检查失败（" + c.note + "）"
+                                        Updater.Result.Failed -> "没查成（" + c.note + "），过会儿再点一次"
                                     }
                                     checking = false
                                 }
@@ -175,7 +175,7 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
                     )
                     Text(
                         text = "QQ 机器人的 Python 运行时打包在 App 里，由本机前台服务托管，不用另装模块。" +
-                            "支持多个 bot 同时在线、按 bot 选人格、长期记忆，以及定时消息。",
+                            "可以同时挂几个 bot，人格、长期记忆、定时消息各管各的。",
                         fontSize = 14.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                     )
@@ -203,8 +203,8 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
                 // ⑤ 许可证说明
                 SectionCard(metrics, title = "许可证说明") {
                     Text(
-                        text = "上表组件的著作权归各自作者，许可证以各自仓库声明为准。" +
-                            "本 App 只按结构与取值的规格复刻界面，未打包第三方源码。",
+                        text = "上面这些组件的著作权归各自作者，许可证看各自仓库。" +
+                            "本 App 只按规格复刻界面，没打包它们的源码。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                     )

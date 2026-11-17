@@ -157,7 +157,7 @@ fun SettingsPage(
                         "已导出（" + text.lineSequence().count() + " 行）"
                     }
                 } catch (e: Exception) {
-                    "导出失败：" + (e.message ?: e.javaClass.simpleName)
+                    "导出没成：" + (e.message ?: e.javaClass.simpleName) + "，换个位置再存一次"
                 }
             }
             vm.msg = line
@@ -215,7 +215,7 @@ fun SettingsPage(
     PanelConfirmDialog(
         show = confirmClearArchive,
         title = "清空消息存档",
-        body = "确认清空本机的聊天存档？清空后不可恢复（记忆与配置不受影响）。",
+        body = "清空本机的聊天存档？清空后没法恢复（记忆和配置还在）。",
         confirmLabel = "清空",
         onConfirm = {
             confirmClearArchive = false
@@ -482,8 +482,8 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
         gate = on
         persistBotChat(
             { ctx.botGateEnabled = on },
-            if (on) "Bot 互聊：同一句话只让最合适的一个 bot 回"
-            else "Bot 互聊：总模型不再分配，各 bot 自己判断",
+            if (on) "Bot 互聊：一句话只让一个 bot 回"
+            else "Bot 互聊：总模型不管了，各 bot 自己判断",
         )
     }
 
@@ -608,7 +608,7 @@ private fun MiuixSettingsBody(
             SettingsMiuixGroup(topPadding = 0.dp) {
                 SwitchPreference(
                     title = "多 bot 由总模型决定谁回",
-                    summary = "开启后同一句话只让最合适的一个 bot 回；只有一个 bot 时不生效",
+                    summary = "打开后一句话只让一个 bot 回，由总模型挑谁；只有一个 bot 时不起作用",
                     startAction = { SettingsRowIcon(Icons.Filled.Forum) },
                     checked = vm.gate,
                     onCheckedChange = { vm.switchGate(it) },
@@ -677,7 +677,7 @@ private fun MiuixSettingsBody(
                 )
                 OverlayDropdownPreference(
                     title = "每日上限",
-                    summary = "每天最多回多少条；到点当天就不再回（群配置可以按群覆盖）",
+                    summary = "每天最多回多少条，到点当天就不再回（群配置能按群覆盖）",
                     startAction = { SettingsRowIcon(Icons.Filled.Speed) },
                     items = vm.dailyLimitItems,
                     selectedIndex = vm.dailyLimitIndex,
@@ -727,7 +727,7 @@ private fun MiuixSettingsBody(
                 )
                 SwitchPreference(
                     title = "运行中的通知栏提醒",
-                    summary = "在通知栏显示一条运行中消息，也可以点击跳转至软件",
+                    summary = "通知栏挂一条运行中的消息，点一下回到 App",
                     startAction = { SettingsRowIcon(Icons.Filled.Notifications) },
                     checked = vm.runNotif,
                     onCheckedChange = { vm.switchRunNotif(it) },
@@ -762,7 +762,7 @@ private fun MiuixSettingsBody(
                 )
                 ArrowPreference(
                     title = "备份与恢复",
-                    summary = "导出 / 导入配置，一键备份与换机迁移",
+                    summary = "导出 / 导入配置，备份和换机用",
                     startAction = { SettingsRowIcon(Icons.Rounded.Backup) },
                     onClick = onOpenBackup,
                 )
@@ -774,7 +774,7 @@ private fun MiuixSettingsBody(
             SettingsMiuixGroup {
                 ArrowPreference(
                     title = "关于",
-                    summary = "版本、技术信息与开源致谢",
+                    summary = "版本、技术信息和开源致谢",
                     startAction = { SettingsRowIcon(Icons.Filled.Info) },
                     onClick = actions.onOpenAbout,
                 )
@@ -787,7 +787,7 @@ private fun MiuixSettingsBody(
                 SettingsMiuixGroup {
                     ArrowPreference(
                         title = "重看使用引导",
-                        summary = "清掉完成标记，重新走一遍 5 步引导",
+                        summary = "清掉完成标记，重新走一遍引导",
                         startAction = { SettingsRowIcon(Icons.Filled.Refresh) },
                         onClick = actions.onReplayOnboarding,
                     )
@@ -829,8 +829,8 @@ private const val JUDGE_CARD_RANDOM = "当前为随机模式，模型判定配�
 
 /** 卡片底部的说明（原模型配置页那段，只把档位名换成 [JudgeLabels] 的叫法）。 */
 private const val JUDGE_CARD_NOTE =
-    "主动程度只影响「没 @ 本 bot」的群消息：保守要求明确在叫你，标准（默认）拿不准就接，" +
-        "积极几乎都接。判定模型答不出 1/0 时按「接」处理；判定调用失败时只有在「保守」档才按「不接」。"
+    "只影响没 @ 本 bot 的群消息：保守要明确叫你，标准（默认）拿不准就接，积极基本都接。" +
+        "判定模型答不出 1/0 就当接；判定调用失败时，只有保守档才当不接。"
 
 /** 卡内说明小字：13sp + 次要色（两套结构同一份字号与颜色）。 */
 @Composable
@@ -1003,7 +1003,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedSwitchItem(
                         title = "多 bot 由总模型决定谁回",
-                        summary = "开启后同一句话只让最合适的一个 bot 回；只有一个 bot 时不生效",
+                        summary = "打开后一句话只让一个 bot 回，由总模型挑谁；只有一个 bot 时不起作用",
                         icon = Icons.Filled.Forum,
                         checked = vm.gate,
                         onCheckedChange = { vm.switchGate(it) },
@@ -1084,7 +1084,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedDropdownItem(
                         title = "每日上限",
-                        summary = "每天最多回多少条；到点当天就不再回（群配置可以按群覆盖）",
+                        summary = "每天最多回多少条，到点当天就不再回（群配置能按群覆盖）",
                         icon = Icons.Filled.Speed,
                         items = vm.dailyLimitItems,
                         selectedIndex = vm.dailyLimitIndex,
@@ -1144,7 +1144,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedSwitchItem(
                         title = "运行中的通知栏提醒",
-                        summary = "在通知栏显示一条运行中消息，也可以点击跳转至软件",
+                        summary = "通知栏挂一条运行中的消息，点一下回到 App",
                         icon = Icons.Filled.Notifications,
                         checked = vm.runNotif,
                         onCheckedChange = { vm.switchRunNotif(it) },
@@ -1187,7 +1187,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedArrowItem(
                         title = "备份与恢复",
-                        summary = "导出 / 导入配置，一键备份与换机迁移",
+                        summary = "导出 / 导入配置，备份和换机用",
                         icon = Icons.Rounded.Backup,
                         onClick = onOpenBackup,
                     )
@@ -1201,7 +1201,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedArrowItem(
                         title = "关于",
-                        summary = "版本、技术信息与开源致谢",
+                        summary = "版本、技术信息和开源致谢",
                         icon = Icons.Filled.Info,
                         onClick = actions.onOpenAbout,
                     )
@@ -1216,7 +1216,7 @@ private fun MaterialSettingsBody(
                     item {
                         SegmentedArrowItem(
                             title = "重看使用引导",
-                            summary = "清掉完成标记，重新走一遍 5 步引导",
+                            summary = "清掉完成标记，重新走一遍引导",
                             icon = Icons.Filled.Refresh,
                             onClick = actions.onReplayOnboarding,
                         )
@@ -1368,7 +1368,7 @@ private fun ArchiveDialog(
                     color = MiuixTheme.colorScheme.onBackground,
                 )
                 Text(
-                    text = "每 20 条或 5 秒落一次盘；默认保留 30 天、每个会话最多 5000 条，"
+                    text = "每 20 条或 5 秒落一次盘。默认留 30 天，每个会话最多 5000 条，"
                         + "超出的自动删最旧的。导出是一行一条纯文本。",
                     style = MiuixTheme.textStyles.footnote2,
                     color = MiuixTheme.colorScheme.onBackground,

@@ -35,7 +35,7 @@ fun UpdateDialog(
 ) {
     WindowDialog(
         show = true,
-        title = "发现新版本 " + newer.versionName + "（当前 " + current + "）",
+        title = "有新版 " + newer.versionName + "（你现在是 " + current + "）",
         onDismissRequest = onDismiss,
         content = {
             Column(
@@ -45,7 +45,7 @@ fun UpdateDialog(
                 val body = newer.body.trim()
                 if (body.isEmpty()) {
                     Text(
-                        text = "（该版本未提供更新说明）",
+                        text = "（这个版本没写更新说明）",
                         fontSize = 14.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                     )

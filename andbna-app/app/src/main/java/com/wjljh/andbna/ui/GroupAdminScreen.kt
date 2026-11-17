@@ -482,7 +482,7 @@ private fun AdminRuleScreen(
             val s = stats
             PanelListRow(
                 title = if (s == null) "—" else s.users.toString() + " 人 / 共 " + s.hits + " 次",
-                meta = if (s == null) "共享计数文件还没写这一行（运行侧统计落盘后自动显示）"
+                meta = if (s == null) "共享计数文件里还没这一行，等运行侧统计落盘就会显示"
                 else "本群最近统计（group_admin/_stats.json）",
             )
             Text(

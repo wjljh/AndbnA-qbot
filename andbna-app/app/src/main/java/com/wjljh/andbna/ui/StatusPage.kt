@@ -193,7 +193,7 @@ private fun LocalStatusContent(
     ) { granted ->
         if (!granted) {
             msgOk = false
-            msg = "没给通知权限：bot 仍在跑，但通知栏看不到，也更容易被系统清掉"
+            msg = "没给通知权限：bot 照跑，通知栏看不到，也更容易被系统清掉。去系统设置里开一下"
         }
     }
 
@@ -306,8 +306,8 @@ private fun LocalStatusContent(
         if (pendingUpdate != null) item(key = "update") {
             Box(Modifier.fillMaxWidth().clickable { updateDialog = true }) {
                 Note(
-                    text = "发现新版本 " + pendingUpdate.versionName +
-                        "（当前 " + BuildConfig.VERSION_NAME + "）· 点击查看",
+                    text = "有新版 " + pendingUpdate.versionName +
+                        "（你现在是 " + BuildConfig.VERSION_NAME + "）· 点一下看",
                     ok = true,
                 )
             }
@@ -354,7 +354,7 @@ private fun LocalStatusContent(
                             go()
                         } else {
                             msgOk = true
-                            msg = "自动拉回已在设置里关掉：到底栏「设置」页把它打开"
+                            msg = "自动拉回在设置里关着：去底栏「设置」打开"
                         }
                     })
                     PullBack.Action.NONE -> null
@@ -413,7 +413,7 @@ private fun LocalStatusContent(
                             BotService.stopByUser(ctx)
                             BotHost.stopAll()
                             msgOk = true
-                            msg = "已请求停止"
+                            msg = "停止指令已发出"
                         },
                         modifier = Modifier.weight(1f),
                         enabled = running && !busy,
@@ -470,7 +470,7 @@ private fun LocalStatusContent(
     PanelConfirmDialog(
         show = resumeAsk,
         title = "恢复自动拉回",
-        body = "自动拉回因为「达到上限」暂停了。恢复会清掉这次的暂停计数，让看门狗重新上岗，" +
+        body = "自动拉回到了次数上限，暂停了。恢复会清掉这次的计数，看门狗重新上岗，" +
             "被杀后照常把 App 拉回来。",
         confirmLabel = "恢复自动拉回",
         danger = false,
@@ -727,18 +727,18 @@ internal fun costCandidates(c: CostSnapshot?): List<String> {
  */
 private fun probeSummary(raw: String): Pair<Boolean, String> {
     val lines = raw.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
-    if (lines.isEmpty()) return false to "自检失败：没有输出"
+    if (lines.isEmpty()) return false to "自检没过：python 没有输出。先点「启动」，起来再自检一次"
 
     val bad = lines.firstOrNull { it.contains("✗") }
     if (bad != null) {
         val name = bad.substringBefore(' ').trim()
         val why = bad.substringAfter("✗", "").trim()
-        return false to "自检失败：" +
+        return false to "自检没过：" +
             (if (name.isBlank()) "依赖导入出错" else name + " 导入失败") +
-            (if (why.isBlank()) "" else "（" + why + "）")
+            (if (why.isBlank()) "" else "（" + why + "）") + "。多半是依赖没装上，去「日志」页看哪一步挂了"
     }
     if (raw.startsWith("Python 没起来") || raw.startsWith("自检失败")) {
-        return false to "自检失败：" + lines.first().removePrefix("自检失败：").take(40)
+        return false to "自检没过：" + lines.first().removePrefix("自检失败：").take(40) + "。先点「启动」再来"
     }
 
     fun value(name: String): String? = lines.firstOrNull { it.startsWith(name) }
@@ -753,7 +753,7 @@ private fun probeSummary(raw: String): Pair<Boolean, String> {
         botpy == "ok" -> "botpy 正常"
         else -> "botpy " + botpy
     }
-    return true to "自检通过：" + parts.joinToString(" · ")
+    return true to "自检过了：" + parts.joinToString(" · ")
 }
 
 /** 运行模式的显示用语（业务层 label 是「root 模式」，这里统一成「×× 托管」）。 */

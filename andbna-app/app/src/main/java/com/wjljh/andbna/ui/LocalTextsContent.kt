@@ -36,6 +36,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import com.wjljh.andbna.local.BotHost
+import com.wjljh.andbna.local.GroupNames
 import com.wjljh.andbna.local.LocalBot
 import com.wjljh.andbna.local.MemoryRepo
 import com.wjljh.andbna.local.BotStore
@@ -100,6 +101,8 @@ fun LocalTextsContent(
         bots = withContext(Dispatchers.IO) { BotStore.load(ctx) }
     }
     var sessions by remember { mutableStateOf<Map<String, List<org.json.JSONObject>>>(emptyMap()) }
+    // 每个 bot 一份群名缓存（group_names.json）：key = appid，取不到名字就显示「群 + openid 前 8 位」
+    var names by remember { mutableStateOf<Map<String, Map<String, GroupNames.Entry>>>(emptyMap()) }
     var msg by remember { mutableStateOf("") }
     var tick by remember { mutableIntStateOf(0) }
     var expandedBot by remember { mutableStateOf("") }
@@ -125,7 +128,12 @@ fun LocalTextsContent(
     val material = LocalUiMode.current == UiMode.Material
 
     LaunchedEffect(tick, bots.size) {
-        sessions = readLocalSessions(ctx, bots)
+        val read = readLocalSessions(ctx, bots)
+        sessions = read
+        // 先把已有缓存摊上来（首帧就能看到群名），再给「还没有缓存」的群补一次
+        names = withContext(Dispatchers.IO) { loadNames(ctx, bots) }
+        val got = withContext(Dispatchers.IO) { fillNames(ctx, bots, read) }
+        if (got > 0) names = withContext(Dispatchers.IO) { loadNames(ctx, bots) }
     }
 
     // 多选态把底部胶囊导航栏收走（App.kt 据这个 local 决定画不画底栏），
@@ -310,6 +318,7 @@ fun LocalTextsContent(
                     LocalBotSegmentedGroup(
                         bot = bot,
                         appid = bot.appid,
+                        names = names[bot.appid].orEmpty(),
                         chats = chats,
                         shown = shown,
                         expanded = expanded,
@@ -367,7 +376,7 @@ fun LocalTextsContent(
                             val picked = SelectedKey(bot.appid, key)
                             PanelEntityRow(
                                 icon = Icons.Filled.Forum,
-                                title = "${c.optString("type")} · ${key.take(18)}",
+                                title = chatTitle(c.optString("type"), key, names[bot.appid].orEmpty()),
                                 subtitle = "${c.optInt("count")} 条 · ${c.optString("last")}",
                                 // 多选：行首选择圈（任一分组都看得到）；长按进多选，进入后单击 = 选中/取消
                                 leading = {
@@ -527,6 +536,7 @@ fun LocalTextsContent(
 private fun LocalBotSegmentedGroup(
     bot: LocalBot,
     appid: String,
+    names: Map<String, GroupNames.Entry>,
     chats: List<org.json.JSONObject>,
     shown: List<org.json.JSONObject>,
     expanded: Boolean,
@@ -561,7 +571,7 @@ private fun LocalBotSegmentedGroup(
             val key = c.optString("key")
             item {
                 SegmentedRowItem(
-                    title = c.optString("type") + " · " + key.take(18),
+                    title = chatTitle(c.optString("type"), key, names),
                     subtitle = c.optInt("count").toString() + " 条 · " + c.optString("last"),
                     icon = Icons.Filled.Forum,
                     // 多选：行首选择圈；长按进多选，进入后单击 = 选中/取消
@@ -629,6 +639,7 @@ fun MemoryDetailContent(
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     var chats by remember { mutableStateOf<List<org.json.JSONObject>>(emptyList()) }
+    var names by remember { mutableStateOf<Map<String, GroupNames.Entry>>(emptyMap()) }
     var msg by remember { mutableStateOf("") }
     var tick by remember { mutableStateOf(0) }
     var undoable by remember { mutableStateOf(false) }
@@ -641,15 +652,22 @@ fun MemoryDetailContent(
     }
 
     LaunchedEffect(appid, tick) {
-        chats = withContext(Dispatchers.IO) {
-            val list = ArrayList<org.json.JSONObject>()
+        val list = withContext(Dispatchers.IO) {
+            val out = ArrayList<org.json.JSONObject>()
             try {
                 val arr = JSONArray(BotHost.memoryList(ctx, appid))
-                for (i in 0 until arr.length()) arr.optJSONObject(i)?.let { list.add(it) }
+                for (i in 0 until arr.length()) arr.optJSONObject(i)?.let { out.add(it) }
             } catch (_: Exception) {
             }
-            list
+            out
         }
+        chats = list
+        // 群名：先摊缓存，再给「还没有缓存」的群补一次（一次 ≤ GroupNames.BATCH 个、串行 200ms）
+        names = withContext(Dispatchers.IO) { GroupNames.load(ctx, appid) }
+        val gids = list.map { it.optString("key") }
+            .filter { it.startsWith("g") }.map { it.removePrefix("g") }
+        val got = withContext(Dispatchers.IO) { GroupNames.fill(ctx, appid, gids) }
+        if (got > 0) names = withContext(Dispatchers.IO) { GroupNames.load(ctx, appid) }
     }
 
     // 群 openid：记忆键就是 g + group_openid
@@ -674,13 +692,13 @@ fun MemoryDetailContent(
         item(key = "groups") {
             PanelGroupCard {
                 Text(
-                    text = "群 openid（${groups.size}）",
+                    text = "群聊（${groups.size}）",
                     fontSize = PanelTokens.EntityTitleSize,
                     fontWeight = FontWeight(550),
                     color = PanelColors.onSurface,
                 )
                 Text(
-                    text = "记忆键就是 g + group_openid",
+                    text = "群名取不到时显示 openid 前 8 位",
                     fontSize = PanelTokens.EntitySubtitleSize,
                     color = PanelColors.onSurfaceVariantSummary,
                     modifier = Modifier.padding(top = PanelTokens.InfoValueGap),
@@ -699,7 +717,8 @@ fun MemoryDetailContent(
                     verticalArrangement = Arrangement.spacedBy(PanelTokens.ButtonGap),
                 ) {
                     groups.forEach { g ->
-                        PanelChip(text = g.optString("key").removePrefix("g"), onClick = {})
+                        val gid = g.optString("key").removePrefix("g")
+                        PanelChip(text = GroupNames.label(gid, names[gid]?.name.orEmpty()), onClick = {})
                     }
                 }
             }
@@ -728,7 +747,7 @@ fun MemoryDetailContent(
                     val key = c.optString("key")
                     PanelEntityRow(
                         icon = if (key.startsWith("g")) Icons.Filled.Forum else Icons.Filled.Person,
-                        title = "${c.optString("type")} · ${key.take(18)}",
+                        title = chatTitle(c.optString("type"), key, names),
                         subtitle = "${c.optInt("count")} 条 · ${c.optString("last")}",
                         divider = i != chats.lastIndex,
                         trailing = {
@@ -772,6 +791,50 @@ fun MemoryDetailContent(
 
 
 private const val TAG = "LocalTexts"
+
+/**
+ * 记忆行主标题：群 → 直接写群名，取不到写「群 + openid 前 8 位」（不再有 g 前缀那串 openid）；
+ * 私聊保持「私聊 · p + openid 前 8 位」的旧样子，只是 openid 也压到 8 位。
+ */
+private fun chatTitle(
+    type: String,
+    key: String,
+    names: Map<String, GroupNames.Entry>,
+): String {
+    if (key.startsWith("g")) {
+        val gid = key.removePrefix("g")
+        return GroupNames.label(gid, names[gid]?.name.orEmpty())
+    }
+    return type + " · " + GroupNames.shortKey(key)
+}
+
+/** 每个 bot 一份群名缓存（<botdir>/group_names.json）。 */
+private fun loadNames(
+    ctx: Context,
+    bots: List<LocalBot>,
+): Map<String, Map<String, GroupNames.Entry>> =
+    bots.associate { it.appid to GroupNames.load(ctx, it.appid) }
+
+/**
+ * 给「还没有缓存」的群补名字：限流全在 [GroupNames.fill] 里（一次最多 5 个、串行、间隔 200ms），
+ * 查不到就静默 —— 页面上永远是「群名 or 群 + openid 前 8 位」，不会被一个名字卡住。
+ */
+private suspend fun fillNames(
+    ctx: Context,
+    bots: List<LocalBot>,
+    sessions: Map<String, List<org.json.JSONObject>>,
+): Int {
+    var got = 0
+    bots.forEach { b ->
+        val gids = sessions[b.appid].orEmpty()
+            .map { it.optString("key") }
+            .filter { it.startsWith("g") }
+            .map { it.removePrefix("g") }
+        if (gids.isEmpty()) return@forEach
+        got += GroupNames.fill(ctx, b.appid, gids)
+    }
+    return got
+}
 
 /** 重读每个 bot 的会话列表（BotHost.memoryList）：首帧和下拉刷新共用同一份读取逻辑。 */
 private suspend fun readLocalSessions(

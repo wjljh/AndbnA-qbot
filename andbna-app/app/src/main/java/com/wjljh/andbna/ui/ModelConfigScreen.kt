@@ -170,7 +170,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
             } else {
                 models = emptyList()
                 sheetFor = ""
-                error = "读取模型失败：" + out.error
+                error = "没读到模型：" + out.error + "。地址和 Key 再核一遍"
             }
         }
     }
@@ -230,7 +230,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
             }
             val o = runCatching { JSONObject(raw) }.getOrNull()
             verifyBusy = false
-            verifyLine = o?.optString("line").orEmpty().ifBlank { "失败：验证没有返回结论" }
+            verifyLine = o?.optString("line").orEmpty().ifBlank { "没验出结果：接口一个结论都没回" }
             verifyDetail = o?.optString("detail").orEmpty()
             verifyFailed = o?.optString("state").orEmpty() == "fail"
         }
@@ -301,7 +301,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 SlotCard(
                     metrics = metrics,
                     title = "识图模型",
-                    help = "留空则沿用主模型；收到图片时用这个模型识图。",
+                    help = "留空就用主模型。收到图片时用它识图。",
                     value = visionModel,
                     main = mainModel,
                     busy = busy == "vision",
@@ -312,7 +312,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 SlotCard(
                     metrics = metrics,
                     title = "判定模型",
-                    help = "留空则沿用主模型；「回复判定」只回一个 0/1，配个便宜模型更省。",
+                    help = "留空就用主模型。「回复判定」只回一个 0/1，配个便宜的够用。",
                     value = judgeModel,
                     main = mainModel,
                     busy = busy == "judge",
@@ -323,7 +323,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 SlotCard(
                     metrics = metrics,
                     title = "摘要模型",
-                    help = "留空则沿用主模型；上下文压缩时用它把旧对话并成一段摘要。",
+                    help = "留空就用主模型。上下文压缩时用它把旧对话并成一段摘要。",
                     value = summaryModel,
                     main = mainModel,
                     busy = busy == "summary",
@@ -334,7 +334,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 SlotCard(
                     metrics = metrics,
                     title = "搜索模型",
-                    help = "留空则沿用主模型；#搜 / #读 把结果按人格转述成中文时用它（一次一条，配便宜的就够）。",
+                    help = "留空就用主模型。#搜 / #读 把结果按人格转述成中文时用它（一次一条，配便宜的够）。",
                     value = searchModel,
                     main = mainModel,
                     busy = busy == "search",
@@ -403,7 +403,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                     }
                     Text(
                         text = "官方 DeepSeek 的取值为 None / Minimal / Low / Medium / High / " +
-                            "Xhigh / Ultra / Max（发送时用小写）；不是所有模型都支持，留空最安全。",
+                            "Xhigh / Ultra / Max（发送时用小写）。不是每个模型都认，留空最稳。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 6.dp),
@@ -474,9 +474,9 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                     val win = contextWindow.trim().toLongOrNull() ?: 131072L
                     Text(
                         text = "单位 token，默认 131072（128K）。这是估算阈值，不是硬上限：" +
-                            "估算达到 " + (win * 75 / 100) + " tokens 才把旧对话压成摘要；" +
-                            "真正发出去的只有 system + 摘要 + 最近 12 条原文，所以填大一点不会" +
-                            "让每次请求变贵。压缩后如果没有真的变小，这次压缩会被放弃（不落盘）。",
+                            "估算到 " + (win * 75 / 100) + " tokens 才把旧对话压成摘要。" +
+                            "真正发出去的只有 system + 摘要 + 最近 12 条原文，填大一点不会" +
+                            "让每次请求变贵。压缩后没真的变小，这次压缩就作废（不落盘）。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 6.dp),
@@ -487,7 +487,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 SectionCard(metrics, title = "联网搜索", titleOutside = true) {
                     SwitchPreference(
                         title = "联网搜索",
-                        summary = if (webOn) "已开启 · #搜 / #读 与自动搜索都可用"
+                        summary = if (webOn) "已开启 · #搜 / #读 和自动搜索都能用"
                         else "已关闭 · 不发送任何联网请求",
                         checked = webOn,
                         onCheckedChange = { webOn = it },
@@ -568,10 +568,10 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                     Text(
                         text = "不用打前缀：聊天里它不确定就会自己搜（「最近/今天/新闻/多少钱/" +
                             "价格/什么时候/谁是/查一下」这类词也会兜底搜一次），最多连查 5 轮。" +
-                            "#搜 / #读 只有主人能用，别人发 # 就是普通聊天。回复都是一段话，" +
-                            "最多附一条链接。中转站/第三方模型通常没有 /v1/tools，请改用" +
+                            "#搜 / #读 只有主人能用，别人发 # 就是普通聊天。回复是一段话，" +
+                            "最多带一条链接。中转站和第三方模型通常没有 /v1/tools，得改用" +
                             "「SearXNG 自建」或「自定义 JSON 接口」（#读 抓正文只有 DeepSeek 官方" +
-                            "支持）。关掉「人设化回答」= 回到原始列表贴法。" +
+                            "能抓）。关掉「人设化回答」= 回到原始列表贴法。" +
                             "DeepSeek 官方计费：每 1000 次成功请求 5 元。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
@@ -587,8 +587,8 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                         onClick = { save() },
                     )
                     Text(
-                        text = "保存会同时写入接口地址、API Key、主模型、识图/判定/摘要三个槽位、" +
-                            "上下文窗口、联网开关与思考强度；没点保存前改的值不落盘。",
+                        text = "点保存才会一起写入接口地址、API Key、主模型、识图/判定/摘要三个槽位、" +
+                            "上下文窗口、联网开关和思考强度。没点保存的改动不会落盘。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 8.dp),
@@ -646,7 +646,7 @@ private fun SlotCard(
         PanelEllipsisField(
             value = value,
             onValueChange = onValueChange,
-            hint = "留空则沿用主模型",
+            hint = "留空就用主模型",
             mono = false,
         )
         Text(

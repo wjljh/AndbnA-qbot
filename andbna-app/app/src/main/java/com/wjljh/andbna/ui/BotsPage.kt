@@ -161,7 +161,7 @@ fun BotsPage(
                             item {
                                 SegmentedArrowItem(
                                     title = "还没有配置 bot",
-                                    summary = "填入 AppID 与 AppSecret 就能加一个",
+                                    summary = "填上 AppID 和 AppSecret 就能加一个",
                                     icon = Icons.Filled.Person,
                                     onClick = { onOpenBotAdd() },
                                 )
@@ -176,7 +176,7 @@ fun BotsPage(
                                 color = PanelColors.onSurface,
                             )
                             Text(
-                                text = "填入 AppID 与 AppSecret 就能加一个",
+                                text = "填上 AppID 和 AppSecret 就能加一个",
                                 fontSize = PanelTokens.EntitySubtitleSize,
                                 color = PanelColors.onSurfaceVariantSummary,
                                 modifier = Modifier.padding(top = PanelTokens.InfoValueGap),

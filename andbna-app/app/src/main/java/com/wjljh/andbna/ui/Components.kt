@@ -294,7 +294,7 @@ fun Pill(
 @Composable
 fun ConfirmButton(
     text: String,
-    confirmText: String = "再点一次确认",
+    confirmText: String = "再点一次",
     danger: Boolean = true,
     enabled: Boolean = true,
     onConfirm: () -> Unit,
