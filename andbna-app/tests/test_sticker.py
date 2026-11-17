@@ -18,6 +18,11 @@
   9) 顺序：先文字后表情；上传走群/私聊各自路径；此时现传 file_info
  10) 正文只有标记 → 只发图，不发文字
  11) 文件读不到 → 不发 HTTP、只记错误
+ 12) #表情 / #发表情 [#关键词] / #表情列表 / #表情库：挑了哪张、命中不到、别名
+ 13) 限频：主人不限次；其他人同一会话 5 分钟 1 次（拒绝只回一次，免得拒绝刷屏）
+ 14) 开关关掉命令照样能发；库空回「库里还没有表情」
+ 15) system 常驻行：库非空才有、只列前 6 张 / 描述截 20 字、开关关掉不占 token
+ 16) 自然语言触发（发个表情 / 来个无语的表情）：私聊任意消息，群里要 @ 或叫名字
 """
 import asyncio
 import json
@@ -144,6 +149,8 @@ def reset():
     del br._state["log"][:]
     br._sticker_state["replies"].clear()
     br._sticker_state["sent"].clear()
+    br._sticker_cmd_state["last"].clear()
+    br._sticker_cmd_state["warned"].clear()
     br._sticker_lib_cache.clear()
     br._sticker_conf_cache.clear()
     br._sticker_pending.set(None)
@@ -215,12 +222,13 @@ def test_library():
 
     hint, cands = br._sticker_hint(BOT)
     lines = hint.splitlines()
-    check("2a 提示词：引导语 + 每张一行 id｜描述｜标签 + 标记写法 + 不要解释",
+    check("2a 提示词：常驻行 + 标记写法 + 每张一行 id｜描述｜标签 + 不要解释",
           len(lines) == 5
-          and lines[0] == "你可以偶尔发表情图，让对话更生动。可用的表情（id｜描述｜标签）："
-          and lines[1] == "s1｜无语的翻白眼｜无语,嫌弃"
-          and lines[2] == "s2｜比心｜-"
-          and lines[3] == "想发时在回复末尾单独写一行：<sticker>s1</sticker>"
+          and lines[0] == "你手里有一个本机表情库，共 2 张：s1 无语的翻白眼 · s2 比心"
+          and lines[1].startswith("想发某张就在回复末尾单独写一行：<sticker>s1</sticker>")
+          and "用户直接让你发表情时也照做" in lines[1]
+          and lines[2] == "s1｜无语的翻白眼｜无语,嫌弃"
+          and lines[3] == "s2｜比心｜-"
           and lines[4] == "不想发就不要写。不要解释这个标记。", lines)
     check("2b 候选条目数 = 过滤后的库", len(cands) == 2, len(cands))
 
@@ -407,6 +415,254 @@ def test_private_and_file():
           [x for x in logs() if "表情" in x])
 
 
+
+# ── 13 / 14 · 表情命令（所有人可用，非主人限频）与 system 常驻行 ─────────
+
+OTHER = "OTHER_openid_9"
+LIB10 = [
+    ("s1", "无语的翻白眼", ["无语", "嫌弃"]),
+    ("s2", "比心", ["喜欢"]),
+    ("s3", "笑死", ["哈哈"]),
+    ("s4", "打滚", []),
+    ("s5", "竖大拇指", ["赞"]),
+    ("s6", "摊手", ["无奈"]),
+    ("s7", "哭", ["难过"]),
+    ("s8", "生气", ["怒"]),
+    ("s9", "睡着", ["困"]),
+    ("s10", "鼓掌", ["掌声"]),
+]
+
+
+def lib10():
+    if not os.path.isdir(STK):
+        os.makedirs(STK)
+    rows = []
+    for sid, desc, tags in LIB10:
+        make_img(sid + ".png")
+        rows.append({"id": sid, "file": sid + ".png", "desc": desc, "tags": tags})
+    return write_lib(rows)
+
+
+def cmd(text, msg=None, key="g" + GID):
+    """跑一次表情命令（走真入口，mid 用消息 id）。"""
+    msg = msg or FakeMsg("c1", text)
+    return asyncio.run(br.sticker_cmd(APPID, BOT, msg, key, text,
+                                      gid=GID if key.startswith("g") else "",
+                                      mid=msg.id))
+
+
+def imgs():
+    return [kw for _k, kw in API.sent if kw.get("msg_type") == 7]
+
+
+def texts():
+    return [kw.get("content") for _k, kw in API.sent if kw.get("msg_type") == 0]
+
+
+def clear_http():
+    API.sent[:] = []
+    API.http.calls[:] = []
+
+
+def test_cmd():
+    print("[13] #表情 命令（所有人可用，非主人限频）")
+    reset()
+    write_llm(sticker_every_n=10, sticker_cooldown_h=24)
+    write_json(os.path.join(BOT, "owner.json"), {"user_openid": UOID})
+    lib10()
+
+    ok = cmd("#表情")
+    check("命令9a 主人 #表情 无参数 → 上传 1 次 + 发 1 条图（不多发文字）",
+          ok is True and len(API.http.calls) == 1 and len(API.sent) == 1
+          and API.sent[0][1].get("msg_type") == 7, (ok, len(API.http.calls), API.sent))
+    check("命令9b 发出去的那张记进冷却、本会话窗口清零",
+          list(br._sticker_state["sent"]) and br._sticker_state["replies"].get("g" + GID) == 0,
+          br._sticker_state)
+    check("命令9c 日志写清「不看 every_n / 冷却，仍记冷却与窗口」",
+          has("表情命令：#表情 随机 → 发") and has("不看 every_n / 冷却"),
+          [x for x in logs() if "表情命令" in x])
+
+    br._sticker_state["sent"].clear()
+    clear_http()
+    ok = cmd("#表情 比心")
+    check("命令10a 关键词命中描述 → 发 s2",
+          ok and len(imgs()) == 1 and [k[1] for k in br._sticker_state["sent"]] == ["s2"],
+          (API.sent, br._sticker_state["sent"]))
+    br._sticker_state["sent"].clear()
+    clear_http()
+    ok = cmd("#表情 掌声")
+    check("命令10b 关键词只命中标签也算（掌声 → s10）",
+          ok and [k[1] for k in br._sticker_state["sent"]] == ["s10"],
+          (API.sent, br._sticker_state["sent"]))
+    clear_http()
+    ok = cmd("#表情 不存在")
+    check("命令10c 命中不到 → 回「库里没这个：<关键词>」，不发图",
+          ok and imgs() == [] and texts() == ["库里没这个：不存在"] and API.http.calls == [],
+          (API.sent, API.http.calls))
+
+    clear_http()
+    ok = cmd("#表情列表")
+    txt = texts()[0] if texts() else ""
+    check("命令11a #表情列表 → 一条文字消息，含 id 与描述",
+          ok and len(API.sent) == 1 and API.sent[0][1].get("msg_type") == 0
+          and "s1 无语的翻白眼" in txt and "s8 生气" in txt, txt)
+    check("命令11b 超过 8 张 → 只列前 8 张 + 「等 10 张」",
+          "等 10 张" in txt and "s9" not in txt and "s10" not in txt, txt)
+    clear_http()
+    ok = cmd("#表情库")
+    check("命令11c #表情库 是 #表情列表 的别名",
+          ok and texts() and "s1 无语的翻白眼" in texts()[0], texts())
+
+    print("[14] 限频：主人不限次 / 其他人 5 分钟 1 次")
+    br._sticker_cmd_state["last"].clear()
+    br._sticker_cmd_state["warned"].clear()
+    clear_http()
+    first = FakeMsg("c2", "#表情", oid=OTHER)
+    first.author.username = "路人甲"
+    ok1 = cmd("#表情", first)
+    check("命令12a 非主人第一次也能发（上传 1 + 发 1）",
+          ok1 is True and len(imgs()) == 1 and len(API.http.calls) == 1,
+          (ok1, API.sent, API.http.calls))
+    clear_http()
+    second = FakeMsg("c3", "#表情", oid=OTHER)
+    second.author.username = "路人甲"
+    ok2 = cmd("#表情", second)
+    check("命令12b 紧接着第二次 → 限频拒绝：不发图，回一句「歇会儿」",
+          ok2 is True and API.http.calls == [] and imgs() == []
+          and texts() == ["歇会儿，5 分钟后再来"], (API.sent, API.http.calls))
+    check("命令12c detail 日志：表情：<昵称> 请求过频，已拒绝",
+          has("表情：路人甲 请求过频，已拒绝"), [x for x in logs() if "过频" in x])
+    clear_http()
+    ok3 = cmd("#表情", FakeMsg("c4", "#表情", oid=OTHER))
+    check("命令12d 5 分钟内再刷 → 静音（连拒绝都不回，免得拒绝本身刷屏）",
+          ok3 is True and API.sent == [] and API.http.calls == [], API.sent)
+    br._sticker_cmd_state["last"][("g" + GID, OTHER)] -= br._STICKER_CMD_GAP_S
+    clear_http()
+    ok4 = cmd("#表情", FakeMsg("c5", "#表情", oid=OTHER))
+    check("命令12e 过了 5 分钟 → 又能发", ok4 is True and len(imgs()) == 1, API.sent)
+    clear_http()
+    three = [cmd("#表情") for _ in range(3)]
+    check("命令12f 主人不限次：连续三次都发得出去",
+          all(three) and len(imgs()) == 3, (three, len(imgs())))
+
+    print("[15] 开关关 / 库空")
+    reset()
+    write_llm(sticker_enabled=False)
+    lib10()
+    clear_http()
+    ok = cmd("#表情")
+    check("命令13a sticker_enabled=false：模型自己不发了，但用户让它发照样发",
+          br._sticker_enabled(BASE) is False and ok is True and len(imgs()) == 1,
+          (br._sticker_enabled(BASE), API.sent))
+    reset()
+    write_llm()
+    write_lib([])
+    clear_http()
+    ok = cmd("#表情")
+    check("命令13b 库空 → 回「库里还没有表情」，不发图",
+          ok is True and imgs() == [] and texts() == ["库里还没有表情"]
+          and API.http.calls == [], (API.sent, API.http.calls))
+    clear_http()
+    ok = cmd("#表情列表")
+    check("命令13c 库空时 #表情列表 也回同一句", ok is True and texts() == ["库里还没有表情"],
+          texts())
+
+
+def test_stick_line():
+    print("[16] system 常驻行")
+    reset()
+    write_llm()
+    lib10()
+    head = br._sticker_hint(BOT)[0].splitlines()[0]
+    check("常驻14a 库非空 → 常驻行：共 10 张 + 前 6 张 id 与描述",
+          head.startswith("你手里有一个本机表情库，共 10 张：")
+          and all(("s%d " % i) in head for i in range(1, 7)), head)
+    check("常驻14b 只列前 6 张 + 后面写「等 10 张」",
+          ("s7 " not in head) and ("s10 " not in head) and ("等 10 张" in head), head)
+    MODEL["out"] = "嗯"
+    reply("在吗")
+    check("常驻14c 真实回复的 system 里带着这行（每轮都有，不是只注入候选那轮）",
+          MODEL["systems"] and "你手里有一个本机表情库" in MODEL["systems"][-1],
+          (MODEL["systems"][-1][-60:] if MODEL["systems"] else ""))
+    long_desc = "一二三四五六七八九十一二三四五六七八九十多出来的"
+    write_lib([{"id": "s1", "file": "s1.png", "desc": long_desc, "tags": []}])
+    reset()
+    head2 = br._sticker_hint(BOT)[0].splitlines()[0]
+    check("常驻14d 常驻行里描述截 20 字",
+          long_desc[:20] in head2 and long_desc not in head2, head2)
+    write_lib([])
+    reset()
+    check("常驻14e 库为空 → 没有常驻行", br._sticker_hint(BOT) == ("", []))
+    write_llm(sticker_enabled=False)
+    lib10()
+    check("常驻14f sticker_enabled=false → 也不给常驻行（关掉的开关别占 token）",
+          br._sticker_hint(BOT) == ("", []))
+
+
+def test_nl():
+    print("[17] 自然语言触发（发个表情）")
+    reset()
+    write_llm()
+    write_json(os.path.join(BOT, "owner.json"), {"user_openid": UOID})
+    with open(os.path.join(BOT, "persona_name.txt"), "w", encoding="utf-8") as f:
+        f.write("桑多涅")
+    lib10()
+
+    clear_http()
+    m1 = FakeMsg("n1", "发个表情", oid=UOID)
+    ok = asyncio.run(br.sticker_nl(APPID, BOT, m1, "p" + UOID, "发个表情", mid="n1"))
+    check("自然15a 私聊「发个表情」→ 发一张（一句固定配文 + 一条图，都走私聊）",
+          ok is True and len(imgs()) == 1 and texts() == ["这张给你"]
+          and API.sent[0][0] == "c2c" and API.sent[1][0] == "c2c", API.sent)
+    check("自然15b 日志：表情：自然语言触发（关键词=无）→ 已发",
+          has("表情：自然语言触发（关键词=无）→ 已发"),
+          [x for x in logs() if "自然语言触发" in x])
+
+    br._sticker_cmd_state["last"].clear()
+    br._sticker_state["sent"].clear()
+    clear_http()
+    m2 = FakeMsg("n2", "来个无语的表情", oid=OTHER)
+    ok = br._sticker_nl_ok(BOT, m2, trusted_at=True, at_state="yes") is True and asyncio.run(
+        br.sticker_nl(APPID, BOT, m2, "g" + GID, "来个无语的表情", gid=GID, mid="n2"))
+    check("自然15c 群里 @ 了本 bot + 「来个无语的表情」→ 命中带「无语」的 s1",
+          ok is True and [k[1] for k in br._sticker_state["sent"]] == ["s1"],
+          (br._sticker_state["sent"], API.sent))
+    check("自然15d 日志写清关键词：表情：自然语言触发（关键词=无语）→ 已发 s1",
+          has("表情：自然语言触发（关键词=无语）→ 已发 s1"),
+          [x for x in logs() if "自然语言触发" in x])
+
+    clear_http()
+    m3 = FakeMsg("n3", "来个表情", oid=OTHER)
+    allowed = br._sticker_nl_ok(BOT, m3, trusted_at=False, at_state="no")
+    called = allowed and asyncio.run(
+        br.sticker_nl(APPID, BOT, m3, "g" + GID, "来个表情", gid=GID, mid="n3"))
+    check("自然15e 群里没 @ 也没叫名字 → 不算跟本 bot 说，一张都不发",
+          allowed is False and not called and API.sent == [] and API.http.calls == [],
+          (allowed, API.sent))
+
+    check("自然15f 群里叫了名字（人格名）也算被叫",
+          br._sticker_nl_ok(BOT, FakeMsg("n4", "桑多涅 来个表情", oid=OTHER)) is True)
+
+    br._sticker_cmd_state["last"].clear()
+    clear_http()
+    m5 = FakeMsg("n5", "他发表情包被我删了", oid=OTHER)
+    ok = br._sticker_nl_ok(BOT, m5, at_state="yes") is True and asyncio.run(
+        br.sticker_nl(APPID, BOT, m5, "g" + GID, "他发表情包被我删了", gid=GID, mid="n5"))
+    check("自然15g 语义不同的「他发表情包被我删了」+ @ → 照样真发（宁可真发，有意取舍）",
+          ok is True and len(imgs()) == 1, API.sent)
+
+    br._sticker_cmd_state["last"].clear()
+    clear_http()
+    asyncio.run(br.sticker_nl(APPID, BOT, FakeMsg("n6", "来个表情", oid=OTHER),
+                              "g" + GID, "来个表情", gid=GID, mid="n6"))
+    clear_http()
+    ok = asyncio.run(br.sticker_nl(APPID, BOT, FakeMsg("n7", "再来个表情", oid=OTHER),
+                                   "g" + GID, "再来个表情", gid=GID, mid="n7"))
+    check("自然15h 非主人 5 分钟内第二次自然语言请求 → 限频拒绝（不发图，回一句）",
+          ok is True and imgs() == [] and texts() == ["歇会儿，5 分钟后再来"], API.sent)
+
+    check("自然15i 「今天天气不错」不触发", br._sticker_nl_of("今天天气不错") == (False, ""))
+
 def main():
     os.makedirs(BOT, exist_ok=True)
     with open(os.path.join(BOT, "persona.txt"), "w", encoding="utf-8") as f:
@@ -420,6 +676,9 @@ def main():
     test_rate()
     test_send()
     test_private_and_file()
+    test_cmd()
+    test_stick_line()
+    test_nl()
 
     shutil.rmtree(TMP, ignore_errors=True)
     bad = [r for r in RESULTS if not r[1]]

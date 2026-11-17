@@ -6677,14 +6677,25 @@ _STICKER_EVERY_N = 10               # 每个会话每 N 条回复最多 1 张
 _STICKER_COOLDOWN_H = 24            # 同一张图冷却小时数（防刷屏）
 _STICKER_SHOW_MAX = 60              # 候选条目上限（库再大也别把提示词撑爆）
 _STICKER_DESC_MAX = 40              # 单条描述进候选时的字数上限
+_STICKER_LINE_SHOW = 6              # 常驻行里列几张（前 6 张 id + 描述）
+_STICKER_LINE_DESC = 20             # 常驻行 / 列表里描述截多少字
+_STICKER_LIST_SHOW = 8              # #表情列表 一次列几张
+_STICKER_FRESH_H = 24               # 命令随机挑图：优先挑这么多小时内没发过的
 _STICKER_MARK_RE = re.compile(r"<sticker>\s*([^<>\s]{1,64})\s*</sticker>", re.I)
 _STICKER_ANY_RE = re.compile(r"<sticker>.*?(?:</sticker>|$)", re.I | re.S)  # 含残缺半截标记
-_STICKER_HINT_HEAD = "你可以偶尔发表情图，让对话更生动。可用的表情（id｜描述｜标签）："
+# 常驻行：库存在 + 共几张 + 前 6 张。不再问「要不要用」，让它一直知道自己手里有这个库。
+_STICKER_HINT_HEAD = "你手里有一个本机表情库，共 %d 张：%s"
+_STICKER_HINT_RULE = ("想发某张就在回复末尾单独写一行：<sticker>%s</sticker>（换成上表里的 id）；"
+                      "用户直接让你发表情时也照做。可用的表情（id｜描述｜标签）：")
 _STICKER_HINT_TAIL = "不想发就不要写。不要解释这个标记。"
+_STICKER_EMPTY = "库里还没有表情"
+_STICKER_CMD_GAP_S = 300            # 非主人：#表情 同一会话同一个人 5 分钟最多 1 次
+_STICKER_CMD_BUSY = "歇会儿，5 分钟后再来"
 _sticker_lib_cache = {}             # library.json 路径 -> ((mtime_ns, size), [item])
 _sticker_conf_cache = {}            # llm.json 路径 -> ((mtime_ns, size), conf)
 _sticker_lock = threading.Lock()
 _sticker_state = {"replies": {}, "sent": {}}   # 防刷屏状态：只在内存，重启清零
+_sticker_cmd_state = {"last": {}, "warned": {}}  # 命令限频：last=上次放行，warned=上次回过拒绝
 _sticker_pending = contextvars.ContextVar("sticker_pending", default=None)
 # botpy 的错误类型不带状态码，按类名反查（不 import botpy：单测环境里没有它）
 _STICKER_HTTP = {"AuthenticationFailedError": 401, "ForbiddenError": 403,
@@ -6777,19 +6788,32 @@ def _sticker_enabled(base=None):
     return bool(_sticker_conf(base)["enabled"])
 
 
+def _sticker_line(items):
+    """常驻行：库存在 + 共几张 + 前 6 张（id + 描述，描述截 20 字；多了写「等 N 张」）。"""
+    rows = ["%s %s" % (it["id"], it["desc"][:_STICKER_LINE_DESC])
+            for it in items[:_STICKER_LINE_SHOW]]
+    tail = " … 等 %d 张" % len(items) if len(items) > _STICKER_LINE_SHOW else ""
+    return _STICKER_HINT_HEAD % (len(items), " · ".join(rows) + tail)
+
+
 def _sticker_hint(botdir):
-    """候选注入文本：开关开 + 库非空才有 → (追加进 system 的文本, 候选条目)。"""
+    """候选注入文本：开关开 + 库非空才有 → (追加进 system 的文本, 候选条目)。
+
+    第一行是**常驻行**（每次回复都注入，与候选无关）：库存在、共几张、前 6 张长什么样 ——
+    这样它平时也知道自己手里有表情包，不是只在注入候选那一轮才想起来。
+    常驻行和候选明细合成一段（不另起一段重复列前 6 张），省 token。
+    """
     if not _sticker_enabled():
         return "", []
-    items = _sticker_library(botdir)[:_STICKER_SHOW_MAX]
+    items = _sticker_library(botdir)
     if not items:
         return "", []
     rows = ["%s｜%s｜%s" % (it["id"], it["desc"][:_STICKER_DESC_MAX],
-                           ",".join(it["tags"]) or "-") for it in items]
-    text = chr(10).join([_STICKER_HINT_HEAD] + rows + [
-        "想发时在回复末尾单独写一行：<sticker>%s</sticker>" % items[0]["id"],
+                           ",".join(it["tags"]) or "-") for it in items[:_STICKER_SHOW_MAX]]
+    text = chr(10).join([_sticker_line(items),
+                         _STICKER_HINT_RULE % items[0]["id"]] + rows + [
         _STICKER_HINT_TAIL])
-    return text, items
+    return text, items[:_STICKER_SHOW_MAX]
 
 
 def _sticker_bump(key):
@@ -6834,10 +6858,19 @@ def _sticker_pick(appid, botdir, key, sid):
         log("表情：跳过 %s（同一张图冷却中，还要 %.1f 小时）" % (sid, left),
             appid, cat="回复", lv="detail")
         return None
+    _sticker_note_sent(botdir, key, sid)
+    return item
+
+
+def _sticker_note_sent(botdir, key, sid):
+    """这张发出去了：冷却打点 + 本会话窗口清零。
+
+    命令发的图也走这里 —— 用户让发的那一张同样算「刚发过」，
+    免得紧接着模型又自动补一张重复的。
+    """
     with _sticker_lock:
         _sticker_state["replies"][str(key or "")] = 0
-        _sticker_state["sent"][(str(botdir or ""), sid)] = time.time()
-    return item
+        _sticker_state["sent"][(str(botdir or ""), str(sid or ""))] = time.time()
 
 
 def _sticker_unmark(botdir, item):
@@ -6939,6 +6972,227 @@ async def _sticker_send(appid, api, botdir, key, item, mid=""):
     log("表情：发送 %s（%s %d 条内第 1 张）" % (sid, where, _sticker_conf(_base_dir)["every_n"]),
         appid, cat="回复")
     return True
+
+
+# ── 表情命令：#表情 / #发表情 / #表情列表 / #表情库 ──────────────────
+#
+# 开关 sticker_enabled 管的是「模型自己发」，不管「用户让它发」：
+# 关掉开关命令照样能用（库是空的时候才没法发）。命令也不受
+# sticker_every_n / sticker_cooldown_h 限制 —— 可是发出去的那一张照样记账，
+# 免得紧接着模型又自动补一张重复的。
+_STICKER_CMD_RE = re.compile(r"^#\s*(表情列表|表情库|发表情|表情)\s*(.*)$")
+
+
+def _sticker_cmd_of(text):
+    """→ ("list" | "send", 关键词)；不是表情命令 → ("", "")。"""
+    m = _STICKER_CMD_RE.match(_strip_mentions(text).strip())
+    if not m:
+        return "", ""
+    word = m.group(1)
+    return ("list" if word in ("表情列表", "表情库") else "send"), (m.group(2) or "").strip()
+
+
+def _sticker_list_text(items):
+    """#表情列表 的正文：前 8 张「id 描述」，超过 8 张再写「等 N 张」。"""
+    rows = ["%s %s" % (it["id"], it["desc"][:_STICKER_LINE_DESC])
+            for it in items[:_STICKER_LIST_SHOW]]
+    tail = " 等 %d 张" % len(items) if len(items) > _STICKER_LIST_SHOW else ""
+    return " · ".join(rows) + tail
+
+
+def _sticker_pick_any(botdir, keyword=""):
+    """命令挑图 → (条目, 没挑到的原因)。原因非空 = 回一句话，不发图。
+
+    不带关键词：优先挑最近 24 小时没发过的那几张，全发过就整库随机。
+    带关键词：描述 + 标签做包含匹配，命中里随机；一张都没命中就说清关键词。
+    """
+    items = _sticker_library(botdir)
+    if not items:
+        return None, _STICKER_EMPTY
+    kw = str(keyword or "").strip()
+    if kw:
+        hit = [it for it in items
+               if kw in it["desc"] or any(kw in t for t in it["tags"])]
+        if not hit:
+            return None, "库里没这个：%s" % kw[:20]
+        return random.choice(hit), ""
+    now = time.time()
+    window = _STICKER_FRESH_H * 3600.0
+    fresh = [it for it in items
+             if now - float(_sticker_state["sent"].get((str(botdir or ""), it["id"]), 0.0)) > window]
+    return random.choice(fresh or items), ""
+
+
+def _sticker_cmd_gate(key, oid):
+    """非主人限频 → "ok" 放行（记账）/ "deny" 拒绝且这次回一句 / "quiet" 拒绝但不吭声。
+
+    键是 (会话, 这个人)：同一个群里张三刷屏不影响李四；同一个人连着刷，
+    5 分钟内只在第一次被拒时回一句「歇会儿」，后面的直接丢掉（否则拒绝本身就是刷屏源）。
+    """
+    now = time.time()
+    k = (str(key or ""), str(oid or ""))
+    with _sticker_lock:
+        if now - float(_sticker_cmd_state["last"].get(k, 0.0)) >= _STICKER_CMD_GAP_S:
+            _sticker_cmd_state["last"][k] = now
+            return "ok"
+        if now - float(_sticker_cmd_state["warned"].get(k, 0.0)) >= _STICKER_CMD_GAP_S:
+            _sticker_cmd_state["warned"][k] = now
+            return "deny"
+        return "quiet"
+
+
+async def _sticker_cmd_say(api, appid, message, key, gid, mid, content):
+    """命令的一句短回复：私聊 / 群聊各走各的发送口（失败只记日志，不静默吞）。"""
+    content = str(content or "").strip()
+    if not content or api is None:
+        log("表情命令：没有可发的正文或 api，这句发不出去（%s）" % _snip(content), appid, cat="错误")
+        return False
+    try:
+        if str(key or "").startswith("p"):
+            await api.post_c2c_message(openid=getattr(message.author, "user_openid", ""),
+                                       msg_type=0, msg_id=mid, content=content)
+        else:
+            await api.post_group_message(group_openid=gid, msg_type=0, msg_id=mid,
+                                         content=content, msg_seq=_next_msg_seq(appid, mid))
+    except Exception as e:
+        log("表情命令：回话失败 %r" % e, appid, cat="错误")
+        return False
+    return True
+
+
+async def sticker_cmd(appid, botdir, message, key, text, gid="", mid=""):
+    """#表情 / #发表情 [#关键词] / #表情列表 / #表情库 → True = 这条已经处理完。
+
+    谁能用：所有人（含陌生人）。限频只压在非主人身上 —— 主人（_is_master_msg，和
+    #撤回/#禁言 同一套判定里的主人那一半）不限次，其他人同一会话 5 分钟 1 次；
+    超限回一句短话，同一个人 5 分钟内只回一次，免得拒绝本身变成刷屏源。
+    """
+    kind, arg = _sticker_cmd_of(text)
+    if not kind:
+        return False
+    key = str(key or "")
+    gid = str(gid or "")
+    api = getattr(message, "_api", None)
+    mid = str(mid or _unique_msg_id(message)[1] or "")
+    # 所有人可用（含陌生人）；只对「非主人」限频：同一会话同一个人 5 分钟最多 1 次。
+    # 主人不限次 —— 本来就认人，不用再给数字。
+    if not _is_master_msg(botdir, gid, message):
+        gate = _sticker_cmd_gate(key, _member_openid_of(message))
+        if gate != "ok":
+            who = _gm_nickname(message) or _oid8(_member_openid_of(message)) or "某个人"
+            log("表情：%s 请求过频，已拒绝（非主人，%d 秒 1 次）" % (who, _STICKER_CMD_GAP_S),
+                appid, cat="判定", lv="detail")
+            if gate == "deny":
+                await _sticker_cmd_say(api, appid, message, key, gid, mid, _STICKER_CMD_BUSY)
+            return True
+    if kind == "list":
+        items = _sticker_library(botdir)
+        if not items:
+            log("表情命令：#表情列表 → 库是空的，回「%s」" % _STICKER_EMPTY, appid, cat="回复")
+            await _sticker_cmd_say(api, appid, message, key, gid, mid, _STICKER_EMPTY)
+            return True
+        log("表情命令：#表情列表 → 列前 %d 张（库里共 %d 张）"
+            % (min(len(items), _STICKER_LIST_SHOW), len(items)), appid, cat="回复")
+        await _sticker_cmd_say(api, appid, message, key, gid, mid, _sticker_list_text(items))
+        return True
+    item, why = _sticker_pick_any(botdir, arg)
+    if item is None:
+        log("表情命令：#表情 %s → %s" % ("「%s」" % arg[:20] if arg else "随机", why),
+            appid, cat="回复")
+        await _sticker_cmd_say(api, appid, message, key, gid, mid, why)
+        return True
+    _sticker_note_sent(botdir, key, item["id"])     # 命令不受冷却限制，但这一张要记账
+    log("表情命令：#表情 %s → 发 %s（不看 every_n / 冷却，仍记冷却与窗口）"
+        % ("「%s」" % arg[:20] if arg else "随机", item["id"]), appid, cat="回复")
+    await _sticker_send(appid, api, botdir, key, item, mid)
+    return True
+
+
+# ── 自然语言触发：不用打 #，「发个表情」「来个无语的表情」也算 ───────────
+#
+# 群里只认「@ 了本 bot 或叫了名字」（_sticker_nl_ok）：不然别人聊天里顺口
+# 说一句「他发表情包被我删了」就会被触发。宁可真发的取舍写在报告里。
+_STICKER_NL_RE = re.compile(
+    r"(?:发|来|整|甩|给|换|要)(?:个|张|一|点)?\s*"
+    r"(?P<mid>[^，。！？,.!?\s]{0,10}?)\s*(?:表情包|表情|图片|图)")
+_STICKER_NL_SAY = "这张给你"          # 极短固定配文：不再为一句配文多调一次模型
+_STICKER_NL_NOISE = ("的", "个", "张", "点", "一", "那", "这", "吧", "呗", "呀", "啊", "嘛", "哈")
+
+
+def _sticker_nl_kw(mid):
+    """「无语的」→「无语」：削掉量词 / 语气词 / 结构助词，剩下那截当关键词。"""
+    s = str(mid or "").strip()
+    for _ in range(3):
+        before = s
+        for w in _STICKER_NL_NOISE:
+            while s.startswith(w):
+                s = s[len(w):]
+            while s.endswith(w):
+                s = s[:-len(w)]
+        if s == before:
+            break
+    return s
+
+
+def _sticker_nl_of(text):
+    """自然语言要表情？→ (是不是, 关键词)。关键词取不出 = 空串（= 整库随机）。"""
+    m = _STICKER_NL_RE.search(" ".join(str(text or "").split()))
+    if not m:
+        return False, ""
+    return True, _sticker_nl_kw(m.group("mid"))
+
+
+def _sticker_nl_ok(botdir, message, trusted_at=False, at_state="no"):
+    """群里这一句是不是「跟我说」：@ 了本 bot / 平台可信 @ / 叫了名字。
+
+    名字算不算「叫」跟随 name_hit_as_call（和直回判定同一个开关）。
+    私聊不调这个函数（对方说话就是跟本 bot 说）。
+    """
+    if trusted_at or at_state == "yes":
+        return True
+    if not (_llm_conf(_base_dir) or {}).get("name_hit_as_call", True):
+        return False
+    return bool(_name_hit(botdir, getattr(message, "content", "") or ""))
+
+
+async def sticker_nl(appid, botdir, message, key, text, gid="", mid=""):
+    """自然语言要表情 → True = 这条已经处理完。
+
+    发送链路与 #表情 完全相同（限频 / 冷却记账 / 失败回退），只是不用打 #、
+    也不经过模型挑图：关键词命中就发那张，没命中就随机（不回「库里没这个」——
+    自然语言里的关键词常是顺口一说）。
+    """
+    want, kw = _sticker_nl_of(text)
+    if not want:
+        return False
+    key = str(key or "")
+    gid = str(gid or "")
+    api = getattr(message, "_api", None)
+    mid = str(mid or _unique_msg_id(message)[1] or "")
+    if not _is_master_msg(botdir, gid, message):
+        gate = _sticker_cmd_gate(key, _member_openid_of(message))
+        if gate != "ok":
+            who = _gm_nickname(message) or _oid8(_member_openid_of(message)) or "某个人"
+            log("表情：%s 请求过频，已拒绝（非主人，%d 秒 1 次）" % (who, _STICKER_CMD_GAP_S),
+                appid, cat="判定", lv="detail")
+            if gate == "deny":
+                await _sticker_cmd_say(api, appid, message, key, gid, mid, _STICKER_CMD_BUSY)
+            return True
+    item, why = _sticker_pick_any(botdir, kw)
+    if item is None and kw:
+        log("表情：自然语言触发（关键词=%s）没命中 → 随机挑一张" % kw[:20],
+            appid, cat="判定", lv="detail")
+        item, why = _sticker_pick_any(botdir, "")
+    if item is None:
+        log("表情：自然语言触发 → %s" % why, appid, cat="判定")
+        await _sticker_cmd_say(api, appid, message, key, gid, mid, why)
+        return True
+    _sticker_note_sent(botdir, key, item["id"])
+    log("表情：自然语言触发（关键词=%s）→ 已发 %s" % (kw or "无", item["id"]), appid, cat="判定")
+    await _sticker_cmd_say(api, appid, message, key, gid, mid, _STICKER_NL_SAY)
+    await _sticker_send(appid, api, botdir, key, item, mid)
+    return True
+
 
 async def _post_group(api, appid, gid, mid, content="", markdown=None):
     """发一条群消息：msg_seq 由 _next_msg_seq 分配，冲突就换序号重试一次。
@@ -8457,6 +8711,10 @@ async def _group_admin_tick(appid, botdir, message, gid, text, mid=""):
     conf = group_admin_conf(botdir, gid)
     mid = str(mid or _unique_msg_id(message)[1] or "")
     key, nick, oid, shared = _gm_user_key(message, appid)
+    # 表情命令放在这里（@ 判定 / 限流 / 群额度之前）：用户让它发就必须发得出去，
+    # 静音群、没 @ 本 bot 也照发 —— 和 #撤回/#禁言 同一个位置。
+    if await sticker_cmd(appid, botdir, message, "g" + gid, text, gid=gid, mid=mid):
+        return True
     if await group_admin_cmd(appid, botdir, message, gid, text, mid):
         return True
     if not conf.get("enabled"):
@@ -8759,6 +9017,12 @@ async def _handle_group(appid, botdir, message, tag):
     at_body, at_meta, at_line = _at_semantics(appid, botdir, message)
     log(at_line, appid, cat="判定", lv="detail")
     model_in = (at_meta + chr(10) + at_body) if at_body else at_meta
+    # 自然语言要表情（「发个表情」）：群里只认 @ 了本 bot / 叫了名字。
+    # 先过正则再判「是不是跟我说的」—— 读名字表比匹配一行字贵。
+    if _sticker_nl_of(body)[0] and \
+            _sticker_nl_ok(botdir, message, trusted_at=trusted_at, at_state=at_state) and \
+            await sticker_nl(appid, botdir, message, "g" + gid, body, gid=gid, mid=mid):
+        return
     # 本地指令先判：过了四道闸就算「该回这条」，回时间不必打扰模型
     if await _local_time_reply(appid, message, body, group_openid=gid):
         return
@@ -8883,6 +9147,18 @@ def _make_client(appid, secret, botdir, gen=None):
                     appid, message, text,
                     key="p" + str(getattr(message.author, "user_openid", "")),
                     botdir=botdir):
+                return
+            # 表情命令（#表情 / #表情列表）：私聊同样认，主人不限次、其他人限频
+            if await sticker_cmd(
+                    appid, botdir, message,
+                    "p" + str(getattr(message.author, "user_openid", "")), text,
+                    mid=str(getattr(message, "id", "") or "")):
+                return
+            # 自然语言要表情（「发个表情」）：私聊说就算，不用 @ 也不用打 #
+            if await sticker_nl(
+                    appid, botdir, message,
+                    "p" + str(getattr(message.author, "user_openid", "")), text,
+                    mid=str(getattr(message, "id", "") or "")):
                 return
             try:
                 # 私聊的会话键用 p + 对方 openid（之前误用了群的 g + group_openid，
