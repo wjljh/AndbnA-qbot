@@ -375,6 +375,103 @@ def test_at_leak():
           [x for x in logs() if "总模型跳过" in x][:1])
 
 
+# ── 5 · 空正文 / 指令复述（真机 11-17 18:55）────────────────────
+#
+# 事故原文：模型只回了「最终回答。不错。不使用列表。纯中文口语」，19 字，
+# 群里当场吐槽「咋又把思考发出来了」。两条防线都在这里钉住：
+#   ① content 空 → 不发，绝不拿 reasoning_content 顶替正文；
+#   ② 出站清洗认得出「复述指令」，整条丢弃（只删片段会留下更怪的残句）。
+
+ECHO = "最终回答。不错。不使用列表。纯中文口语"
+
+
+def test_empty_and_echo():
+    print("[5] 空正文 / 指令复述")
+    reset()
+
+    # ① _extract_text：只认 content
+    check("5a content 空 + 有 reasoning_content → 返回空串（不回填思考）",
+          br._extract_text({"content": "", "reasoning_content": ECHO}) == "",
+          repr(br._extract_text({"content": "", "reasoning_content": ECHO})))
+    check("5b 日志：错误 · 模型返回空正文（已丢弃 reasoning_content，19 字）",
+          has("模型返回空正文（已丢弃 reasoning_content，19 字）"),
+          [x for x in logs() if "reasoning_content" in x][:1])
+    check("5c 纯空白 content 也算空正文",
+          br._extract_text({"content": "  \n\t ", "reasoning_content": "想了一会儿。"}) == "")
+    check("5d content 有正文 → 原样返回（前后空白照旧去掉）",
+          br._extract_text({"content": "  晚上好啊。  "}) == "晚上好啊。")
+
+    # ② 端到端：模型什么都不给 → 一条都不发，并记下不发的原因
+    reset()
+    write_llm()
+    br._base_dir = BASE
+    br._call_llm_sync = fake_llm
+    MODEL["out"] = ""
+    out = asyncio.run(REAL_REPLY("botA", botdir("botA"), "g" + GID, "小明", "在吗"))
+    check("5e 空正文 → _reply 返回空串（不再兜「（模型没返回内容）」）", out == "", out)
+    check("5f 日志：本条不发：模型返回空正文", has("本条不发：模型返回空正文"),
+          [x for x in logs() if "本条不发" in x][:1])
+    reset()
+    write_llm()
+    br._base_dir = BASE
+    br._call_llm_sync = fake_llm
+    MODEL["out"] = ""
+    run("botA", human(51, "在吗"))
+    check("5g 空正文 → 群里一条都不发", len(API.sent) == 0, API.sent)
+
+    # ③ 指令复述 → 整条丢弃
+    reset()
+    write_llm()
+    br._base_dir = BASE
+    br._call_llm_sync = fake_llm
+    MODEL["out"] = ECHO
+    out = asyncio.run(REAL_REPLY("botA", botdir("botA"), "g" + GID, "小明", "在吗"))
+    check("5h 真机那条复述 → 洗成空串", out == "", out)
+    check("5i 日志：出站清洗：疑似复述指令，已丢弃（前 30 字：…）",
+          has("出站清洗：疑似复述指令，已丢弃（前 30 字：" + ECHO),
+          [x for x in logs() if "疑似复述" in x][:1])
+    reset()
+    write_llm()
+    br._base_dir = BASE
+    br._call_llm_sync = fake_llm
+    MODEL["out"] = ECHO
+    run("botA", human(52, "在吗"))
+    check("5j 复述 → 群里一条都不发", len(API.sent) == 0, API.sent)
+
+    # ④ 负例：正常台词不许误杀
+    okay = "卡二——是卡在第二屏还是第二个循环？先把日志最后几行发我"
+    check("5k 正常回复原样通过", br.sanitize_reply(okay) == okay, br.sanitize_reply(okay))
+    long_line = ("不是说了不使用列表嘛，你上次交代过的这种排面我一直记着，"
+                 "今天就照你的意思慢慢讲，别的先不管。")
+    check("5l 含「不使用列表」但 >40 字且带标点 → 不丢（不误伤正常复述规则）",
+          len(long_line) > 40 and br.sanitize_reply(long_line) == long_line,
+          (len(long_line), br.sanitize_reply(long_line)))
+    check("5m 台词里的「练口语」不误杀",
+          br.sanitize_reply("练口语的事明天再说吧。") == "练口语的事明天再说吧。")
+
+    # ⑤ 源头：硬约束收拢到规则段，并在其后禁止复述
+    rules = br._CHAT_RULES
+    check("5n 规则段收尾就是那句禁止复述的话", rules.rstrip().endswith(br._NO_ECHO),
+          rules.splitlines()[-1])
+    check("5o 篇幅 / 格式硬约束都在规则段里",
+          "1~3 句" in rules and "不要过长" in rules and "不用列表" in rules)
+    seen = {}
+
+    def cap_llm(conf, messages, max_tokens=400, temperature=0.9):
+        seen["p"] = messages[0]["content"]
+        return "这个我是真不清楚诶。"
+
+    br._call_llm_sync = cap_llm
+    prompts = [br._search_answer_prompt(botdir("botA"), [], "今天几点"),
+               br._fetch_style_prompt(botdir("botA"), "网页正文")]
+    check("5p 联网合成 / #读 的提示词也带这句",
+          all(br._NO_ECHO in p for p in prompts))
+    asyncio.run(br._no_result_reply("botA", botdir("botA"), "今天几点",
+                                   br._llm_conf(BASE)))
+    check("5q 没查到的说辞提示词也带这句", br._NO_ECHO in seen.get("p", ""),
+          seen.get("p", "")[:30])
+
+
 def main():
     os.makedirs(BASE, exist_ok=True)
     br._base_dir = BASE
@@ -393,6 +490,7 @@ def main():
     test_sanitize()
     test_candidates()
     test_at_leak()
+    test_empty_and_echo()
 
     shutil.rmtree(TMP, ignore_errors=True)
     bad = [r for r in RESULTS if not r[1]]

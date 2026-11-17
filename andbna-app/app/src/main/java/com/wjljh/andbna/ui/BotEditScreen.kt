@@ -1,6 +1,7 @@
 package com.wjljh.andbna.ui
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -16,6 +17,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -34,6 +36,7 @@ import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.ui.Alignment
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.TextStyle
@@ -47,6 +50,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wjljh.andbna.ModelCatalog
 import com.wjljh.andbna.local.BotHost
+import com.wjljh.andbna.local.GroupAdmin
 import com.wjljh.andbna.local.BotRestarts
 import com.wjljh.andbna.local.BotStore
 import com.wjljh.andbna.local.BotStore.groupAutochatOverride
@@ -127,6 +131,16 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     var sub by remember(appid) { mutableStateOf("") }   // "" = 本页 / "groups" / "stickers"
     /** 表情库张数（右侧「N 张 / 未添加」）：只在 IO 里读 library.json */
     var stickerCount by remember(appid) { mutableStateOf(0) }
+    /** 已经配过群管理规则的群数量（「群管理」卡右侧「N 个群已配置」） */
+    var adminCount by remember(appid) { mutableStateOf(0) }
+    // 进群欢迎（<botdir>/group_admin/_default.json 的 welcome：开关 / @ 新成员 / 欢迎语）
+    var welcomeOn by remember(appid) { mutableStateOf(false) }
+    var welcomeAt by remember(appid) { mutableStateOf(true) }
+    var welcomeText by remember(appid) { mutableStateOf("") }
+    /** 内置人格：欢迎语由人格定死（界面只读、落盘用内置那句），自定义人格才给输入框 */
+    var welcomeBuiltin by remember(appid) { mutableStateOf(false) }
+    /** 人格名（去掉「自定义：」前缀与 -完整/-精华/-精简 后缀）：内置欢迎语按它查表 */
+    var welcomeName by remember(appid) { mutableStateOf("") }
     // 组合期一律不读盘、不读 prefs：bot 详情 / 模型三件套 / 人格清单 / 定时表 / openid 全在下面的
     // LaunchedEffect 里按 IO 读回来再填状态（这几行以前都是 remember { ... } 里同步读文件）。
     var bot by remember(appid) { mutableStateOf<LocalBot?>(null) }
@@ -267,6 +281,18 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
 
         // ④ 表情库张数：<botdir>/stickers/library.json（卡片右侧「N 张 / 未添加」）
         stickerCount = withContext(Dispatchers.IO) { StickerStore.load(ctx, appid).size }
+
+        // ⑤ 群管理：已配规则的群数量 + 进群欢迎（bot 级默认，<botdir>/group_admin/_default.json）
+        adminCount = withContext(Dispatchers.IO) { GroupAdmin.configured(ctx, appid).size }
+        val welcome = withContext(Dispatchers.IO) { GroupAdmin.defaultWelcome(ctx, appid) }
+        welcomeOn = welcome.enabled
+        welcomeAt = welcome.at
+        welcomeText = welcome.text
+        // 内置人格 → 欢迎语锁死；判定口径与 Python 侧 _greet_preset 一致（先看 persona_meta.json）
+        welcomeBuiltin = withContext(Dispatchers.IO) {
+            builtinPersona(ctx, appid, loaded?.persona.orEmpty())
+        }
+        welcomeName = presetPersonaName(loaded?.persona.orEmpty())
     }
 
     // 老的 tasks.json「定时任务」已下线：编辑页不再读写它，运行侧也不再执行（见 bot_runner._sched_loop）
@@ -343,6 +369,19 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                     WordsStore.saveBotSlots(ctx, appid, normalized.map { it.toWordsSlot() })
                 }
                 if (!okSlots) wordsErr = "时段没写进 greetings.json"
+                // 进群欢迎：写 <botdir>/group_admin/_default.json 的 welcome（已配规则的群同步一份）
+                val welcomeErr = GroupAdmin.saveWelcome(
+                    ctx,
+                    appid,
+                    GroupAdmin.Welcome(
+                        welcomeOn,
+                        welcomeAt,
+                        (if (welcomeBuiltin) builtinWelcome(welcomeName) else welcomeText).trim(),
+                    ),
+                )
+                if (welcomeErr != null && wordsErr.isBlank()) {
+                    wordsErr = "进群欢迎没写进 group_admin/_default.json"
+                }
                 // 运行时只在启动时建调度循环、配置是每轮现读的，所以改动要重连一次才生效；
                 // 但只有「值确实变了」才重连（人格 / 称呼 / 问候 / 模型三件套 / 启用 / 名字都算）。
                 val slotChanged = normalized != slotsBaseline
@@ -591,6 +630,48 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                     thickness = PanelTokens.Divider,
                     color = PanelColors.dividerLine,
                 )
+                // 进群欢迎：写 <botdir>/group_admin/_default.json 的 welcome（契约与群管理规则页同一份）
+                BotFormSwitchRow(
+                    title = "进群欢迎",
+                    summary = "有人进群时 @ 他并说一句欢迎语",
+                    checked = welcomeOn,
+                    onCheckedChange = { welcomeOn = it },
+                )
+                Text(
+                    text = "需要先在 QQ 开放平台为该机器人开通「群成员事件」，否则收不到进群通知",
+                    fontSize = 13.sp,
+                    color = PanelColors.onSurfaceVariantSummary,
+                    modifier = Modifier.padding(start = 4.dp, top = 6.dp),
+                )
+                Spacer(Modifier.height(12.dp))
+                BotFormSwitchRow(
+                    title = "@ 新成员",
+                    summary = if (welcomeAt) "欢迎语前面带一个 @ 新成员（他一定会收到提醒）" else "不 @，只发一句欢迎语",
+                    checked = welcomeAt,
+                    onCheckedChange = { welcomeAt = it },
+                )
+                if (welcomeBuiltin) {
+                    // 内置人格：文案由人格定死（与 Python 侧预设一致），输入框置灰只读
+                    ReadOnlyWelcomeField(
+                        value = builtinWelcome(welcomeName),
+                        hint = "内置人格使用固定欢迎语，不能修改",
+                    )
+                } else {
+                    BotFormField(
+                        label = "欢迎语",
+                        value = welcomeText,
+                        onValueChange = { welcomeText = it },
+                        hint = "例如：欢迎～有不懂的随时问",
+                        singleLine = false,
+                        minLines = 2,
+                        modifier = Modifier.padding(top = 8.dp),
+                    )
+                }
+                HorizontalDivider(
+                    modifier = Modifier.padding(vertical = 12.dp),
+                    thickness = PanelTokens.Divider,
+                    color = PanelColors.dividerLine,
+                )
                 Text(
                     text = if (preset) {
                         "内置人格：候选文本自带、不可修改；开始时刻、窗口分钟可以改，行首开关能关掉整个时段"
@@ -749,6 +830,45 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 )
             }
 
+            // ⑨′ 群管理：一行入口（右侧「N 个群已配置」），点开二级页挑群设规则
+            //     （<botdir>/group_admin/<openid>.json；没配过的群完全不管）
+            PanelGroupCard {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = PanelMetrics.RowMinHeight)
+                        .modeClickable(onClick = { sub = "admin" }),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            text = "群管理",
+                            fontSize = PanelMetrics.BodySize,
+                            color = PanelColors.onSurface,
+                        )
+                        Text(
+                            text = "关键词判定 / 惩罚阶梯 / 撤回与警告；点开挑群",
+                            fontSize = PanelMetrics.ValueSize,
+                            color = PanelColors.onSurfaceVariantSummary,
+                        )
+                    }
+                    Text(
+                        text = adminCount.toString() + " 个群已配置",
+                        fontSize = PanelMetrics.ValueSize,
+                        color = if (adminCount > 0) PanelColors.primary
+                        else PanelColors.onSurfaceVariantSummary,
+                    )
+                    Spacer(Modifier.width(PanelMetrics.ButtonGap))
+                    Icon(
+                        imageVector = PanelIcons.ChevronForward,
+                        contentDescription = null,
+                        tint = PanelColors.onSurfaceVariantSummary,
+                        modifier = Modifier.size(PanelMetrics.RowIconSize),
+                    )
+                }
+            }
+            Spacer(Modifier.height(PanelTokens.CardSpacing))
+
             // ⑨ 模型：继承开关 / 接口地址 / API Key / 模型下拉（与「添加 bot」页同一份共享组件）
             BotFormModelSection(
                 inherit = inherit,
@@ -783,6 +903,20 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     ) { route ->
         if (route == "groups") {
             GroupConfigScreen(metrics = metrics, appid = appid, onBack = { sub = "" })
+        } else if (route == "admin") {
+            GroupAdminScreen(
+                metrics = metrics,
+                appid = appid,
+                onBack = {
+                    sub = ""
+                    // 回来时重算「N 个群已配置」：刚配过的群现在算数了
+                    scope.launch {
+                        adminCount = withContext(Dispatchers.IO) {
+                            GroupAdmin.configured(ctx, appid).size
+                        }
+                    }
+                },
+            )
         } else if (route == "stickers") {
             StickerLibraryScreen(
                 metrics = metrics,
@@ -860,6 +994,77 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
         onDismiss = { showDelayDialog = false },
     )
 }
+
+/**
+ * 只读的欢迎语展示框（内置人格用）：与输入框同尺寸、同圆角，但底色压灰、文字淡一档 ——
+ * 一眼看出「这段是人格自带的，改不了」，而不是给个能点却打不进字的空输入框。
+ */
+@Composable
+private fun ReadOnlyWelcomeField(value: String, hint: String) {
+    Column(Modifier.padding(top = 8.dp, bottom = 6.dp)) {
+        Text(
+            text = "欢迎语",
+            fontSize = 13.sp,
+            fontWeight = FontWeight(550),
+            color = PanelColors.onSurfaceVariantSummary,
+            modifier = Modifier.padding(start = 4.dp, bottom = 6.dp),
+        )
+        Text(
+            text = value,
+            fontSize = PanelTokens.ButtonTextSize,
+            color = PanelColors.onSurface.copy(alpha = 0.55f),
+            modifier = Modifier
+                .fillMaxWidth()
+                .clip(RoundedCornerShape(PanelTokens.CardRadius))
+                .background(PanelColors.surfaceContainerHigh)
+                .padding(PanelMetrics.NoticeInside),
+        )
+        Text(
+            text = hint,
+            fontSize = 13.sp,
+            color = PanelColors.onSurfaceVariantSummary,
+            modifier = Modifier.padding(start = 4.dp, top = 6.dp),
+        )
+    }
+}
+
+/**
+ * 这个 bot 是不是内置人格：优先 <botdir>/persona_meta.json 的 builtin（与 Python 侧
+ * _greet_preset 同一口径，名字撞上不算内置），没有该文件时按 persona_name.txt 是否带
+ * 「自定义：」前缀判断 —— 与 Python 侧的回退完全一致。
+ */
+private fun builtinPersona(ctx: android.content.Context, appid: String, persona: String): Boolean {
+    val dir = java.io.File(BotHost.dataDir(ctx), appid)
+    val meta = java.io.File(dir, PersonaAssets.META)
+    if (meta.isFile) {
+        val o = runCatching { JSONObject(meta.readText(Charsets.UTF_8)) }.getOrNull()
+        if (o != null && o.has("builtin")) return o.optBoolean("builtin", false)
+    }
+    val raw = runCatching { java.io.File(dir, "persona_name.txt").readText(Charsets.UTF_8) }
+        .getOrNull().orEmpty().trim()
+    if (raw.isNotBlank()) return !raw.startsWith(PersonaAssets.CUSTOM_PREFIX)
+    return PersonaAssets.isBuiltinName(ctx, persona)
+}
+
+/**
+ * 内置人格的固定欢迎语（按人格名查表，名字已去档位后缀）。
+ *
+ * 只用于界面展示与落盘：真正发送以 Python 侧为准 —— 这两份文案必须一致，
+ * 所以改的时候两边一起改（Python 侧是「进群欢迎」的预设表）。
+ */
+private fun builtinWelcome(name: String): String =
+    BUILTIN_WELCOMES[name.trim()] ?: BUILTIN_WELCOME_FALLBACK
+
+private val BUILTIN_WELCOMES = mapOf(
+    "奥黛塔" to "（抖了抖耳朵）来啦？这里不缺人，缺的是能好好说话的人。",
+    "哥伦比娅" to "（抬眼看了你一下）新来的？坐吧，月亮不管你是谁，我也一样。",
+    "桑多涅" to "（冷冷扫了一眼）进来就安静点，规矩比人多。",
+    "沃雅妮莎" to "（笑盈盈）欢迎呀，第一次来别紧张，慢慢就熟了。",
+    "鲸鱼娘" to "（尾鳍轻轻摆）来啦来啦，先找个位置坐，别客气。",
+    "猫娘" to "（耳朵一竖）喵？新面孔，先报个名字吧。",
+)
+
+private const val BUILTIN_WELCOME_FALLBACK = "（抬眼）来了？随便坐，别拘束。"
 
 /** bot_runner.ids_for() 的结果（只用 owner + groups）。 */
 private data class Ids(val owner: String, val groups: List<String>)

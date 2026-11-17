@@ -299,6 +299,7 @@ def test_at_fail_closed():
 
     # 没有 @ 的正常闲聊 → 总模型照常
     setup_two(autochat=True)
+    MODEL["out"] = "今天天气是不错。"   # 空正文现在不发（不再兜「（模型没返回内容）」）
     GATE["ret"] = json.dumps({"action": "reply", "bot": "桑多涅", "why": "该她接"})
     run("botA", human(3, "今天天气不错", mentions=[]))
     check("2d 正文没有 @ → 正常走总模型并回一条",
@@ -394,6 +395,7 @@ def test_msgseq():
 
     # 端到端：真机那条「回复（模型…）→ 回群失败」的路（_group_send 只发一次）
     setup_two(autochat=True, gate=False)
+    MODEL["out"] = "在呢。"             # 同上：正文不能摸空
     api2 = FakeApi(fails=1)
     msg = FakeMsg("m_e2e", "在吗", FakeAuthor("user_oid_e2e", bot=False), api=api2)
     run("botA", msg)

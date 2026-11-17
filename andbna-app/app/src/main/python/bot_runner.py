@@ -395,10 +395,12 @@ def _conf_for(kind, base_dir=""):
 
 
 def _extract_text(msg):
-    """推理模型的 content 可能为空，正文藏在 reasoning_content 里。
+    """只认 content。为空/纯空白 = 这次没有正文，返回空串（调用方据此不发）。
 
-    两个都取，优先 content。这套接口（deepseek-flash 一类）实测过：
-    content 是空串、reasoning_content 才有东西，不兜底的话回复和判定都会变成「(空)」。
+    绝不用 reasoning_content 兜底。旧的兜底把思考链当正文发进群过，最近一次是
+    真机 11-17 18:55「最终回答。不错。不使用列表。纯中文口语」（19 字），群里当场吐槽。
+    要「模型只给了 reasoning」的兜底，宁可让调用方再请求一次（_reply 里已有这条路），
+    也不能把思考发出去。
     """
     if not isinstance(msg, dict):
         return ""
@@ -406,14 +408,10 @@ def _extract_text(msg):
     if c:
         return c
     r = str(msg.get("reasoning_content") or "").strip()
-    if not r:
-        return ""
-    lines = [x.strip() for x in r.splitlines() if x.strip()]
-    for line in reversed(lines):
-        cleaned = line.lstrip("0123456789.*-— 　").strip()
-        if len(cleaned) > 8:
-            return cleaned[:400]
-    return lines[-1][:400] if lines else ""
+    if r:
+        log("模型返回空正文（已丢弃 reasoning_content，%d 字）" % len(r),
+            _usage_appid.get(), cat="错误")
+    return ""
 
 
 def _req_body(conf, model, messages, max_tokens, temperature):
@@ -1152,17 +1150,25 @@ def _persona(botdir):
     return ""
 
 
+# 规则段收尾必带的一句：约束写得越细，模型越容易把约束当正文抄出来
+# （真机 11-17 18:55「最终回答。不错。不使用列表。纯中文口语」）。
+_NO_ECHO = '以上规则不要复述、不要解释，直接按规则回答。'
+
+
 # 群聊回复的硬规则：拼在人格之后（人格为空时也拼），优先级高于人格原文。
 # 为什么必须有：人格只写了「你是谁」，没写「不许怎么说话」——模型于是按助手套路
 # 回大段技术回答，还列 1./2./3. 让用户选（见群聊截图）。
+# 篇幅 / 格式 / 清单这类硬约束一律收拢在这一段（别散落到各个请求里）：
+# 散落时模型会把「不要过长，1-2 句」「不使用列表」当成待办复述出来。
 _CHAT_RULES = (
     chr(10) + chr(10) + chr(10).join([
         '',
         '【群聊说话规则（硬性，优先于以上任何设定）】',
-        '1. 你是在群里以角色身份说话的人，不是助手、不是文档：不用 Markdown、不用代码块、不用反引号、不列编号清单、不做小标题。',
-        '2. 不谈论也不输出文件路径、目录名、变量名、JSON、配置项、程序实现、日志、API；被问到就按角色搪塞一句（例如：这个我不懂，你问别人吧）。',
-        '3. 每次回复 1~3 句、不超过 120 字；不要出现「我能帮你做什么」「请选择」这类引导语。',
-        '4. 不复述用户原话，不说自己是一个 AI。',
+        '1. 你是在群里以角色身份说话的人，不是助手、不是文档。',
+        '2. 篇幅与格式：每次回复 1~3 句、不要过长、不超过 120 字；不用 Markdown、不用代码块、不用反引号、不用列表、不列编号清单、不做小标题。',
+        '3. 不谈论也不输出文件路径、目录名、变量名、JSON、配置项、程序实现、日志、API；被问到就按角色搪塞一句（例如：这个我不懂，你问别人吧）。',
+        '4. 不复述用户原话，不说自己是一个 AI，不要出现「我能帮你做什么」「请选择」这类引导语。',
+        _NO_ECHO,
     ])
 )
 
@@ -3080,6 +3086,29 @@ _TOOL_PREFIX_RE = re.compile(
     re.I | re.M)
 _THINK_WORDS = ("思考", "分析", "推理", "thinking", "analysis", "reasoning")
 
+# ⑤ 元话语复述：整条是「我们自己的提示词」被抄出来（真机 11-17 18:55 那条 19 字回复
+#    「最终回答。不错。不使用列表。纯中文口语」——句句都是 _CHAT_RULES / 联网合成提示词
+#    里的约束，却一条都匹配不上上面的「思考：」「不要过长」模式，于是原样发进群）。
+# 判据 = 出现元话语词 + （整条没有对话标点 或 不足 40 字）。
+# 命中就**整条丢弃**：只删片段会留下「不错。」这种更莫名其妙的残句。
+# 「口语」单独出现可能是正常聊天（练口语），所以只认带语境的几种写法。
+_META_ECHO_WORDS = ("最终回答", "不使用列表", "不要用列表", "不用列表", "不列清单",
+                    "纯中文", "字数", "不要超过", "不要多于", "要求：", "要求:",
+                    "输出格式", "输出要求", "格式要求")
+_META_ECHO_CTX_RE = re.compile(r"(?:中文|说|用|讲)口语|口语(?:化|回答|风格)")
+_META_ECHO_PUNCT = "。！？…～"
+_META_ECHO_MIN = 40      # 40 字以上且带对话标点 → 当成真台词（见 tests 的负例）
+
+
+def _looks_meta_echo(text):
+    """整条像在复述我们自己的指令（而不是在跟人说话）？"""
+    t = str(text or "").strip()
+    if not t:
+        return False
+    if not any(w in t for w in _META_ECHO_WORDS) and not _META_ECHO_CTX_RE.search(t):
+        return False
+    return len(t) < _META_ECHO_MIN or not any(x in t for x in _META_ECHO_PUNCT)
+
 
 def _is_meta_sentence(one):
     """这句话是不是模型的「自言自语」（指令 / 内心独白）？"""
@@ -3096,6 +3125,10 @@ def sanitize_reply(text):
     """模型输出 → 只留能发进群的正文；洗不出正文就返回空串（= 本条不发）。"""
     s = str(text or "")
     if not s.strip():
+        return ""
+    if _looks_meta_echo(s):
+        log("出站清洗：疑似复述指令，已丢弃（前 30 字：%s）"
+            % " ".join(s.split())[:30], _usage_appid.get(), cat="错误")
         return ""
     last = None
     for m in _END_MARK_RE.finditer(s):
@@ -3596,10 +3629,11 @@ def _search_answer_prompt(botdir, hits, query, left=_SRCH_MAX):
         "- 资料没提到的别编；拿不准就说拿不准，或者直接说没查到\n"
         "- 如果资料跟问题根本对不上，就说没搜到靠谱的，不要硬凑\n"
         "%s\n"
+        "- %s\n"
         "- 回答完另起一行，只写「链接：N」—— N 是你引用最多、最相关的资料序号；"
         "都不相关就写「链接：0」\n"
     ) % (str(query or "")[:120], _style_persona(botdir), _hits_text(hits),
-         _search_more_rule(left))
+         _search_more_rule(left), _NO_ECHO)
 
 
 async def _search_answer_styled(appid, botdir, hits, query, conf, left=_SRCH_MAX):
@@ -3660,8 +3694,10 @@ async def _no_result_reply(appid, botdir, query, conf, rounds=1, hits=None):
         "【情况】你联网查了 %d 轮，还是没找到能回答这个问题的靠谱资料。%s"
         "【要求】用 1~2 句中文口语告诉对方你不清楚/没查到；"
         "如果有沾边的线索，一句话带过就行；不要编造任何事实、不要列清单、不要贴链接。\n"
+        "- %s\n"
     ) % (str(query or "")[:120], _style_persona(botdir), rounds,
-         ("查到过的沾边标题（仅供参考，别当成答案）：" + chr(10) + clues) if clues else "")
+         ("查到过的沾边标题（仅供参考，别当成答案）：" + chr(10) + clues) if clues else "",
+         _NO_ECHO)
     try:
         raw = await asyncio.to_thread(_call_llm_sync, sconf,
                                      [{"role": "user", "content": prompt}], 200, 0.8)
@@ -3683,10 +3719,11 @@ def _fetch_style_prompt(botdir, content):
         "【要求】\n"
         "- 用你自己的话把这篇讲了什么说出来，1~3 句中文口语，最多 %d 字\n"
         "- 像跟朋友转述刚看到的东西：不要「摘要如下」「本文介绍了」这种说明书腔\n"
-        "- 不要编号、不要分点、不要小标题、不要照搬原文长句、不要写链接\n\n"
+        "- 不要编号、不要分点、不要小标题、不要照搬原文长句、不要写链接\n"
+        "- %s\n\n"
         "【网页开头】\n%s\n"
     ) % (_style_persona(botdir), _FETCH_OUT_CHARS,
-         str(content or "")[:_FETCH_STYLE_CHARS])
+         _NO_ECHO, str(content or "")[:_FETCH_STYLE_CHARS])
 
 
 async def _fetch_reply_styled(appid, botdir, content, url, conf):
@@ -4495,7 +4532,7 @@ class _GroupMsg:
     __slots__ = ("id", "content", "group_openid", "author", "mentions", "_api", "raw")
 
     class _Author:
-        __slots__ = ("member_openid", "user_openid", "id", "bot")
+        __slots__ = ("member_openid", "user_openid", "id", "bot", "username")
 
     def __init__(self, api, payload):
         p = payload if isinstance(payload, dict) else {}
@@ -4513,6 +4550,16 @@ class _GroupMsg:
             if isinstance(_src, dict) and isinstance(_src.get("bot"), bool):
                 _bot = _src["bot"]
         au.bot = _bot
+        # 昵称：群管理按昵称做跨 bot 共享计数的键（author.username 是平台字段名，
+        # 个别版本叫 nickname / name，都认）
+        au.username = ""
+        for _src in (ai, a, (inner or {}).get("member"), d.get("member")):
+            if not isinstance(_src, dict):
+                continue
+            _v = _src.get("username") or _src.get("nickname") or _src.get("name")
+            if isinstance(_v, str) and _v.strip():
+                au.username = _v.strip()
+                break
         self.author = au
         self._api = api
         self.raw = p
@@ -6909,7 +6956,7 @@ async def _post_group(api, appid, gid, mid, content="", markdown=None):
         kw["content"] = content
         body_len = len(str(content or ""))
     try:
-        await api.post_group_message(**kw)
+        resp = await api.post_group_message(**kw)
     except Exception as e:
         if not _is_msgseq_dup(e):
             raise
@@ -6918,11 +6965,12 @@ async def _post_group(api, appid, gid, mid, content="", markdown=None):
             % (seq, new, (str(mid or "") or "无")[-8:]), appid, cat="回复")
         kw["msg_seq"] = new
         try:
-            await api.post_group_message(**kw)
+            resp = await api.post_group_message(**kw)
         except Exception as e2:
             log("发送失败（msgseq 冲突重试后仍失败）：%r" % e2, appid, cat="错误")
             return False
         seq = new
+    _gm_note_sent(appid, gid, _gm_resp_id(resp))
     shown = _snip((markdown or {}).get("content") if markdown is not None else content)
     log("发送：%s（msg_id=%s｜seq=%d｜%d 字）"
         % (shown, (str(mid or "") or "无")[-8:], seq, body_len), appid, cat="回复")
@@ -7083,6 +7131,1185 @@ async def _gated_turn(appid, botdir, message, gid, from_name, text, gconf, roste
 # ── 统一处理链路 ──────────────────────────────────────────
 
 
+
+def _make_intents(flags, appid=""):
+    """→ 开了群消息 + 群成员事件的 Intents；flags = botpy.Intents（单测传假的同名类）。
+
+    GROUP_MEMBER_EVENT = 1 << 24：public_messages 只覆盖 1<<25，不含群成员事件，
+    不补这一位网关就不会下发 GROUP_MEMBER_ADD → 成员进群欢迎收不到。
+    """
+    try:
+        intents = flags(public_guild_messages=True, public_messages=True)
+    except TypeError:
+        intents = flags(public_guild_messages=True)
+        log("当前 botpy 不支持 public_messages，只开频道事件", appid, cat="系统")
+    try:
+        intents.value |= _GM_MEMBER_INTENT
+    except Exception as e:
+        log("intents 补 GROUP_MEMBER_EVENT 失败：%r（成员进群事件可能收不到）" % e,
+            appid, cat="系统")
+    iv = _gm_intent_value(intents)
+    log("intents=0x%x（含 GROUP_MEMBER_EVENT=%s）"
+        % (iv, "是" if iv & _GM_MEMBER_INTENT else "否"), appid, cat="系统", lv="detail")
+    return intents
+
+
+# ── 群管理（2.1.0 · Python 侧）────────────────────────────────
+#
+# 违规检测 + 惩罚（撤回 / 阶梯禁言 / 踢出 / 警告）、管理命令（#撤回 / #禁言 / #解禁）、
+# 进群欢迎（GROUP_MEMBER_ADD 为主，「首次发言欢迎」兜底）。
+#
+# 跨 bot 的共享只能落在「群名 + 昵称」上：群 openid 与成员 openid 都是每 bot 一套
+# （见 _session_key 的注释）。所以计数文件按群名归并，键用昵称。
+#
+# botpy 17 的 BotAPI 没有这四个接口，所以直接用它的 HTTP 层（token / session 复用）：
+#   撤回   DELETE /v2/groups/{group_openid}/messages/{message_id}
+#   禁言   POST   /v2/groups/{group_openid}/restrict_chat_setting
+#   查状态 GET    /v2/groups/{group_openid}/restrict_chat_setting
+#   踢人   DELETE /v2/groups/{group_openid}/members/{member_openid}   ← 需真机确认
+# 平台在「没有群管理权限」时返回错误码：这里全部转成优雅降级，绝不抛给调用方。
+_GM_DIR = "group_admin"
+_GM_SHARED = "group_admin_shared"
+_GM_MEMBER_INTENT = 1 << 24       # Intents.GROUP_MEMBER_EVENT：GROUP_MEMBER_ADD 事件
+_GM_CTX = 6                       # 复核时喂给判定模型的上下文条数
+_GM_CLAIM_TTL = 8.0               # 跨 bot 认领记录的存活时间（与总模型共享记录一致）
+_GM_WELCOME_TTL = 300.0           # 同一 (群, 成员) 5 分钟内只欢迎一次（事件会重复下发）
+_GM_WELCOME_MAX = 1000            # welcomed.json 只留最近这么多条
+_GM_WELCOME_GENERIC = "（抬眼）来了？随便坐，别拘束。"
+_GM_WARN_FALLBACK = "这条内容涉及外挂/脚本，请不要在本群发布。"
+_GM_NO_PERM = "没有群管理权限"
+_GM_ZW = "\u200b\u200c\u200d\ufeff\u2060"     # 零宽字符：有人用它拆词绕关键词
+_GM_ADMIN_ROLES = ("owner", "admin", "administrator", "群主", "管理员")
+_GM_DEFAULT_STEP = {"n": 1, "mute_min": 10}
+_GM_REF_KEYS = ("message_id", "msg_id", "id")
+
+_gm_lock = threading.RLock()
+_gm_conf_cache = {}       # (path, stamp) -> 归一后的规则
+_gm_names = {}            # (botdir, gid) -> 群名
+_gm_claims = {}           # (正文哈希前16, 30 秒桶) -> {"owner","name","ts"}
+_gm_sent = {}             # appid -> {gid: 本 bot 刚发出的 msg_id}（#撤回 用）
+_gm_mem = {}              # 计数内存兜底（文件写不进去时）
+_gm_welcome_mem = {}      # (appid, gid, member) -> ts：事件的 5 分钟去重
+
+
+# ── 规则文件（Kotlin 侧写，这里只读）──────────────────────
+
+def _gm_conf_path(botdir, gid):
+    """<botdir>/group_admin/<gid>.json；gid 里有路径分隔符 → 空串（绝不拿它拼路径）。"""
+    gid = str(gid or "").strip()
+    if not gid or gid in (".", "..") or os.sep in gid or (os.altsep and os.altsep in gid):
+        return ""
+    return os.path.join(_bot_root(botdir), _GM_DIR, gid + ".json")
+
+
+def _gm_int(v, lo=0, hi=10 ** 6, default=0):
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return default
+    return max(lo, min(hi, n))
+
+
+def _gm_steps(raw):
+    """steps 归一：只留 n>0 且 mute_min>0 的项，按 n 排序；空 → 默认一档。"""
+    out = []
+    for e in raw if isinstance(raw, list) else []:
+        if not isinstance(e, dict):
+            continue
+        n = _gm_int(e.get("n"), 1, 10 ** 4, 0)
+        m = _gm_int(e.get("mute_min"), 0, 30 * 24 * 60, 0)
+        if n <= 0 or m <= 0:
+            continue
+        out.append({"n": n, "mute_min": m})
+    out.sort(key=lambda x: x["n"])
+    return out or [dict(_GM_DEFAULT_STEP)]
+
+
+def _gm_conf_of(raw, base_welcome=None):
+    """规则文件 → 归一后的 dict（坏字段一律退默认：运行中绝不因配置崩）。
+
+    base_welcome = <botdir>/group_admin/_default.json 里的 welcome：群文件没写 welcome 时用它
+    （界面的「问候 › 进群欢迎」是 bot 级默认，新群还没有规则文件时就靠它）。
+    """
+    raw = raw if isinstance(raw, dict) else {}
+    mode = str(raw.get("mode") or "keyword+model").strip().lower()
+    if mode not in ("keyword", "model", "keyword+model"):
+        mode = "keyword+model"
+    kws = [str(k).strip() for k in (raw.get("keywords") or []) if str(k).strip()]
+    w = raw.get("welcome") if isinstance(raw.get("welcome"), dict) else {}
+    bw = base_welcome if isinstance(base_welcome, dict) else {}
+
+    def _w(key, default):
+        """群文件里写了就用它，没写才吃 bot 级默认（与界面 welcome(obj, fallback) 一致）。"""
+        if key in w:
+            return w[key]
+        if key in bw:
+            return bw[key]
+        return default
+
+    return {
+        "enabled": bool(raw.get("enabled")),
+        "mode": mode,
+        "keywords": kws,
+        "steps": _gm_steps(raw.get("steps")),
+        "kick_at": _gm_int(raw.get("kick_at"), 0, 10 ** 4, 0),
+        "warn_enabled": bool(raw.get("warn_enabled", True)),
+        "recall_enabled": bool(raw.get("recall_enabled", True)),
+        "welcome": {"enabled": bool(_w("enabled", False)),
+                    "at": bool(_w("at", True)),
+                    "text": str(_w("text", "") or "")},
+    }
+
+
+def _gm_default_welcome(botdir):
+    """<botdir>/group_admin/_default.json 的 welcome（界面写的 bot 级进群欢迎）；没有 → None。"""
+    d = _load_json(os.path.join(_bot_root(botdir), _GM_DIR, "_default.json"), {})
+    w = d.get("welcome") if isinstance(d, dict) else None
+    return w if isinstance(w, dict) else None
+
+
+def group_admin_conf(botdir, gid):
+    """读 <botdir>/group_admin/<gid>.json → 归一后的 dict；缺失 / 坏 JSON → enabled=false。
+
+    全量 gid 找不到时再试前 8 位（与 _group_owner 的同一套兼容写法）。
+    群文件里没有 welcome → 用 _default.json 的 bot 级默认（欢迎语是 bot 级配置）。
+    """
+    base_welcome = _gm_default_welcome(botdir)
+    for name in (str(gid or "").strip(), str(gid or "").strip()[:8]):
+        path = _gm_conf_path(botdir, name)
+        if not path:
+            continue
+        stamp = _file_stamp(path)
+        if stamp is None:
+            continue
+        key = (path, stamp)
+        with _gm_lock:
+            hit = _gm_conf_cache.get(key)
+        if hit is not None:
+            return hit
+        conf = _gm_conf_of(_load_json(path, None), base_welcome)
+        with _gm_lock:
+            _gm_conf_cache[key] = conf
+        return conf
+    return _gm_conf_of(None, base_welcome)
+
+
+# ── 关键词初筛（归一化）─────────────────────────────
+
+def _gm_norm(text):
+    """关键词归一化：NFKC（全角→半角）+ 去 <@…> + 去空白/零宽 + 小写。"""
+    s = str(text or "")
+    try:
+        import unicodedata
+        s = unicodedata.normalize("NFKC", s)
+    except Exception:
+        pass
+    s = _norm_text(s)
+    for ch in _GM_ZW:
+        s = s.replace(ch, "")
+    return s
+
+
+def _gm_keyword_hit(text, keywords):
+    """→ 命中的关键词（配置里的**原样**，日志要照抄）；没命中 → ""。"""
+    norm = _gm_norm(text)
+    if not norm:
+        return ""
+    for kw in keywords or []:
+        k = _gm_norm(kw)
+        if k and k in norm:
+            return str(kw)
+    return ""
+
+
+# ── 判定模型复核 ────────────────────────────────
+
+def _gm_judge_prompt(hit, text, rows):
+    ctx = _ctx_text(rows) if rows else "（没有上下文）"
+    return ("群聊内容审核。" + chr(10) + "【命中词】%s" + chr(10) + "【这条正文】%s"
+            + chr(10) + "【最近上下文】" + chr(10) + "%s" + chr(10) + chr(10)
+            + "判断这条消息是不是在索取或传播外挂 / 脚本（求推荐、卖、教怎么用、发下载或链接"
+              "都算；单纯批评外挂、讨论怎么反外挂、有人被误伤都不算）。"
+            + chr(10) + "只答 yes 或 no，不要解释。") % (
+        hit or "（无）", str(text or "")[:400], ctx)
+
+
+def _gm_parse_yes(raw):
+    """模型的回答 → "yes" / "no" / ""（判不出按 no 处理，不误伤）。"""
+    s = str(raw or "").strip().lower()
+    if not s:
+        return ""
+    for tok in re.findall(r"[a-z]+|不是|不在|是|否", s):
+        if tok in ("yes", "是"):
+            return "yes"
+        if tok in ("no", "not", "否", "不是", "不在"):
+            return "no"
+    return ""
+
+
+async def _gm_model_ask(appid, botdir, gid, hit, text):
+    """复核一次（判定模型）→ ("yes"/"no"/"", 原始输出)；单测直接替换这个函数。"""
+    conf = _conf_for("judge") or _llm_conf(_base_dir)
+    if not conf:
+        log("群管理：没有判定模型配置 → 按未违规处理（不误伤）", appid, cat="系统")
+        return "", ""
+    rows = _ctx_rows(appid, gid, drop_last=True)[-_GM_CTX:]
+    prompt = _gm_judge_prompt(hit, text, rows)
+    try:
+        raw = await asyncio.to_thread(
+            _call_llm_sync, conf, [{"role": "user", "content": prompt}], 60, 0.0)
+    except Exception as e:
+        log("群管理：判定模型调用失败 %r → 按未违规处理" % e, appid, cat="错误")
+        return "", ""
+    return _gm_parse_yes(raw), raw
+
+
+# ── 群名 → 共享目录（跨 bot 计数的唯一共享面）─────────────
+
+def _gm_name_cached(botdir, gid):
+    """<botdir>/group_names.json（界面侧 7 天缓存）里的群名；没有 → ""。"""
+    d = _load_json(os.path.join(_bot_root(botdir), "group_names.json"), {})
+    e = d.get(str(gid or "").strip()) if isinstance(d, dict) else None
+    if isinstance(e, dict):
+        return str(e.get("name") or "").strip()
+    return ""
+
+
+def _gm_slug(name):
+    """群名 → 目录名：保留中日韩英文数字，其余压成 _；空名 → ""（调用方退回 bot 内计数）。"""
+    s = _gm_norm(name)
+    out = "".join(ch if (ch.isalnum() or ch in "-_") else "_" for ch in s)
+    return re.sub(r"_+", "_", out).strip("_")[:60]
+
+
+def _gm_base(botdir):
+    """<filesDir>：botdir 是 <filesDir>/<appid>；拿不到就退回 _base_dir。"""
+    base, _appid = _bot_of_dir(botdir)
+    return base or _base_dir or _bot_root(botdir)
+
+
+def _gm_vpath(base, gname):
+    """<filesDir>/group_admin_shared/<群名 slug>/violations.json；群名空 → ""。"""
+    slug = _gm_slug(gname)
+    if not slug:
+        return ""
+    return os.path.join(str(base or ""), _GM_SHARED, slug, "violations.json")
+
+
+async def _gm_group_name(botdir, gid, api=None, appid=""):
+    """群名：进程内缓存 → group_names.json → 官方 GET /v2/groups/{gid}/info。
+
+    group_info() 走 urllib + app secret，运行期手里只有本 bot 自己的 token，
+    所以这里用同一个官方接口、同一条 HTTP 通道；拿不到 → ""（调用方退回 bot 内计数）。
+    """
+    gid = str(gid or "").strip()
+    key = (os.path.abspath(str(botdir or "")), gid)
+    with _gm_lock:
+        hit = _gm_names.get(key)
+    if hit:
+        return hit
+    name = _gm_name_cached(botdir, gid)
+    if not name and gid and api is not None:
+        ok, data, _why = await _gm_call(api, "GET", "/v2/groups/{group_openid}/info",
+                                        group_openid=gid)
+        if ok and isinstance(data, dict):
+            name = str(data.get("group_name") or "").strip()
+        if not name:
+            log("群管理：群名取不到（缓存没有 + info 接口%s）→ 共享计数按 bot 内独立计"
+                % ("失败：" + str(data)[:80] if not ok else "没给 group_name"), appid, cat="系统")
+    if name:
+        with _gm_lock:
+            _gm_names[key] = name
+    return name
+
+
+# ── 违规计数（跨 bot 共享 / bot 内独立）──────────────────
+
+def _gm_users(path):
+    d = _load_json(path, {}) if path else {}
+    users = d.get("users") if isinstance(d, dict) else None
+    return dict(users) if isinstance(users, dict) else {}
+
+
+def _gm_bump_mem(tag, key, appid, now=None):
+    """文件写不进去（或没有路径）时的内存兜底：同一进程里仍然能算阶梯。"""
+    now = time.time() if now is None else now
+    with _gm_lock:
+        rec = _gm_mem.setdefault((tag, key), {"count": 0, "last_at": 0,
+                                             "bots": [], "names": []})
+        rec["count"] += 1
+        rec["last_at"] = int(now)
+        if str(appid) and str(appid) not in rec["bots"]:
+            rec["bots"] = (rec["bots"] + [str(appid)])[-8:]
+        if key not in rec["names"]:
+            rec["names"] = (rec["names"] + [key])[-8:]
+        return rec["count"], dict(rec)
+
+
+def _gm_bump(path, tag, key, appid, now=None):
+    """读-改-写一次计数文件 → (次数, 记录)；写不进去 → 内存兜底，绝不抛。"""
+    if not path:
+        return _gm_bump_mem(tag, key, appid, now)
+    now = time.time() if now is None else now
+    with _gm_lock:
+        d = _load_json(path, {})
+        d = d if isinstance(d, dict) else {}
+        users = d.get("users") if isinstance(d.get("users"), dict) else {}
+        rec = dict(users.get(key) or {})
+        rec["count"] = _gm_int(rec.get("count"), 0, 10 ** 6, 0) + 1
+        rec["last_at"] = int(now)
+        bots = [str(b) for b in (rec.get("bots") or []) if str(b).strip()]
+        if str(appid) not in bots:
+            bots.append(str(appid))
+        rec["bots"] = bots[-8:]
+        names = [str(n) for n in (rec.get("names") or []) if str(n).strip()]
+        if key not in names:
+            names.append(key)
+        rec["names"] = names[-8:]
+        users[key] = rec
+        d["users"] = users
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+        if not _save_json(path, d):
+            return _gm_bump_mem(tag, key, appid, now)
+        return rec["count"], rec
+
+
+def _gm_note_stats(botdir, gid, users, now=None):
+    """写 <botdir>/group_admin/_stats.json：{"<gid>": {"users": N, "hits": N}}。
+
+    界面（GroupAdmin.stats）只读这份：users = 该群计数文件里记过几个人，
+    hits = 本 bot 在这个群累计处置了几次（只增，不因重启清零）。
+    """
+    gid = str(gid or "")
+    if not gid:
+        return {}
+    path = os.path.join(_bot_root(botdir), _GM_DIR, "_stats.json")
+    with _gm_lock:
+        d = _load_json(path, {})
+        d = d if isinstance(d, dict) else {}
+        row = d.get(gid) if isinstance(d.get(gid), dict) else {}
+        out = {"users": max(0, int(users or 0)),
+               "hits": _gm_int(row.get("hits"), 0, 10 ** 9, 0) + 1}
+        d[gid] = out
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+        _save_json(path, d)
+        return out
+
+
+def _gm_count(path, key):
+    """只读次数（诊断 / 单测用）。"""
+    rec = _gm_users(path).get(str(key)) or {}
+    return _gm_int(rec.get("count"), 0, 10 ** 6, 0)
+
+
+# ── 跨 bot 认领（同一处违规只处置一次）──────────────────
+
+def _gm_claim(appid, name, text, now=None):
+    """违规处理权认领：沿用「正文哈希 + 30 秒桶」的跨 bot 共享键（与 gid 无关）。
+
+    → (该不该我执行, 先到的那个 bot 的名字)。先到的认领，后到的写「已由 X 处理」并且
+    连判定模型都不调 —— 撤回 / 禁言 / 警告因此只做一次。
+    单独一张表：总模型的共享记录 (_gate_rec) 要留给 _gate_decide 复用，不能混。
+    """
+    h16, bucket = _session_key(text, now)
+    now = time.time() if now is None else now
+    with _gm_lock:
+        for k in [k for k, r in _gm_claims.items() if now - r["ts"] > _GM_CLAIM_TTL]:
+            _gm_claims.pop(k, None)
+        for k in ((h16, bucket), (h16, bucket - 1)):
+            r = _gm_claims.get(k)
+            if r is not None:
+                return False, (str(r.get("name") or "") or "别的 bot")
+        _gm_claims[(h16, bucket)] = {"owner": str(appid), "name": str(name or ""), "ts": now}
+    return True, ""
+
+
+# ── 阶梯时长 / 踢出阈值 ──────────────────────────
+
+def _gm_mute_minutes(n, steps):
+    """第 n 次违规 → 禁言几分钟：取「n 不超过的最大档」；比第一档还小 → 第一档。"""
+    steps = _gm_steps(steps)
+    pick = steps[0]
+    for s in steps:
+        if s["n"] <= int(n or 0):
+            pick = s
+    return int(pick["mute_min"])
+
+
+def _gm_longest_minutes(steps):
+    return max([s["mute_min"] for s in _gm_steps(steps)])
+
+
+# ── 官方接口（走 botpy 的 HTTP 层：同一个 token / session）─────────
+
+class _GmRoute(object):
+    """botpy.http.Route 的替身：桌面单测里没有 botpy，用它拼同一份 (method, path, params)。"""
+
+    __slots__ = ("method", "path", "parameters")
+
+    def __init__(self, method, path, **params):
+        self.method = method
+        self.path = path
+        self.parameters = params
+
+    @property
+    def url(self):
+        return self.path.format_map(self.parameters) if self.parameters else self.path
+
+    def __repr__(self):
+        return "%s %s" % (self.method, self.url)
+
+
+def _gm_route(method, path, **params):
+    try:
+        from botpy.http import Route
+        return Route(method, path, **params)
+    except Exception:
+        return _GmRoute(method, path, **params)
+
+
+def _gm_why(e):
+    """异常 → 一行人话（botpy 的错误类名 + message）。"""
+    name = type(e).__name__
+    msg = ""
+    for attr in ("msgs", "message"):
+        v = getattr(e, attr, None)
+        if isinstance(v, str) and v.strip():
+            msg = v.strip()
+            break
+    if not msg:
+        try:
+            msg = str(e)
+        except Exception:
+            msg = ""
+    return ("%s: %s" % (name, msg[:160])) if msg else name
+
+
+_GM_DENIED_KINDS = ("ForbiddenError", "AuthenticationFailedError", "MethodNotAllowedError")
+_GM_DENIED_WORDS = ("权限", "forbidden", "not allowed", "unauthorized", "no permission",
+                    "群管理", "管理员")
+
+
+def _gm_denied(why):
+    """这个失败算不算「没有群管理权限」（平台拒绝 / token 失效 / 明说要权限）。"""
+    s = str(why or "")
+    if any(k in s for k in _GM_DENIED_KINDS):
+        return True
+    low = s.lower()
+    return any(w in low for w in _GM_DENIED_WORDS)
+
+
+async def _gm_call(api, method, path, body=None, **params):
+    """调一个官方群管理接口 → (成功?, 返回体或错误人话, 是不是没有权限)。
+
+    botpy 的 BotAPI 没有这几个接口，所以直接用它的 HTTP 层；参数名与官方文档一致，
+    将来 botpy 原生支持了只改这里一处。没有 api（单测 / 半启动）→ 一律优雅失败。
+    """
+    http = getattr(api, "_http", None) if api is not None else None
+    if http is None or not hasattr(http, "request"):
+        return False, "没有可用的 api 对象", False
+    kw = {"json": body} if body is not None else {}
+    try:
+        data = await http.request(_gm_route(method, path, **params), **kw)
+    except Exception as e:
+        why = _gm_why(e)
+        return False, why, _gm_denied(why)
+    return True, data, False
+
+
+async def _gm_recall(api, appid, gid, mid):
+    """撤回群消息 → 成功?（失败只记日志：绝不影响后面的禁言 / 警告）。"""
+    if not (str(gid or "") and str(mid or "")):
+        log("群管理：撤回缺少 group_openid / message_id → 跳过", appid, cat="错误")
+        return False
+    ok, data, denied = await _gm_call(
+        api, "DELETE", "/v2/groups/{group_openid}/messages/{message_id}",
+        group_openid=str(gid), message_id=str(mid))
+    if ok:
+        return True
+    log("群管理：撤回失败（%s）%s" % (data, "｜没有群管理权限 → 继续后面几步" if denied else ""),
+        appid, cat="错误")
+    return False
+
+
+def _gm_restrict_body(member_oid, minutes, now=None):
+    """禁言 / 解禁的请求体：minutes > 0 → op=add + mute_expire_at；<= 0 → op=del。"""
+    now = time.time() if now is None else now
+    m = int(minutes or 0)
+    if m > 0:
+        return {"members": [{"op": "add", "member_openid": str(member_oid),
+                             "mute_expire_at": int(now) + m * 60}]}
+    return {"members": [{"op": "del", "member_openid": str(member_oid)}]}
+
+
+async def _gm_mute(api, appid, gid, member_oid, minutes, now=None):
+    """禁言 / 解禁（minutes<=0 = 解禁）→ 成功?。"""
+    if not (str(gid or "") and str(member_oid or "")):
+        log("群管理：禁言缺少 group_openid / member_openid → 跳过", appid, cat="错误")
+        return False
+    ok, data, denied = await _gm_call(
+        api, "POST", "/v2/groups/{group_openid}/restrict_chat_setting",
+        body=_gm_restrict_body(member_oid, minutes, now), group_openid=str(gid))
+    if ok:
+        return True
+    log("群管理：%s失败（%s）%s"
+        % ("禁言" if int(minutes or 0) > 0 else "解禁", data,
+           "｜没有群管理权限 → 已优雅降级" if denied else ""), appid, cat="错误")
+    return False
+
+
+async def _gm_restrict_state(api, appid, gid):
+    """查询群禁言状态 → (成功?, 返回体)。"""
+    ok, data, denied = await _gm_call(
+        api, "GET", "/v2/groups/{group_openid}/restrict_chat_setting",
+        group_openid=str(gid))
+    if not ok:
+        log("群管理：查询禁言状态失败（%s）%s" % (data, "｜没有群管理权限" if denied else ""),
+            appid, cat="错误")
+    return ok, data
+
+
+async def _gm_kick(api, appid, gid, member_oid):
+    """踢出群成员 → 成功?（**需真机确认**：这条 DELETE 路径来自文档，尚未实测）。"""
+    if not (str(gid or "") and str(member_oid or "")):
+        log("群管理：踢出缺少 group_openid / member_openid → 跳过", appid, cat="错误")
+        return False
+    ok, data, denied = await _gm_call(
+        api, "DELETE", "/v2/groups/{group_openid}/members/{member_openid}",
+        group_openid=str(gid), member_openid=str(member_oid))
+    if ok:
+        return True
+    log("群管理：踢出失败（%s）%s"
+        % (data, "｜没有群管理权限 → 退化为最长时长禁言" if denied
+           else "｜接口可能不成立（需真机确认）→ 退化为最长时长禁言"), appid, cat="错误")
+    return False
+
+
+# ── 发消息（群管理自己的话不走模型）───────────────────
+
+def _gm_at_prefix(oid):
+    """群聊 markdown 的 @ 语法。"""
+    return '<qqbot-at-user id="%s"/> ' % str(oid or "")
+
+
+def _gm_resp_id(resp):
+    """发送接口的返回 -> 这条消息自己的 id（#撤回 用它撤回「本 bot 上一条」）。"""
+    if isinstance(resp, dict):
+        for k in ("id", "message_id", "msg_id"):
+            v = str(resp.get(k) or "").strip()
+            if v:
+                return v
+        return ""
+    for k in ("id", "message_id"):
+        v = getattr(resp, k, None)
+        if v:
+            return str(v).strip()
+    return ""
+
+
+def _gm_intent_value(intents):
+    """Intents 的位值；取不到 -> -1（日志里看得出来）。"""
+    try:
+        return int(intents.value)
+    except Exception:
+        return -1
+
+
+def _gm_note_sent(appid, gid, mid):
+    """记下本 bot 在这个群刚发出的消息 id：不带回复的 #撤回 撤的就是它。"""
+    mid = str(mid or "").strip()
+    if not mid:
+        return
+    with _gm_lock:
+        _gm_sent.setdefault(str(appid), {})[str(gid or "")] = mid
+
+
+def _gm_last_sent(appid, gid):
+    with _gm_lock:
+        return str((_gm_sent.get(str(appid)) or {}).get(str(gid or "")) or "")
+
+
+async def _gm_say(api, appid, gid, mid, content, at_oid=""):
+    """群管理回一句话：at_oid 有值 → markdown + qqbot-at-user；mid 为空 = 主动消息。"""
+    content = str(content or "").strip()
+    if not content:
+        return False
+    if api is None:
+        log("群管理：没有可用的 api 对象，这句发不出去（%s）" % _snip(content), appid, cat="错误")
+        return False
+    md = (_gm_at_prefix(at_oid) + content) if at_oid else ""
+    if not str(mid or ""):
+        kw = ({"group_openid": str(gid), "msg_type": 2, "markdown": {"content": md}}
+              if md else {"group_openid": str(gid), "msg_type": 0, "content": content})
+        try:
+            await api.post_group_message(**kw)
+        except Exception as e:
+            log("群管理：主动消息发送失败 %r" % e, appid, cat="错误")
+            return False
+        log("群管理：主动消息已发（群=%s｜%d 字）" % (str(gid or "")[:8], len(content)),
+            appid, cat="回复", lv="detail")
+        return True
+    try:
+        if md:
+            ok = await _post_group(api, appid, str(gid), str(mid), markdown={"content": md})
+        else:
+            ok = await _post_group(api, appid, str(gid), str(mid), content=content)
+    except Exception as e:
+        log("群管理：回话失败 %r" % e, appid, cat="错误")
+        return False
+    return ok
+
+
+# ── 计数键：昵称（可跨 bot） / <appid>:<openid>（只能 bot 内）────────
+
+def _gm_nickname(message):
+    """发言人昵称：author.username（不同版本叫什么就用什么），取不到 → ""。"""
+    for src in (getattr(message, "author", None), message):
+        v = _attr(src, "username", "nickname", "name", "nick")
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+    raw = getattr(message, "raw", None)
+    if isinstance(raw, dict):
+        for holder in (raw, raw.get("d"), raw.get("message")):
+            if not isinstance(holder, dict):
+                continue
+            for sub in (holder, holder.get("author"), holder.get("member")):
+                if isinstance(sub, dict):
+                    v = sub.get("username") or sub.get("nickname") or sub.get("name")
+                    if isinstance(v, str) and v.strip():
+                        return v.strip()
+    return ""
+
+
+def _gm_user_key(message, appid):
+    """计数键 → (键, 昵称, member_openid, 能不能跨 bot 共享)。
+
+    昵称可用 → 键 = 昵称；取不到 → 键 = "<appid>:<openid>"（此时无法跨 bot 共享，
+    调用方必须写「计数：昵称不可用，按 bot 内独立计」）。
+    """
+    nick = _gm_nickname(message)
+    oid = _member_openid_of(message)
+    if nick:
+        return nick, nick, oid, True
+    return ("%s:%s" % (appid, oid)), "", oid, False
+
+
+# ── 管理命令：#撤回 / #禁言 / #解禁 ──────────────────
+
+_GM_CMD_RE = re.compile(r"^#\s*(撤回|禁言|解禁)\s*(\d{1,4})?$")
+
+
+def _gm_cmd_of(text):
+    """→ (命令, 参数)；不是群管理命令 → ("", "")。
+
+    先去掉 <@…>：真机上「@某人 #禁言 10」的正文是 "<@!openid> #禁言 10"，
+    不剥掉这一层就永远匹配不上。
+    """
+    m = _GM_CMD_RE.match(_strip_mentions(text).strip())
+    if not m:
+        return "", ""
+    return m.group(1), (m.group(2) or "")
+
+
+def _gm_member_role(message):
+    """作者在群里的身份（member_role）：哪个位置有就用哪个。"""
+    for src in (message, getattr(message, "author", None)):
+        v = _attr(src, "member_role", "memberRole", "role")
+        if isinstance(v, str) and v.strip():
+            return v.strip().lower()
+    raw = getattr(message, "raw", None)
+    if isinstance(raw, dict):
+        for holder in (raw, raw.get("d"), raw.get("message")):
+            if not isinstance(holder, dict):
+                continue
+            for sub in (holder, holder.get("author"), holder.get("member")):
+                if isinstance(sub, dict):
+                    v = sub.get("member_role") or sub.get("memberRole") or sub.get("role")
+                    if isinstance(v, str) and v.strip():
+                        return v.strip().lower()
+    return ""
+
+
+def _gm_is_admin(message):
+    """群主 / 管理员（member_role 为 owner / admin）。"""
+    return _gm_member_role(message) in _GM_ADMIN_ROLES
+
+
+def _gm_ref_id(message):
+    """被引用的那条消息的 id（「回复某条消息」）；平台没给 → ""。"""
+    holders = [message]
+    raw = getattr(message, "raw", None)
+    if isinstance(raw, dict):
+        holders.append(raw)
+        d = raw.get("d")
+        if isinstance(d, dict):
+            holders.append(d)
+            if isinstance(d.get("message"), dict):
+                holders.append(d["message"])
+    for h in holders:
+        if h is None:
+            continue
+        for name in ("message_reference", "reference", "ref", "reply"):
+            r = h.get(name) if isinstance(h, dict) else getattr(h, name, None)
+            if isinstance(r, dict):
+                for k in _GM_REF_KEYS:
+                    v = str(r.get(k) or "").strip()
+                    if v:
+                        return v
+        for name in ("ref_id", "reply_id"):
+            v = h.get(name) if isinstance(h, dict) else getattr(h, name, None)
+            if v:
+                return str(v).strip()
+    return ""
+
+
+def _gm_target_oid(message, appid, botdir):
+    """#禁言 / #解禁 的对象：先看 @ 了谁（最可靠），再看引用消息里的作者。"""
+    mentions = _mentions_of(message) or []
+    mine = _own_mention_ids(appid, botdir, mentions)
+    for e in mentions:
+        oid = _mention_id(e)
+        if oid and oid.upper() not in set(str(x).upper() for x in mine) and \
+                _mention_flag(e, "is_you", "isYou") is not True:
+            return oid
+    raw = getattr(message, "raw", None)
+    if isinstance(raw, dict):
+        for holder in (raw, raw.get("d"), raw.get("message")):
+            if not isinstance(holder, dict):
+                continue
+            r = holder.get("message_reference") or holder.get("reference") or {}
+            a = (r.get("author") or {}) if isinstance(r, dict) else {}
+            if isinstance(a, dict):
+                v = str(a.get("member_openid") or a.get("user_openid") or "").strip()
+                if v:
+                    return v
+    return ""
+
+
+async def group_admin_cmd(appid, botdir, message, gid, text, mid=""):
+    """#撤回 / #禁言 / #解禁 → True = 这条已经处理完（调用方直接 return）。
+
+    权限：主人（_is_master_msg）或群管理员（member_role = owner/admin）。
+    没权限必须回一句「没有群管理权限」并记日志 —— 不静默失败。
+    """
+    cmd, arg = _gm_cmd_of(text)
+    if not cmd:
+        return False
+    api = getattr(message, "_api", None)
+    mid = str(mid or _unique_msg_id(message)[1] or "")
+    if not (_is_master_msg(botdir, gid, message) or _gm_is_admin(message)):
+        log("群管理：#%s 被拒（不是主人 / 群管理员，member_role=%s）→ 回「%s」"
+            % (cmd, _gm_member_role(message) or "未知", _GM_NO_PERM), appid, cat="判定")
+        await _gm_say(api, appid, gid, mid, _GM_NO_PERM)
+        return True
+    if cmd == "撤回":
+        ref = _gm_ref_id(message)
+        target = ref or _gm_last_sent(appid, gid)
+        if not target:
+            log("群管理：#撤回 找不到目标（没有引用消息，也没有本 bot 的上一条记录）",
+                appid, cat="系统")
+            await _gm_say(api, appid, gid, mid, "没找到要撤回的消息（回复它 + #撤回 试试）")
+            return True
+        ok = await _gm_recall(api, appid, gid, target)
+        log("群管理：#撤回（%s｜id=%s）→ %s"
+            % ("被回复的那条" if ref else "本 bot 上一条", str(target)[:12],
+               "成功" if ok else "失败"), appid, cat="判定")
+        if not ok:
+            await _gm_say(api, appid, gid, mid, "撤回失败（可能没有群管理权限）")
+        return True
+    minutes = _gm_int(arg, 1, 30 * 24 * 60, 10) if arg else 10
+    oid = _gm_target_oid(message, appid, botdir)
+    if not oid:
+        log("群管理：#%s 没认出对象（没 @ 人，也拿不到引用消息的作者）" % cmd,
+            appid, cat="系统")
+        await _gm_say(api, appid, gid, mid,
+                      "请 @ 要%s的人再说一次（如：@某人 #%s 10）" % (cmd, cmd))
+        return True
+    if cmd == "禁言":
+        ok = await _gm_mute(api, appid, gid, oid, minutes)
+        state_ok, _state = await _gm_restrict_state(api, appid, gid)
+        log("群管理：#禁言 %d 分钟（对象=%s）→ %s｜查询禁言状态=%s"
+            % (minutes, _oid8(oid), "成功" if ok else "失败",
+               "成功" if state_ok else "失败"), appid, cat="判定")
+        if not ok:
+            await _gm_say(api, appid, gid, mid, "禁言失败（可能没有群管理权限）")
+        return True
+    ok = await _gm_mute(api, appid, gid, oid, 0)
+    log("群管理：#解禁（对象=%s）→ %s" % (_oid8(oid), "成功" if ok else "失败"),
+        appid, cat="判定")
+    if not ok:
+        await _gm_say(api, appid, gid, mid, "解禁失败（可能没有群管理权限）")
+    return True
+
+
+# ── 进群欢迎 ────────────────────────────────
+
+# 内置人格的进群欢迎语：与定时问候同一条规矩 —— 内置人格的内容锁在代码里，用户改不了。
+# 键 = 人格名去掉「自定义：」前缀与 -完整/-精华/-精简 后缀（_strip_tier），
+# 与 _PRESET_GREETINGS 完全同一套 key 规则。
+_GM_WELCOME_BUILTIN = {
+    "奥黛塔": "（抖了抖耳朵）来啦？这里不缺人，缺的是能好好说话的人。",
+    "哥伦比娅": "（抬眼看了你一下）新来的？坐吧，月亮不管你是谁，我也一样。",
+    "桑多涅": "（冷冷扫了一眼）进来就安静点，规矩比人多。",
+    "沃雅妮莎": "（笑盈盈）欢迎呀，第一次来别紧张，慢慢就熟了。",
+    "鲸鱼娘": "（尾鳍轻轻摆）来啦来啦，先找个位置坐，别客气。",
+    "猫娘": "（耳朵一竖）喵？新面孔，先报个名字吧。",
+}
+
+
+def _gm_persona_key(botdir):
+    """→ (是不是内置人格, 人格名键)。判定顺序与 _greet_preset **完全一致**。
+
+    内置只看 persona_meta.json 的 builtin（用户导入的人格可以叫「鲸鱼娘」，名字撞上不算，
+    1.1.x 的真机事故）；meta 缺失（老装机）才回退按名字匹配，带「自定义：」前缀的一律自定义。
+    """
+    meta = _persona_meta(botdir)
+    if meta:
+        if not bool(meta.get("builtin")):
+            return False, ""
+        key = _strip_tier(str(meta.get("name") or "").strip())
+        return True, (key or _persona_name(botdir))
+    raw = _persona_name_raw(botdir)
+    if raw.startswith("自定义：") or raw.startswith("自定义:"):
+        return False, ""
+    name = _persona_name(botdir)
+    if name and name in _GM_WELCOME_BUILTIN:
+        return True, name
+    return False, ""
+
+
+def _gm_welcome_text(conf, botdir="", appid=""):
+    """进群欢迎的文案。
+
+    内置人格：锁死代码里那一句（忽略 welcome.text，用户改不了），并记 detail 日志说明；
+              代码里没有这个名字 → 通用兜底。
+    自定义人格：用 welcome.text，空 → 通用兜底。
+    """
+    builtin, key = _gm_persona_key(botdir)
+    if builtin:
+        fixed = _GM_WELCOME_BUILTIN.get(key or "")
+        log("群管理：进群欢迎用内置文案（人格=%s%s）"
+            % (key or _persona_name(botdir) or "未知",
+               "" if fixed else "，代码里没有这个内置人格 → 通用兜底"),
+            appid, cat="系统", lv="detail")
+        return fixed or _GM_WELCOME_GENERIC
+    return str(((conf.get("welcome") or {}).get("text")) or "").strip() or _GM_WELCOME_GENERIC
+
+
+def _gm_welcome_path(botdir, gid):
+    gid = str(gid or "").strip()
+    if not gid or gid in (".", "..") or os.sep in gid or (os.altsep and os.altsep in gid):
+        return ""
+    return os.path.join(_bot_root(botdir), _GM_DIR, gid + ".welcomed.json")
+
+
+def _gm_welcome_claim(botdir, gid, keys, now=None):
+    """欢迎一次性：keys 里只要有一个已经记过 → 不再欢迎；否则全记下并返回 True。"""
+    keys = [str(k) for k in (keys or []) if str(k)]
+    if not keys:
+        return False
+    path = _gm_welcome_path(botdir, gid)
+    if not path:
+        return False
+    now = time.time() if now is None else now
+    with _gm_lock:
+        d = _load_json(path, {})
+        users = d.get("users") if isinstance(d, dict) and isinstance(d.get("users"), dict) else {}
+        if any(k in users for k in keys):
+            return False
+        users = dict(users)
+        for k in keys:
+            users[k] = int(now)
+        if len(users) > _GM_WELCOME_MAX:
+            for k in list(users)[:len(users) - _GM_WELCOME_MAX]:
+                users.pop(k, None)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except Exception:
+            pass
+        _save_json(path, {"users": users})
+    return True
+
+
+def _gm_welcome_recent(appid, gid, oid, now=None):
+    """内存去重：同一 (bot, 群, 成员) 5 分钟内只欢迎一次（事件会重复下发）。"""
+    now = time.time() if now is None else now
+    key = (str(appid), str(gid or ""), str(oid or ""))
+    with _gm_lock:
+        for k in [k for k, ts in _gm_welcome_mem.items() if now - ts > _GM_WELCOME_TTL]:
+            _gm_welcome_mem.pop(k, None)
+        if key in _gm_welcome_mem:
+            return True
+        _gm_welcome_mem[key] = now
+    return False
+
+
+async def _gm_welcome_member_add(appid, botdir, api, gid, member_oid):
+    """GROUP_MEMBER_ADD：真正的成员进群欢迎（事件里的 group_openid 就是本 bot 视角的 gid）。"""
+    gid = str(gid or "")
+    member_oid = str(member_oid or "")
+    conf = group_admin_conf(botdir, gid)
+    if not (conf.get("welcome") or {}).get("enabled"):
+        log("群管理：成员进群（群=%s｜成员=%s），但该群欢迎语关着 → 不发"
+            % (gid[:8] or "?", _oid8(member_oid)), appid, cat="系统", lv="detail")
+        return False
+    if not gid or not member_oid:
+        log("群管理：成员进群事件缺 group_openid / member_openid → 跳过", appid, cat="系统")
+        return False
+    if _gm_welcome_recent(appid, gid, member_oid):
+        log("群管理：成员进群（群=%s｜成员=%s）5 分钟内已欢迎过 → 跳过（事件重复下发）"
+            % (gid[:8], _oid8(member_oid)), appid, cat="判定", lv="detail")
+        return False
+    text = _gm_welcome_text(conf, botdir, appid)
+    # welcome.at 照旧生效：关掉就只发文案，不 @ 这个成员
+    at = bool((conf.get("welcome") or {}).get("at", True)) and bool(member_oid)
+    ok = await _gm_say(api, appid, gid, "", text, at_oid=member_oid if at else "")
+    if not ok and at:
+        ok = await _gm_say(api, appid, gid, "", "@新朋友 " + text)
+        if ok:
+            log("群管理：进群欢迎 markdown @ 失败 → 退回纯文本", appid, cat="系统")
+    log("群管理：进群欢迎 → %s（群=%s｜成员=%s）"
+        % ("已发" if ok else "失败", gid[:8], _oid8(member_oid)), appid, cat="系统")
+    return ok
+
+
+async def _gm_welcome_first(appid, botdir, message, gid, conf, nick, oid, mid):
+    """「首次发言欢迎」：平台没开成员事件时的兜底（日志写明是哪种触发的）。"""
+    if not (conf.get("welcome") or {}).get("enabled"):
+        return False
+    if not nick:
+        log("群管理：首次发言欢迎跳过（昵称不可用，判不出是不是第一次）",
+            appid, cat="系统", lv="detail")
+        return False
+    keys = ["n:" + nick]
+    if oid:
+        keys.insert(0, "m:" + oid)
+    if not _gm_welcome_claim(botdir, gid, keys):
+        return False
+    at = bool((conf.get("welcome") or {}).get("at", True)) and bool(oid)
+    ok = await _gm_say(getattr(message, "_api", None), appid, gid, mid,
+                       _gm_welcome_text(conf, botdir, appid), at_oid=oid if at else "")
+    log("群管理：首次发言欢迎 → %s（群=%s｜%s%s｜触发=首次发言，成员进群事件没到时的兜底）"
+        % ("已发" if ok else "失败", str(gid or "")[:8], nick,
+           "，@ 了对方" if at else ""), appid, cat="系统")
+    return ok
+
+
+class _GmMemberEvent(object):
+    """GROUP_MEMBER_ADD 的事件体：{timestamp, group_openid, member_openid, union_group_openid}。"""
+
+    __slots__ = ("event_id", "timestamp", "group_openid", "member_openid",
+                 "union_group_openid", "_api", "raw")
+
+    def __init__(self, api, payload):
+        p = payload if isinstance(payload, dict) else {}
+        d = p.get("d") if isinstance(p.get("d"), dict) else p
+        self._api = api
+        self.raw = p
+        self.event_id = p.get("id") or d.get("id") or ""
+        self.timestamp = d.get("timestamp")
+        self.group_openid = str(d.get("group_openid") or p.get("group_openid") or "")
+        self.member_openid = str(d.get("member_openid") or "")
+        self.union_group_openid = str(d.get("union_group_openid") or "")
+
+    def __repr__(self):
+        return "<group_member_add %s %s>" % (self.group_openid[:8], _oid8(self.member_openid))
+
+
+def _gm_parse_member_add(conn, payload):
+    """解析 + dispatch（挂在 ConnectionState 上的那两行；单测直接调这个）。"""
+    ev = _GmMemberEvent(getattr(conn, "api", None), payload)
+    conn._dispatch("group_member_add", ev)
+    return ev
+
+
+def _install_group_member_parser():
+    """给 ConnectionState 补 GROUP_MEMBER_ADD 的解析器（botpy 17 只 parse 已知事件）。
+
+    ConnectionState.__init__ 用 inspect.getmembers(self) 收集 parse_* 建 parsers 表，
+    所以只要**在建立连接之前**把方法挂到类上，网关推来的 GROUP_MEMBER_ADD 就会被解析成
+    _GmMemberEvent 并 dispatch 到 on_group_member_add。幂等，重复调用只做一次。
+    """
+    try:
+        import botpy.connection as _bc
+        if getattr(_bc.ConnectionState, "_andbna_member_parsed", False):
+            return True
+
+        def parse_group_member_add(self, payload):
+            try:
+                return _gm_parse_member_add(self, payload)
+            except Exception as e:
+                _log_soft("群成员进群事件解析失败：%r" % e, cat="错误")
+                return None
+
+        _bc.ConnectionState.parse_group_member_add = parse_group_member_add
+        _bc.ConnectionState._andbna_member_parsed = True
+        return True
+    except Exception as e:
+        log("注册 GROUP_MEMBER_ADD 解析器失败：%r" % e, cat="错误")
+        return False
+
+
+async def group_admin_member_add(appid, botdir, event):
+    """on_group_member_add 的实现（抽出来才能单测：_make_client 里的闭包没法直接调）。"""
+    gid = str(getattr(event, "group_openid", "") or "")
+    oid = str(getattr(event, "member_openid", "") or "")
+    try:
+        return await _gm_welcome_member_add(appid, botdir, getattr(event, "_api", None), gid, oid)
+    except Exception as e:
+        log("群管理：进群欢迎异常 %r" % e, appid, cat="错误")
+        return False
+
+
+async def group_add_robot(appid, botdir, api, gid):
+    """机器人被拉进群（GROUP_ADD_ROBOT）：官方唯一的「本 bot 进群」事件。
+
+    机器人自己没有昵称、事件里也没有成员 openid，所以这里 at 不了人：只发一句欢迎语。
+    """
+    gid = str(gid or "")
+    conf = group_admin_conf(botdir, gid)
+    if not (conf.get("welcome") or {}).get("enabled"):
+        log("群管理：本 bot 被拉进群（群=%s），该群欢迎语关着 → 不发" % (gid[:8] or "?"),
+            appid, cat="系统", lv="detail")
+        return False
+    ok = await _gm_say(api, appid, gid, "", _gm_welcome_text(conf, botdir, appid))
+    log("群管理：本 bot 进群欢迎 → %s（群=%s｜触发=GROUP_ADD_ROBOT，at 无效不 @）"
+        % ("已发" if ok else "失败", gid[:8] or "?"), appid, cat="系统")
+    return ok
+
+
+# ── 违规判定 + 惩罚 ──────────────────────────
+
+def _gm_hit_label(hit, mode):
+    return ("关键词=%s" % hit) if hit else ("关键词=无（mode=%s 每条都问）" % mode)
+
+
+async def _gm_verdict(appid, botdir, gid, conf, text, hit):
+    """→ {"hit","model","violation"}：mode 决定问不问模型。"""
+    mode = str(conf.get("mode") or "keyword+model")
+    if mode == "keyword":
+        return {"hit": hit, "model": "", "violation": bool(hit)}
+    if mode == "model":
+        verdict, _raw = await _gm_model_ask(appid, botdir, gid, hit or "（无命中词）", text)
+        return {"hit": hit, "model": verdict, "violation": verdict == "yes"}
+    verdict, _raw = await _gm_model_ask(appid, botdir, gid, hit, text)
+    return {"hit": hit, "model": verdict, "violation": verdict == "yes"}
+
+
+async def _gm_warn(appid, botdir, message, gid, nick, v, n, action, oid, mid):
+    """警告一句：把「事实 + 次数 + 处理结果」作为系统补充交给模型，由它按人格组织。
+
+    文案不写死（语气归人格）；模型失败才退回一句中性提醒。
+    """
+    hit = v.get("hit") or ""
+    model = v.get("model") or ""
+    facts = ("【群管理事实】这条消息命中了本群规则（关键词：%s%s）；该成员在本群累计第 %d 次；"
+             "已处理：%s。请用你的语气对他说一句，提醒他别再发这类内容，语气由你决定。"
+             % (hit or "无", "" if model in ("", "不问") else "，判定模型：%s" % model, n, action))
+    try:
+        say = await _reply(appid, botdir, "g" + str(gid), "",
+                           str(getattr(message, "content", "") or ""), extra_sys=facts)
+    except Exception as e:
+        log("群管理：警告生成失败 %r → 退回一句中性提醒" % e, appid, cat="错误")
+        say = ""
+    say = str(say or "").strip() or _GM_WARN_FALLBACK
+    return await _gm_say(getattr(message, "_api", None), appid, gid, mid, say,
+                         at_oid=oid or "")
+
+
+async def _gm_punish(appid, botdir, message, gid, conf, v, key, nick, shared, mid):
+    """惩罚：撤回 → 阶梯禁言 / 踢出 → 警告，最后一行标准日志。"""
+    api = getattr(message, "_api", None)
+    oid = _member_openid_of(message)
+    gname = await _gm_group_name(botdir, gid, api, appid) if shared else ""
+    if shared and gname:
+        path = _gm_vpath(_gm_base(botdir), gname)
+        count, rec = _gm_bump(path, gname, key, appid)
+        _gm_note_stats(botdir, gid, len(_gm_users(path)))
+        if len(rec.get("names") or []) > 1:
+            log("群管理：同一昵称「%s」在本群出现多个（names=%s）→ 无法区分，只能合并计数（已知限制）"
+                % (key, ",".join(rec.get("names") or [])), appid, cat="系统", lv="detail")
+    else:
+        if not shared:
+            log("群管理：计数：昵称不可用，按 bot 内独立计（键=%s）" % (key or "?"),
+                appid, cat="系统")
+        else:
+            log("群管理：计数：群名取不到，按 bot 内独立计（键=%s）" % (key or "?"),
+                appid, cat="系统")
+        local = os.path.join(_bot_root(botdir), _GM_DIR,
+                             (str(gid or "nogid")[:64] or "nogid") + ".violations.json")
+        count, rec = _gm_bump(local, "bot:" + str(botdir), key, appid)
+        _gm_note_stats(botdir, gid, len(_gm_users(local)))
+    n = int(count or 0)
+    minutes = _gm_mute_minutes(n, conf.get("steps"))
+    kick_at = int(conf.get("kick_at") or 0)
+    recall_ok = False
+    if conf.get("recall_enabled"):
+        recall_ok = await _gm_recall(api, appid, gid, mid)
+    action = ""
+    if kick_at > 0 and n >= kick_at and oid:
+        if await _gm_kick(api, appid, gid, oid):
+            action = "踢出"
+        else:
+            minutes = max(minutes, _gm_longest_minutes(conf.get("steps")))
+            muted = await _gm_mute(api, appid, gid, oid, minutes)
+            action = "踢出失败 → 最长禁言 %d 分钟%s" % (minutes, "" if muted else "（禁言也失败）")
+    elif oid:
+        muted = await _gm_mute(api, appid, gid, oid, minutes)
+        action = "禁言 %d 分钟%s" % (minutes, "" if muted else "（失败）")
+    else:
+        action = "拿不到成员 openid，未禁言"
+    warn_ok = False
+    if conf.get("warn_enabled"):
+        warn_ok = await _gm_warn(appid, botdir, message, gid, nick, v, n, action, oid, mid)
+    log("群管理：违规 n=%d（关键词=%s，模型=%s）→ %s｜撤回=%s｜警告=%s"
+        % (n, v.get("hit") or "无", v.get("model") or "不问", action,
+           ("成功" if recall_ok else "失败") if conf.get("recall_enabled") else "关",
+           ("已发" if warn_ok else "失败") if conf.get("warn_enabled") else "关"),
+        appid, cat="判定")
+    return True
+
+
+async def _group_admin_tick(appid, botdir, message, gid, text, mid=""):
+    """群管理总入口（_handle_group 里、回环判断之后调用）。
+
+    → True = 这条已经处理完（命令 / 违规已处置），调用方直接 return。
+    首次发言欢迎不算「处理完」：欢迎完还要照常走回复闸。
+    """
+    gid = str(gid or "")
+    conf = group_admin_conf(botdir, gid)
+    mid = str(mid or _unique_msg_id(message)[1] or "")
+    key, nick, oid, shared = _gm_user_key(message, appid)
+    if await group_admin_cmd(appid, botdir, message, gid, text, mid):
+        return True
+    if (conf.get("welcome") or {}).get("enabled") and (nick or oid):
+        await _gm_welcome_first(appid, botdir, message, gid, conf, nick, oid, mid)
+    if not conf.get("enabled"):
+        return False
+    mode = str(conf.get("mode") or "keyword+model")
+    hit = _gm_keyword_hit(text, conf.get("keywords"))
+    if not hit and mode != "model":
+        return False
+    mine, other = _gm_claim(appid, _my_name(appid), text)
+    if not mine:
+        log("群管理：已由 %s 处理，本 bot 不动（%s）" % (other, _gm_hit_label(hit, mode)),
+            appid, cat="判定")
+        return False
+    v = await _gm_verdict(appid, botdir, gid, conf, text, hit)
+    if not v["violation"]:
+        log("群管理：关键词命中但判定不是违规（关键词=%s，模型=%s）→ 不动"
+            % (hit or "无", v.get("model") or "不问"), appid, cat="判定", lv="detail")
+        return False
+    return await _gm_punish(appid, botdir, message, gid, conf, v, key, nick, shared, mid)
+
+
+
 async def _handle_group(appid, botdir, message, tag):
     """群消息的唯一处理入口：@ 事件和普通群消息都走这里。
 
@@ -7193,6 +8420,16 @@ async def _handle_group(appid, botdir, message, tag):
     if echo:
         log("跳过：疑似复读本 bot 内容（%s）" % brief, appid, cat="判定")
         return
+
+    # ── 群管理（2.1.0）：命令 / 违规处置 / 首次发言欢迎。
+    # 放在这里是因为：作者是 bot 的已经返回、回环也已经返回；而群管理的动作（撤回/禁言）
+    # 不该被后面那几道「回不回」的闸挡掉 —— 静音群、不 @ 本 bot 都要照样管。
+    # 异常一律吞掉：群管理坏了不能连累正常回复。
+    try:
+        if await _group_admin_tick(appid, botdir, message, gid, body, mid):
+            return
+    except Exception as e:
+        log("群管理异常（忽略，不影响回复）：%r" % e, appid, cat="错误")
 
     # 闸 3 · @ 判定（fail-closed）+ 总模型
     level = _gate_level(gid, gconf, _level_override(appid, roster))[0]
@@ -7362,6 +8599,7 @@ def _make_client(appid, secret, botdir, gen=None):
     """
     import botpy
     _install_group_message_parser()
+    _install_group_member_parser()
 
     class Bot(botpy.Client):
         async def on_ready(self):
@@ -7421,6 +8659,22 @@ def _make_client(appid, secret, botdir, gen=None):
             # 采集 → _reply → post_group_message 全复用 _handle_group，没有第二套回复链路。
             await _handle_group(appid, botdir, message, "群消息(新事件)")
 
+        async def on_group_member_add(self, event):
+            # GROUP_MEMBER_ADD：真正的「成员进群」事件（intents 1<<24 + 我们自己补的解析器）
+            if _stale(appid, gen):
+                return
+            await group_admin_member_add(appid, botdir, event)
+
+        async def on_group_add_robot(self, event):
+            # 本 bot 被拉进群：官方事件里没有成员身份，只能发一句不带 @ 的欢迎
+            if _stale(appid, gen):
+                return
+            try:
+                await group_add_robot(appid, botdir, getattr(event, "_api", None),
+                                      str(getattr(event, "group_openid", "") or ""))
+            except Exception as e:
+                log("群管理：本 bot 进群欢迎异常 %r" % e, appid, cat="错误")
+
         async def on_c2c_message_create(self, message):
             if _stale(appid, gen):
                 return
@@ -7474,12 +8728,7 @@ def _make_client(appid, secret, botdir, gen=None):
             except Exception as e:
                 log("回私聊失败：%r" % e, appid, cat="错误")
 
-    try:
-        intents = botpy.Intents(public_guild_messages=True, public_messages=True)
-    except TypeError:
-        intents = botpy.Intents(public_guild_messages=True)
-        log("当前 botpy 不支持 public_messages，只开频道事件", appid, cat="系统")
-    return Bot(intents=intents)
+    return Bot(intents=_make_intents(botpy.Intents, appid))
 
 
 async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
@@ -7605,7 +8854,11 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
         log("回复（模型 %s）：%s" % (conf["model"],
                                     (text or "(空)")[:40].replace(chr(10), " ")), appid, cat="回复")
         if not text:
-            text = "（模型没返回内容）"
+            # content 空/纯空白 → 本条不发。绝不拿 reasoning_content 顶替正文：
+            # 思考链会原样进群（真机 11-17 18:55「最终回答。不错。不使用列表。纯中文口语」）。
+            log("本条不发：模型返回空正文（reasoning_content 不回填，见上方丢弃日志）",
+                appid, cat="错误")
+            return ""
         # 表情：<sticker>id</sticker> 先摘出来（剩下的正文照旧走清洗），id 再过候选 / 频率 / 冷却。
         # 标记本身永远不给用户看 —— 开关关掉时也照摘，只是不选图。
         sk = _STICKER_MARK_RE.search(text or "")
