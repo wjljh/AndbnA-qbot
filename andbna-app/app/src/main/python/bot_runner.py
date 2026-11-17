@@ -9,6 +9,7 @@
   · 自己的 botpy 客户端
 """
 import asyncio
+import base64
 import contextvars
 import json
 import os
@@ -6618,6 +6619,280 @@ def _is_msgseq_dup(err):
     return ("msgseq" in s.lower()) or ("被去重" in s)
 
 
+# ── 表情库：bot 自己挑一张本地图发出去 ─────────────────────────
+#
+# 图与元数据都由 Kotlin 侧写盘（<botdir>/stickers/<id>.<ext> + library.json），
+# Python 只读、只发。候选只给「id｜描述｜标签」三样 —— 不给图，省 token。
+# 发送是两跳：先上传拿 file_info（每次发送前即时上传，file_info 有时效，绝不缓存复用），
+# 再发 msg_type=7 的富媒体消息。两跳都走 botpy 的 http 客户端，token 由它维护，这里不自己取。
+_STICKER_MAX = 5 * 1024 * 1024      # 单张上限 5MB（与 Kotlin 侧导入校验同一口径）
+_STICKER_EVERY_N = 10               # 每个会话每 N 条回复最多 1 张
+_STICKER_COOLDOWN_H = 24            # 同一张图冷却小时数（防刷屏）
+_STICKER_SHOW_MAX = 60              # 候选条目上限（库再大也别把提示词撑爆）
+_STICKER_DESC_MAX = 40              # 单条描述进候选时的字数上限
+_STICKER_MARK_RE = re.compile(r"<sticker>\s*([^<>\s]{1,64})\s*</sticker>", re.I)
+_STICKER_ANY_RE = re.compile(r"<sticker>.*?(?:</sticker>|$)", re.I | re.S)  # 含残缺半截标记
+_STICKER_HINT_HEAD = "你可以偶尔发表情图，让对话更生动。可用的表情（id｜描述｜标签）："
+_STICKER_HINT_TAIL = "不想发就不要写。不要解释这个标记。"
+_sticker_lib_cache = {}             # library.json 路径 -> ((mtime_ns, size), [item])
+_sticker_conf_cache = {}            # llm.json 路径 -> ((mtime_ns, size), conf)
+_sticker_lock = threading.Lock()
+_sticker_state = {"replies": {}, "sent": {}}   # 防刷屏状态：只在内存，重启清零
+_sticker_pending = contextvars.ContextVar("sticker_pending", default=None)
+# botpy 的错误类型不带状态码，按类名反查（不 import botpy：单测环境里没有它）
+_STICKER_HTTP = {"AuthenticationFailedError": 401, "ForbiddenError": 403,
+                 "NotFoundError": 404, "MethodNotAllowedError": 405,
+                 "SequenceNumberError": 429, "ServerError": 500}
+
+
+def _sticker_library(botdir):
+    """这个 bot 可用的表情：[{id, desc, tags, path, size}]。
+
+    坏条目一律跳过（空描述 / 缺文件 / 单张超 5MB）：描述是模型唯一的选择依据，没描述等于没法挑。
+    mtime + size 没变就复用上次结果 —— 每次回复前都要看一眼库，不能每次都读盘。
+    """
+    path = os.path.join(str(botdir or ""), "stickers", "library.json")
+    try:
+        st = os.stat(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    with _sticker_lock:
+        hit = _sticker_lib_cache.get(path)
+        if hit and hit[0] == stamp:
+            return hit[1]
+    items = []
+    if stamp is not None:
+        raw = _load_json(path, {}) or {}
+        rows = raw.get("items") if isinstance(raw, dict) else None
+        for it in (rows or []):
+            if not isinstance(it, dict):
+                continue
+            sid = str(it.get("id") or "").strip()
+            desc = re.sub(r"\s+", " ", str(it.get("desc") or "")).strip()
+            fn = str(it.get("file") or "").strip()
+            if not sid or not desc or not fn:
+                continue                      # 没 id / 没描述 / 没文件名 = 不进候选
+            fp = fn if os.path.isabs(fn) else os.path.join(os.path.dirname(path), fn)
+            try:
+                size = os.path.getsize(fp)
+            except OSError:
+                continue                      # 文件被删了（用户手删 / 没同步）
+            if size <= 0 or size > _STICKER_MAX:
+                continue
+            tags = [str(t).strip() for t in (it.get("tags") or []) if str(t).strip()]
+            items.append({"id": sid, "desc": desc, "tags": tags,
+                          "path": fp, "size": size})
+    with _sticker_lock:
+        _sticker_lib_cache[path] = (stamp, items)
+    return items
+
+
+def _sticker_conf(base):
+    """llm.json 里的三个表情键：enabled（缺省开）/ every_n（10）/ cooldown_h（24）。
+
+    和 _log_level 同款吃 mtime 缓存：改配置下一次回复就生效，不用重启。
+    """
+    base = str(base if base is not None else (_base_dir or ""))
+    path = os.path.join(base, "llm.json") if base else ""
+    try:
+        st = os.stat(path)
+        stamp = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        stamp = None
+    with _sticker_lock:
+        hit = _sticker_conf_cache.get(path)
+        if hit and hit[0] == stamp:
+            return hit[1]
+    raw = _load_json(path, {}) if stamp is not None else {}
+    if not isinstance(raw, dict):
+        raw = {}
+    on = raw.get("sticker_enabled")
+    on = True if on is None else bool(on)      # 没这个键 = 默认允许
+    try:
+        every = int(_STICKER_EVERY_N if raw.get("sticker_every_n") is None
+                    else raw.get("sticker_every_n"))
+    except (TypeError, ValueError):
+        every = _STICKER_EVERY_N
+    try:
+        cool = float(_STICKER_COOLDOWN_H if raw.get("sticker_cooldown_h") is None
+                     else raw.get("sticker_cooldown_h"))
+    except (TypeError, ValueError):
+        cool = _STICKER_COOLDOWN_H
+    conf = {"enabled": on, "every_n": max(1, every), "cooldown_h": max(0.0, cool)}
+    with _sticker_lock:
+        _sticker_conf_cache[path] = (stamp, conf)
+    return conf
+
+
+def _sticker_enabled(base=None):
+    """允许 bot 自己发表情吗？（llm.json 的 sticker_enabled，缺项 = 开）"""
+    return bool(_sticker_conf(base)["enabled"])
+
+
+def _sticker_hint(botdir):
+    """候选注入文本：开关开 + 库非空才有 → (追加进 system 的文本, 候选条目)。"""
+    if not _sticker_enabled():
+        return "", []
+    items = _sticker_library(botdir)[:_STICKER_SHOW_MAX]
+    if not items:
+        return "", []
+    rows = ["%s｜%s｜%s" % (it["id"], it["desc"][:_STICKER_DESC_MAX],
+                           ",".join(it["tags"]) or "-") for it in items]
+    text = chr(10).join([_STICKER_HINT_HEAD] + rows + [
+        "想发时在回复末尾单独写一行：<sticker>%s</sticker>" % items[0]["id"],
+        _STICKER_HINT_TAIL])
+    return text, items
+
+
+def _sticker_bump(key):
+    """这个会话又回了一条（含本条）→ 本窗口内的回复条数。"""
+    key = str(key or "")
+    with _sticker_lock:
+        n = int(_sticker_state["replies"].get(key, 0)) + 1
+        _sticker_state["replies"][key] = n
+    return n
+
+
+def _sticker_cooldown_left(botdir, sid):
+    """同一张图还要等多少小时（0 = 现在就能发）。按 bot 算，不分群/私聊。"""
+    hit = _sticker_state["sent"].get((str(botdir or ""), str(sid or "")))
+    if not hit:
+        return 0.0
+    window = float(_sticker_conf(_base_dir)["cooldown_h"]) * 3600.0
+    return max(0.0, window - (time.time() - hit)) / 3600.0
+
+
+def _sticker_pick(appid, botdir, key, sid):
+    """模型挑的这张到底发不发：开关 → id 在候选 → 窗口到了 → 不在冷却。
+
+    放行时当场记账（窗口清零 + 冷却打点），发送失败由 _sticker_unmark 回滚冷却。
+    返回要发的条目，或 None。
+    """
+    sid = str(sid or "").strip()
+    conf = _sticker_conf(_base_dir)
+    if not conf["enabled"] or not sid:
+        return None
+    item = next((x for x in _sticker_library(botdir) if x["id"] == sid), None)
+    if item is None:
+        log("表情：id 不在候选里（%s）" % sid, appid, cat="错误")
+        return None
+    n = int(_sticker_state["replies"].get(str(key or ""), 0))
+    if n < conf["every_n"]:
+        log("表情：跳过 %s（本会话 %d/%d 条，窗口未到）" % (sid, n, conf["every_n"]),
+            appid, cat="回复", lv="detail")
+        return None
+    left = _sticker_cooldown_left(botdir, sid)
+    if left > 0:
+        log("表情：跳过 %s（同一张图冷却中，还要 %.1f 小时）" % (sid, left),
+            appid, cat="回复", lv="detail")
+        return None
+    with _sticker_lock:
+        _sticker_state["replies"][str(key or "")] = 0
+        _sticker_state["sent"][(str(botdir or ""), sid)] = time.time()
+    return item
+
+
+def _sticker_unmark(botdir, item):
+    """这次没发出去：把冷却打点撤掉，别让一次网络抖动白占一整个冷却窗口。"""
+    with _sticker_lock:
+        _sticker_state["sent"].pop((str(botdir or ""), str((item or {}).get("id") or "")), None)
+
+
+def _sticker_take():
+    """取出并清空本轮待发表情（_reply 写好，发送方用完即弃）。"""
+    item = _sticker_pending.get()
+    _sticker_pending.set(None)
+    return item
+
+
+def _sticker_route(method, path):
+    """botpy 的 Route（域名 / sandbox / token 都复用它的）；单测没装 botpy 时给个同形替身。
+
+    替身只提供 BotHttp.request() 真正用到的三个字段：method / url / is_sandbox。
+    """
+    try:
+        from botpy.http import Route
+        return Route(method, path)
+    except Exception:
+        class _StickerRoute(object):
+            DOMAIN = "api.sgroup.qq.com"
+
+            def __init__(self, m, p):
+                self.method = m
+                self.path = p
+                self.is_sandbox = False
+
+            @property
+            def url(self):
+                return "https://" + self.DOMAIN + self.path
+
+        return _StickerRoute(method, path)
+
+
+def _sticker_err(e):
+    """异常 → 日志里的「HTTP 码 / 原因」。"""
+    code = _STICKER_HTTP.get(type(e).__name__)
+    msg = str(e) or repr(e)
+    return ("HTTP %d %s" % (code, msg)) if code else msg
+
+
+async def _sticker_upload(api, key, data):
+    """上传一张图（base64 内联）→ 接口响应 dict；群和私聊的上传路径不同。"""
+    body = {"file_type": 1, "file_data": base64.b64encode(data).decode("ascii"),
+            "srv_send_msg": False}
+    if key[:1] == "g":
+        route = _sticker_route("POST", "/v2/groups/%s/files" % key[1:])
+    else:
+        route = _sticker_route("POST", "/v2/users/%s/files" % key[1:])
+    return await api._http.request(route, json=body)
+
+
+def _sticker_fail(appid, botdir, item, why):
+    """发图失败：回滚冷却 + 一行错误。文字那条早就发出去了，这里只影响表情。"""
+    _sticker_unmark(botdir, item)
+    log("表情发送失败：%s｜已回退纯文字" % why, appid, cat="错误")
+
+
+async def _sticker_send(appid, api, botdir, key, item, mid=""):
+    """即时上传 + 发 msg_type=7 的图；True 成功 / False 失败（失败只记日志）。
+
+    key："g" + group_openid 或 "p" + user_openid，决定上传 / 发送走哪套接口。
+    mid：触发这一轮的 msg_id（被动回复要用它 + 一个新的 msg_seq）。
+    """
+    key = str(key or "")
+    item = item or {}
+    sid = str(item.get("id") or "")
+    path = str(item.get("path") or "")
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except Exception as e:
+        _sticker_fail(appid, botdir, item, "读文件失败 %r" % e)
+        return False
+    if not data or len(data) > _STICKER_MAX:
+        _sticker_fail(appid, botdir, item, "文件不可用（%d 字节）" % len(data))
+        return False
+    try:
+        resp = await _sticker_upload(api, key, data)
+        info = str((resp or {}).get("file_info") or "") if isinstance(resp, dict) else ""
+        if not info:
+            raise RuntimeError("上传响应里没有 file_info")
+        seq = _next_msg_seq(appid, mid)
+        if key[:1] == "g":
+            await api.post_group_message(group_openid=key[1:], msg_id=mid, msg_seq=seq,
+                                         msg_type=7, content="", media={"file_info": info})
+        else:
+            await api.post_c2c_message(openid=key[1:], msg_id=mid, msg_seq=seq,
+                                       msg_type=7, content="", media={"file_info": info})
+    except Exception as e:
+        _sticker_fail(appid, botdir, item, _sticker_err(e))
+        return False
+    where = "本群" if key[:1] == "g" else "本会话"
+    log("表情：发送 %s（%s %d 条内第 1 张）" % (sid, where, _sticker_conf(_base_dir)["every_n"]),
+        appid, cat="回复")
+    return True
+
 async def _post_group(api, appid, gid, mid, content="", markdown=None):
     """发一条群消息：msg_seq 由 _next_msg_seq 分配，冲突就换序号重试一次。
 
@@ -6675,9 +6950,11 @@ async def _group_send(appid, botdir, message, gid, who, model_in, images=None,
                                  extra_sys=extra_sys)
         finally:
             _member_openid_ctx.reset(tok)
-        if not reply:
+        pend = _sticker_take()      # _reply 挑好的表情；正文为空 = 只发图
+        if not reply and not pend:
             return ""          # 出站清洗判空：这条不发（_reply 里已记「丢弃」日志）
-        plain, at_ids = _resolve_at_tags(reply, _mentions_of(message))
+        plain, at_ids = (_resolve_at_tags(reply, _mentions_of(message)) if reply
+                         else ("", []))
         # 群级互斥：总模型的决定是按「同一条消息」共享的（_gate_decide 的 8 秒窗口 key 带
         # 正文哈希），两条不同消息同时进来会各自被判 reply → 两个 bot 同时说话。
         # 所以在发送前再卡一道：本群这一轮已经有别的 bot 发出去了 → 本轮放弃。
@@ -6685,10 +6962,13 @@ async def _group_send(appid, botdir, message, gid, who, model_in, images=None,
         if busy_name:
             log("群级互斥：本群 3 秒内已有 %s 发言，放弃（%.1f 秒前｜键=%s）"
                 % (busy_name, busy_ago, _session_log(skey)), appid, cat="判定")
+            if pend:
+                _sticker_unmark(botdir, pend)     # 图没发出去，别白占冷却窗口
             return ""
-        _note_sent(appid, gid, plain)
         mid = _unique_msg_id(message)[1]
-        if at_ids:
+        if plain:
+            _note_sent(appid, gid, plain)
+        if plain and at_ids:
             log("@ 发出：%d 个（群聊 markdown 消息）" % len(at_ids), appid, cat="回复")
             try:
                 ok = await _post_group(message._api, appid, gid, mid,
@@ -6696,10 +6976,17 @@ async def _group_send(appid, botdir, message, gid, who, model_in, images=None,
             except Exception as e_at:
                 log("@ 消息发送失败（%r）→ 退回纯文本" % e_at, appid, cat="错误")
                 ok = await _post_group(message._api, appid, gid, mid, content=plain)
-        else:
+        elif plain:
             ok = await _post_group(message._api, appid, gid, mid, content=plain)
+        else:
+            ok = True           # 只发图：没有文字要发
         if not ok:
+            if pend:
+                _sticker_unmark(botdir, pend)
             return ""          # 发不出去就不算说过：不记「刚说过」，本轮到此为止
+        # 顺序硬规则：文字已经发出去了，才轮到表情；表情失败绝不影响那条文字
+        if pend:
+            await _sticker_send(appid, message._api, botdir, "g" + gid, pend, mid)
     except Exception as e:
         log("回群失败：%r" % e, appid, cat="错误")
         return ""
@@ -7172,12 +7459,18 @@ def _make_client(appid, secret, botdir, gen=None):
                 say = await _reply(appid, botdir,
                                    "p" + str(message.author.user_openid), "", text,
                                    images=images)
-                if not say:
+                pend = _sticker_take()
+                if not say and not pend:
                     return         # 出站清洗判空：这条不发（_reply 里已记「丢弃」日志）
-                await message._api.post_c2c_message(
-                    openid=message.author.user_openid, msg_type=0,
-                    msg_id=message.id, content=say,
-                )
+                if say:
+                    await message._api.post_c2c_message(
+                        openid=message.author.user_openid, msg_type=0,
+                        msg_id=message.id, content=say,
+                    )
+                if pend:
+                    await _sticker_send(appid, message._api, botdir,
+                                        "p" + str(message.author.user_openid), pend,
+                                        str(message.id))
             except Exception as e:
                 log("回私聊失败：%r" % e, appid, cat="错误")
 
@@ -7198,6 +7491,7 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
     这样至少能看出「收到消息了」，而不是静默不回复。
     """
     _usage_appid.set(appid)          # 这条链路里的模型调用（含判定/识图/摘要/搜索合成）记到该 bot 账上
+    _sticker_pending.set(None)       # 每轮重新决定，上一轮挑的图绝不许漏到这一轮
     if images and not incoming:
         incoming = "（发了张图）"
     conf = _llm_conf(_base_dir) if _base_dir else None
@@ -7228,6 +7522,12 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
         auto_decide = web_on and bool(conf.get("search_auto_decide", True))
         msgs = _build_messages(botdir, key, who, incoming, first=first, search_hint=auto_decide,
                                member_oid=_member_openid_ctx.get())
+        # 表情候选：只给「正常回复」注入（#搜 / #读 / 回时间 / 命令在 _reply 之前就分流了），
+        # 频道的会话键是 c 开头、平台也没给频道侧的上传口子 → 只对群 g 和私聊 p 注入。
+        hint, cands = _sticker_hint(botdir) if str(key or "")[:1] in ("g", "p") else ("", [])
+        if hint:
+            msgs[0]["content"] = msgs[0]["content"] + chr(10) + chr(10) + hint
+            log("表情候选：%d 个" % len(cands), appid, cat="系统", lv="detail")
         # extra_sys：群内最近消息（带名字标签）/ 收尾提示 —— 插在这一条之前当 system
         if extra_sys:
             msgs.insert(len(msgs) - 1, {"role": "system", "content": extra_sys})
@@ -7306,6 +7606,17 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
                                     (text or "(空)")[:40].replace(chr(10), " ")), appid, cat="回复")
         if not text:
             text = "（模型没返回内容）"
+        # 表情：<sticker>id</sticker> 先摘出来（剩下的正文照旧走清洗），id 再过候选 / 频率 / 冷却。
+        # 标记本身永远不给用户看 —— 开关关掉时也照摘，只是不选图。
+        sk = _STICKER_MARK_RE.search(text or "")
+        sid = (sk.group(1) or "").strip() if sk else ""
+        if _STICKER_ANY_RE.search(text or ""):
+            text = _STICKER_ANY_RE.sub("", text or "").strip()
+        pick = None
+        if str(key or "")[:1] in ("g", "p"):
+            _sticker_bump(key)          # 每条回复都算进本会话窗口（含没发表情的）
+            if sid:
+                pick = _sticker_pick(appid, botdir, key, sid)
         raw_len = len(text)
         # ① 出站清洗：模型把自己的指令 / 思考 / 收尾标记一起抄出来时，这里只留正文
         before = text
@@ -7313,6 +7624,13 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
         if text != before.strip():
             log("出站清洗：删掉指令/思考片段（%d → %d 字）" % (len(before), len(text)), appid, cat="回复")
         if not text:
+            if pick:
+                # 正文只剩标记：只发图。记忆里留一句占位，下一轮才知道它「说过话」。
+                _sticker_pending.set(pick)
+                _remember(botdir, key, "assistant", "（发了个表情）")
+                _arc_reply_by_key(botdir, key, "（发了个表情）")
+                log("表情：正文只剩标记，只发图（%s）" % pick["id"], appid, cat="回复", lv="detail")
+                return ""
             log("出站清洗：内容为空，丢弃", appid, cat="回复")
             return ""
         text = _clean_reply(text)
@@ -7329,6 +7647,8 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
                     log("称呼兜底：删除 %d 处「主人」→「你」（对方非主人，未配置称呼）"
                         % n_fix, appid, cat="回复")
                 text = fixed
+        if pick:
+            _sticker_pending.set(pick)      # 交给发送方：文字先发，图后发
         _remember(botdir, key, "assistant", text)
         # 存档：把这一轮发出去的话补到「刚收到那条」的 reply_text 上（一行 = 原文 ⇢ 回复）
         _arc_reply_by_key(botdir, key, text)

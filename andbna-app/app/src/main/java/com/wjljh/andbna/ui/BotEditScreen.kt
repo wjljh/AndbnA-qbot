@@ -11,7 +11,9 @@ import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
@@ -57,6 +59,7 @@ import com.wjljh.andbna.local.BotStore.replyDelayMaxMs
 import com.wjljh.andbna.local.BotStore.replyDelayMinMs
 import com.wjljh.andbna.local.LocalBot
 import com.wjljh.andbna.local.PersonaAssets
+import com.wjljh.andbna.local.StickerStore
 import com.wjljh.andbna.local.WordsStore
 import com.wjljh.andbna.ui.component.BotFormField
 import com.wjljh.andbna.ui.component.BotFormModelSection
@@ -68,12 +71,15 @@ import com.wjljh.andbna.ui.component.rememberPersonaImporter
 import com.wjljh.andbna.ui.component.PanelArrowRow
 import com.wjljh.andbna.ui.component.PanelGroupCard
 import com.wjljh.andbna.ui.component.PanelIconPillButton
+import com.wjljh.andbna.ui.component.PanelIcons
 import com.wjljh.andbna.ui.component.PanelListRow
+import com.wjljh.andbna.ui.component.PanelMetrics
 import com.wjljh.andbna.ui.component.PanelPillRow
 import com.wjljh.andbna.ui.component.PanelPrimaryButton
 import com.wjljh.andbna.ui.component.PanelSecondaryButton
 import com.wjljh.andbna.ui.component.SecretEyeButton
 import com.wjljh.andbna.ui.component.PanelTokens
+import com.wjljh.andbna.ui.component.modeClickable
 import com.wjljh.andbna.ui.component.panelStepTransition
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -116,9 +122,11 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    // 「群配置」二级页就地接管整屏（不新增 App 路由）：返回就回到本页，编辑页状态全在 remember 里。
-    // 进出这一层也用 panelStepTransition（与列表↔单群编辑、引导页同一份），在函数尾部渲染时切换。
-    var showGroups by remember(appid) { mutableStateOf(false) }
+    // 「群配置」「表情 / 图片库」两个二级页就地接管整屏（不新增 App 路由）：返回就回到本页，
+    // 编辑页状态全在 remember 里。进出这一层也用 panelStepTransition（与列表↔单群编辑、引导页同一份）。
+    var sub by remember(appid) { mutableStateOf("") }   // "" = 本页 / "groups" / "stickers"
+    /** 表情库张数（右侧「N 张 / 未添加」）：只在 IO 里读 library.json */
+    var stickerCount by remember(appid) { mutableStateOf(0) }
     // 组合期一律不读盘、不读 prefs：bot 详情 / 模型三件套 / 人格清单 / 定时表 / openid 全在下面的
     // LaunchedEffect 里按 IO 读回来再填状态（这几行以前都是 remember { ... } 里同步读文件）。
     var bot by remember(appid) { mutableStateOf<LocalBot?>(null) }
@@ -256,6 +264,9 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
 
         // ③ openid：主人（问候发私聊用）+ 群列表（「另记到 N 个群」用）
         collectIds()
+
+        // ④ 表情库张数：<botdir>/stickers/library.json（卡片右侧「N 张 / 未添加」）
+        stickerCount = withContext(Dispatchers.IO) { StickerStore.load(ctx, appid).size }
     }
 
     // 老的 tasks.json「定时任务」已下线：编辑页不再读写它，运行侧也不再执行（见 bot_runner._sched_loop）
@@ -509,6 +520,44 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 )
             }
 
+            // ⑥′ 表情 / 图片库：一行入口（右侧 N 张 / 未添加），点开二级页管理
+            PanelGroupCard {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .heightIn(min = PanelMetrics.RowMinHeight)
+                        .modeClickable(onClick = { sub = "stickers" }),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Column(Modifier.weight(1f)) {
+                        Text(
+                            text = "表情 / 图片库",
+                            fontSize = PanelMetrics.BodySize,
+                            color = PanelColors.onSurface,
+                        )
+                        Text(
+                            text = "点开管理：导入图片、写描述、删除",
+                            fontSize = PanelMetrics.ValueSize,
+                            color = PanelColors.onSurfaceVariantSummary,
+                            modifier = Modifier.padding(top = PanelTokens.RowSpacing),
+                        )
+                    }
+                    Text(
+                        text = if (stickerCount > 0) stickerCount.toString() + " 张" else "未添加",
+                        fontSize = PanelMetrics.ValueSize,
+                        color = if (stickerCount > 0) PanelColors.primary else PanelColors.onSurfaceVariantSummary,
+                    )
+                    Spacer(Modifier.width(PanelMetrics.ButtonGap))
+                    Icon(
+                        imageVector = PanelIcons.ChevronForward,
+                        contentDescription = null,
+                        tint = PanelColors.onSurfaceVariantSummary,
+                        modifier = Modifier.size(PanelMetrics.RowIconSize),
+                    )
+                }
+            }
+            Spacer(Modifier.height(PanelTokens.CardSpacing))
+
             // ⑦ 问候：总开关 + 发到哪 + 时段表（每段在窗口内随机挑一刻发一条）
             BotFormSection(title = "问候") {
                 BotFormSwitchRow(
@@ -696,7 +745,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                     title = "按群单独设置",
                     summary = "自动接话 / 每日额度 / 联网 / 整群静音；没配过的群沿用上面的设置",
                     feedback = false,
-                    onClick = { showGroups = true },
+                    onClick = { sub = "groups" },
                 )
             }
 
@@ -724,16 +773,29 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
         }
     }
 
-    // 本页 ↔ 群配置：同一份 panelStepTransition
-    //   进入（showGroups=false → true）：forward = true，群配置从右进、本页往左出；
-    //   返回（true → false）：forward = false，本页从右进、群配置往左出 —— 与列表↔单群编辑完全一致。
+    // 本页 ↔ 群配置 / 表情图片库：同一份 panelStepTransition
+    //   进入（"" → 某页）：forward = true，二级页从右进、本页往左出；
+    //   返回（某页 → ""）：forward = false，本页从右进、二级页往左出 —— 与列表↔单群编辑完全一致。
     AnimatedContent(
-        targetState = showGroups,
-        transitionSpec = { panelStepTransition(forward = targetState) },
-        label = "bot-edit-groups",
-    ) { groups ->
-        if (groups) {
-            GroupConfigScreen(metrics = metrics, appid = appid, onBack = { showGroups = false })
+        targetState = sub,
+        transitionSpec = { panelStepTransition(forward = targetState.isNotEmpty()) },
+        label = "bot-edit-sub",
+    ) { route ->
+        if (route == "groups") {
+            GroupConfigScreen(metrics = metrics, appid = appid, onBack = { sub = "" })
+        } else if (route == "stickers") {
+            StickerLibraryScreen(
+                metrics = metrics,
+                appid = appid,
+                botName = title,
+                onBack = {
+                    sub = ""
+                    // 回来时刷新「N 张」：导入 / 删除都可能刚刚发生过
+                    scope.launch {
+                        stickerCount = withContext(Dispatchers.IO) { StickerStore.load(ctx, appid).size }
+                    }
+                },
+            )
         } else if (LocalUiMode.current == UiMode.Material) {
             M3Scaffold(
                 containerColor = MaterialTheme.colorScheme.background,

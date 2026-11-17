@@ -422,6 +422,21 @@ object BotStore {
         }
 
     /**
+     * 允许 bot 自己发表情（默认开）：二级页「表情 / 图片库」顶部那个开关。
+     *
+     * 与 [masterWordGuard] 同一套写法：缺键 → true（别让 getString 的默认值盖掉用户显式关闭）。
+     * prefs 存一份给界面读，llm.json 里再写一份（Python 侧每条消息现读文件，不用重启 bot）。
+     */
+    var Context.stickerEnabled: Boolean
+        get() = sp(this).let {
+            !it.contains("sticker_enabled") ||
+                it.getString("sticker_enabled", "1").orEmpty().trim() != "0"
+        }
+        set(v) {
+            sp(this).edit().putString("sticker_enabled", if (v) "1" else "0").apply()
+        }
+
+    /**
      * 日志详细程度：simple（简洁，默认）/ detail（详细）。
      *
      * 真正的过滤在 Python 写日志时按 llm.json 的 log_level 完成，这里只负责落盘一份；
@@ -524,6 +539,8 @@ object BotStore {
             .put("reply_delay_max_ms", ctx.replyDelayMaxMs)
             // 非主人不称呼主人（默认 true）：false = 只注入规则、不替换「主人」
             .put("master_word_guard", ctx.masterWordGuard)
+            // 允许 bot 自己发表情（默认 true）：图片库本身在 <botdir>/stickers/
+            .put("sticker_enabled", ctx.stickerEnabled)
             // 全局每日上限：群配置「跟随全局」时 Python 侧读这一档（0 = 无上限）
             .put("daily_limit", ctx.dailyLimit)
             // 日志详细程度（simple / detail）：Python 写日志时按它决定是否带细节
