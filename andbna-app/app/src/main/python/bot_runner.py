@@ -6690,15 +6690,23 @@ _STICKER_HINT_RULE = ("想发某张就在回复末尾单独写一行：<sticker>
 _STICKER_HINT_TAIL = "不想发就不要写。不要解释这个标记。"
 _STICKER_EMPTY = "库里还没有表情"
 _STICKER_FAIL_SAY = "发不出去：%s"     # 只发图失败时唯一会说的那句话
+# 模型写了 <sticker>、图却没发出去（id 不在候选 / 上传失败 / 发送失败）时补的那句话，
+# 以及留给下一轮 system 的一句事实 —— 不然它会顺着自己的话继续声称「发了」。
+_STICKER_LOST = "图上不去了"
+_STICKER_LOST_FACT = "上一轮表情没发出去（%s）。这一轮不要说你发了图，也别再提那张图。"
 _STICKER_CMD_GAP_S = 300            # 非主人：#表情 同一会话同一个人 5 分钟最多 1 次
 _STICKER_CMD_BUSY = "歇会儿，5 分钟后再来"
 _sticker_lib_cache = {}             # library.json 路径 -> ((mtime_ns, size), [item])
 _sticker_conf_cache = {}            # llm.json 路径 -> ((mtime_ns, size), conf)
 _sticker_lock = threading.Lock()
-_sticker_state = {"replies": {}, "sent": {}}   # 防刷屏状态：只在内存，重启清零
+_sticker_state = {"replies": {}, "sent": {}, "fail": {}}
+# replies=本窗口回复条数；sent=冷却打点；fail=上一轮写了标记却没发出去的会话（只留一轮）
+# 全部只在内存，重启清零
 _sticker_cmd_state = {"last": {}, "warned": {}}  # 命令限频：last=上次放行，warned=上次回过拒绝
 _sticker_pending = contextvars.ContextVar("sticker_pending", default=None)
 _sticker_last_err = contextvars.ContextVar("sticker_last_err", default="")  # 上一次发图失败的原因（只发图时要回一句）
+_sticker_lost = contextvars.ContextVar("sticker_lost", default=False)  # 本轮写了标记但图没发出去 → 正文之后补一句
+_sticker_direct = contextvars.ContextVar("sticker_direct", default=False)  # 本轮是用户主动找它（@ / 叫名字 / 私聊）
 # botpy 的错误类型不带状态码，按类名反查（不 import botpy：单测环境里没有它）
 _STICKER_HTTP = {"AuthenticationFailedError": 401, "ForbiddenError": 403,
                  "NotFoundError": 404, "MethodNotAllowedError": 405,
@@ -6836,32 +6844,47 @@ def _sticker_cooldown_left(botdir, sid):
     return max(0.0, window - (time.time() - hit)) / 3600.0
 
 
-def _sticker_pick(appid, botdir, key, sid):
+def _sticker_pick(appid, botdir, key, sid, direct=False):
     """模型挑的这张到底发不发：开关 → id 在候选 → 窗口到了 → 不在冷却。
 
+    direct=True（用户点名要图：私聊 / 群里 @ 了本 bot / 叫了名字）时**跳过窗口与冷却**，
+    只要求 id 在候选 —— 用户开口了还按「每 N 条一张」拦，就变成「它答应了却没发」。
+    其它情形（总模型自动接话、bot 之间续聊）照旧受限。
     放行时当场记账（窗口清零 + 冷却打点），发送失败由 _sticker_unmark 回滚冷却。
-    返回要发的条目，或 None。
+    → (条目, 没发的理由)；理由："" 放行 / off 开关关或空 id / id 不在候选 / window / cool。
     """
     sid = str(sid or "").strip()
     conf = _sticker_conf(_base_dir)
     if not conf["enabled"] or not sid:
-        return None
+        return None, "off"
     item = next((x for x in _sticker_library(botdir) if x["id"] == sid), None)
     if item is None:
         log("表情：id 不在候选里（%s）" % sid, appid, cat="错误")
-        return None
+        return None, "id"
+    every = int(conf["every_n"])
     n = int(_sticker_state["replies"].get(str(key or ""), 0))
-    if n < conf["every_n"]:
-        log("表情：跳过 %s（本会话 %d/%d 条，窗口未到）" % (sid, n, conf["every_n"]),
-            appid, cat="回复", lv="detail")
-        return None
     left = _sticker_cooldown_left(botdir, sid)
+    if direct:
+        blocked = []
+        if n < every:
+            blocked.append("窗口 %d/%d" % (n, every))
+        if left > 0:
+            blocked.append("冷却 %.1f 小时" % left)
+        _sticker_note_sent(botdir, key, sid)
+        if blocked:
+            log("表情：用户点名 → 直接放行 %s（跳过%s）" % (sid, "、".join(blocked)),
+                appid, cat="判定")
+        return item, ""
+    if n < every:
+        # 判定级：简洁模式下也得看得见「它这次为什么没发图」，否则就是无声地食言
+        log("表情：跳过 %s（窗口 %d/%d 未到）" % (sid, n, every), appid, cat="判定")
+        return None, "window"
     if left > 0:
         log("表情：跳过 %s（同一张图冷却中，还要 %.1f 小时）" % (sid, left),
-            appid, cat="回复", lv="detail")
-        return None
+            appid, cat="判定")
+        return None, "cool"
     _sticker_note_sent(botdir, key, sid)
-    return item
+    return item, ""
 
 
 def _sticker_note_sent(botdir, key, sid):
@@ -6879,6 +6902,42 @@ def _sticker_unmark(botdir, item):
     """这次没发出去：把冷却打点撤掉，别让一次网络抖动白占一整个冷却窗口。"""
     with _sticker_lock:
         _sticker_state["sent"].pop((str(botdir or ""), str((item or {}).get("id") or "")), None)
+
+
+def _sticker_fail_note(botdir, key, why):
+    """这一轮写了标记、图却没发出去：记一句事实，下一轮拼进 system（只留一轮）。"""
+    with _sticker_lock:
+        _sticker_state["fail"][str(key or "")] = str(why or "")[:60]
+
+
+def _sticker_fail_take(key):
+    """取走上一轮那句「表情没发出去」（取完即清，不重复念）。"""
+    with _sticker_lock:
+        return _sticker_state["fail"].pop(str(key or ""), "")
+
+
+async def _sticker_lost_say(appid, api, botdir, key, gid, mid, why=""):
+    """图没发出去 → 正文之后补一句极短说明，并给下一轮留一句事实。
+
+    只在「模型确实写了 <sticker>」且「id 不在候选 / 上传失败 / 发送失败」时调；
+    窗口与冷却拦下的不算（那是策略，不是故障）。
+    """
+    _sticker_fail_note(botdir, key, why)
+    key = str(key or "")
+    if api is None:
+        return False
+    try:
+        if key[:1] == "p":
+            await api.post_c2c_message(openid=key[1:], msg_type=0, msg_id=mid,
+                                       msg_seq=_next_msg_seq(appid, mid), content=_STICKER_LOST)
+        else:
+            await api.post_group_message(group_openid=gid, msg_id=mid, msg_type=0,
+                                         msg_seq=_next_msg_seq(appid, mid), content=_STICKER_LOST)
+    except Exception as e:
+        log("表情：补一句「%s」没发出去 %r" % (_STICKER_LOST, e), appid, cat="错误")
+        return False
+    log("表情：补一句「%s」（%s）" % (_STICKER_LOST, why or "图没发出去"), appid, cat="判定")
+    return True
 
 
 def _sticker_remember(botdir, key):
@@ -7256,11 +7315,12 @@ async def _post_group(api, appid, gid, mid, content="", markdown=None):
 
 
 async def _group_send(appid, botdir, message, gid, who, model_in, images=None,
-                      extra_sys="", closing=None):
+                      extra_sys="", closing=None, sticker_direct=False):
     """群回复的唯一出口：延迟 → 抢先检查 → 生成 → 群级互斥 → 发出去 → 记「刚说过」。
 
     closing = {"bot","target","minutes"} 时是 end_topic 的收尾：发出去之后给这对
     关系上静默、把该 bot 的句数清零。→ 发出去的纯文本；放弃 / 失败 → ""。
+    sticker_direct：这一轮是用户主动找它（@ 了本 bot / 叫了名字）→ 表情跳过窗口与冷却。
     """
     gconf = _gate_conf(_base_dir)
     # 本轮的会话键：从**触发这一轮的那条消息正文**算（不是本 bot 自己的输出）。
@@ -7272,12 +7332,21 @@ async def _group_send(appid, botdir, message, gid, who, model_in, images=None,
     try:
         tok = _member_openid_ctx.set(_member_openid_of(message))
         try:
-            reply = await _reply(appid, botdir, "g" + gid, who, model_in, images=images,
-                                 extra_sys=extra_sys)
+            dtok = _sticker_direct.set(bool(sticker_direct))
+            try:
+                reply = await _reply(appid, botdir, "g" + gid, who, model_in, images=images,
+                                     extra_sys=extra_sys)
+            finally:
+                _sticker_direct.reset(dtok)
         finally:
             _member_openid_ctx.reset(tok)
         pend = _sticker_take()      # _reply 挑好的表情；正文为空 = 只发图
+        lost = "id 不在候选" if (not pend and _sticker_lost.get()) else ""
         if not reply and not pend:
+            if lost:
+                # 正文和标记都空了：至少让它说一句图没发出去，别整轮无声
+                await _sticker_lost_say(appid, message._api, botdir, "g" + gid, gid,
+                                        _unique_msg_id(message)[1], lost)
             return ""          # 出站清洗判空：这条不发（_reply 里已记「丢弃」日志）
         plain, at_ids = (_resolve_at_tags(reply, _mentions_of(message)) if reply
                          else ("", []))
@@ -7311,8 +7380,15 @@ async def _group_send(appid, botdir, message, gid, who, model_in, images=None,
                 _sticker_unmark(botdir, pend)
             return ""          # 发不出去就不算说过：不记「刚说过」，本轮到此为止
         # 顺序硬规则：文字已经发出去了，才轮到表情；表情失败绝不影响那条文字
+        lost_why = ""
         if pend:
-            await _sticker_send(appid, message._api, botdir, "g" + gid, pend, mid)
+            if not await _sticker_send(appid, message._api, botdir, "g" + gid, pend, mid):
+                lost_why = _sticker_last_err.get() or "发送失败"
+        elif lost:
+            lost_why = lost
+        if lost_why:
+            # 说了要发却没发出去：补一句「图上不去了」，别让下一句继续假装发过
+            await _sticker_lost_say(appid, message._api, botdir, "g" + gid, gid, mid, lost_why)
     except Exception as e:
         log("回群失败：%r" % e, appid, cat="错误")
         return ""
@@ -9053,8 +9129,13 @@ async def _handle_group(appid, botdir, message, tag):
     # 联网指令（#搜 / #读）：搜完交给模型按人格转述（人设化加工），链接洗净后贴出去
     if await _local_web_cmd(appid, message, body, group_openid=gid, botdir=botdir):
         return
+    # 这一轮是不是用户主动找它（@ 了本 bot / 叫了名字）—— 用户点名要表情时跳过窗口与冷却。
+    # 总模型自动接话、bot 之间续聊都走不到这里 → 它们照旧受限。
+    name_call = bool(_name_hit(botdir, text)) if (
+        (_llm_conf(_base_dir) or {}).get("name_hit_as_call", True)) else False
     # 延迟 + 抢先检查 + 发送（_group_send 是群回复的唯一出口）
-    await _group_send(appid, botdir, message, gid, "", model_in, images, extra_sys, closing)
+    await _group_send(appid, botdir, message, gid, "", model_in, images, extra_sys, closing,
+                      sticker_direct=(at_state == "yes") or name_call)
 
 def _make_client(appid, secret, botdir, gen=None):
     """每个实例一套自己的 Client 类，避免事件回调串台。
@@ -9191,17 +9272,28 @@ def _make_client(appid, secret, botdir, gen=None):
                                    "p" + str(message.author.user_openid), "", text,
                                    images=images)
                 pend = _sticker_take()
+                pkey = "p" + str(message.author.user_openid)
+                lost = "id 不在候选" if (not pend and _sticker_lost.get()) else ""
                 if not say and not pend:
+                    if lost:
+                        await _sticker_lost_say(appid, message._api, botdir, pkey, "",
+                                                str(message.id), lost)
                     return         # 出站清洗判空：这条不发（_reply 里已记「丢弃」日志）
                 if say:
                     await message._api.post_c2c_message(
                         openid=message.author.user_openid, msg_type=0,
                         msg_id=message.id, content=say,
                     )
+                lost_why = ""
                 if pend:
-                    await _sticker_send(appid, message._api, botdir,
-                                        "p" + str(message.author.user_openid), pend,
-                                        str(message.id))
+                    if not await _sticker_send(appid, message._api, botdir, pkey, pend,
+                                               str(message.id)):
+                        lost_why = _sticker_last_err.get() or "发送失败"
+                elif lost:
+                    lost_why = lost
+                if lost_why:
+                    await _sticker_lost_say(appid, message._api, botdir, pkey, "",
+                                            str(message.id), lost_why)
             except Exception as e:
                 log("回私聊失败：%r" % e, appid, cat="错误")
 
@@ -9215,9 +9307,11 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
     识图失败就退回纯文本处理，消息照常回，不会静默丢掉。
     LLM 没配（localbot/llm.json 缺失或没 key）时退回连通测试文案，
     这样至少能看出「收到消息了」，而不是静默不回复。
+    「这一轮是不是用户主动找它」由调用方经 _sticker_direct 传进来（私聊一律算）。
     """
     _usage_appid.set(appid)          # 这条链路里的模型调用（含判定/识图/摘要/搜索合成）记到该 bot 账上
     _sticker_pending.set(None)       # 每轮重新决定，上一轮挑的图绝不许漏到这一轮
+    _sticker_lost.set(False)         # 本轮写下的标记到底发没发出去，由发送方收尾
     if images and not incoming:
         incoming = "（发了张图）"
     conf = _llm_conf(_base_dir) if _base_dir else None
@@ -9254,6 +9348,14 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
         if hint:
             msgs[0]["content"] = msgs[0]["content"] + chr(10) + chr(10) + hint
             log("表情候选：%d 个" % len(cands), appid, cat="系统", lv="detail")
+        # 上一轮写了 <sticker> 却没发出去：这一轮 system 里留一句事实，
+        # 不然它会接着自己「已经发了」的话往下说，用户只看到一张不存在的图。
+        bad = _sticker_fail_take(key)
+        if bad:
+            msgs[0]["content"] = (msgs[0]["content"] + chr(10) + chr(10)
+                                  + (_STICKER_LOST_FACT % bad))
+            log("表情：上一轮有标记没发出去（%s）→ 本轮 system 里带一句事实" % bad,
+                appid, cat="判定")
         # extra_sys：群内最近消息（带名字标签）/ 收尾提示 —— 插在这一条之前当 system
         if extra_sys:
             msgs.insert(len(msgs) - 1, {"role": "system", "content": extra_sys})
@@ -9346,7 +9448,12 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
         if str(key or "")[:1] in ("g", "p"):
             _sticker_bump(key)          # 每条回复都算进本会话窗口（含没发表情的）
             if sid:
-                pick = _sticker_pick(appid, botdir, key, sid)
+                # 私聊 = 对方就是跟本 bot 说话；群里由调用方给出「@ 了本 bot / 叫了名字」。
+                # 用户点名要图时窗口与冷却不再拦（否则就是「答应了、什么都没发」）。
+                direct = bool(_sticker_direct.get()) or str(key or "")[:1] == "p"
+                pick, sk_why = _sticker_pick(appid, botdir, key, sid, direct=direct)
+                if pick is None and sk_why == "id":
+                    _sticker_lost.set(True)     # 欠用户一句「图上不去了」
         raw_len = len(text)
         # ① 出站清洗：模型把自己的指令 / 思考 / 收尾标记一起抄出来时，这里只留正文
         before = text

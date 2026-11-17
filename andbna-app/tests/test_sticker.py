@@ -23,6 +23,10 @@
  14) 开关关掉命令照样能发；库空回「库里还没有表情」
  15) system 常驻行：库非空才有、只列前 6 张 / 描述截 20 字、开关关掉不占 token
  16) 自然语言触发（发个表情 / 来个无语的表情）：私聊任意消息，群里要 @ 或叫名字
+ 17) 用户点名要图（私聊 / 群里 @ 了本 bot / 叫了名字）→ 跳过 every_n 与冷却，只要求 id 在候选
+ 18) 被窗口 / 冷却拦下一律记「判定」级（简洁模式可见），不再静默
+ 19) 写了 <sticker> 却没发出去（id 不在候选 / 上传发送失败）→ 补一句「图上不去了」，
+     并在下一轮 system 里留一句「上一轮表情没发出去」
 """
 import asyncio
 import json
@@ -149,6 +153,7 @@ def reset():
     del br._state["log"][:]
     br._sticker_state["replies"].clear()
     br._sticker_state["sent"].clear()
+    br._sticker_state["fail"].clear()
     br._sticker_cmd_state["last"].clear()
     br._sticker_cmd_state["warned"].clear()
     br._sticker_lib_cache.clear()
@@ -181,8 +186,10 @@ def reply(text, key="g" + GID):
     return asyncio.run(go())
 
 
-def group_send(mid="m1", body="在吗"):
-    return asyncio.run(br._group_send(APPID, BOT, FakeMsg(mid, body), GID, "", body))
+def group_send(mid="m1", body="在吗", direct=False):
+    """direct=True = 群里 @ 了本 bot / 叫了名字（用户主动找它）。"""
+    return asyncio.run(br._group_send(APPID, BOT, FakeMsg(mid, body), GID, "", body,
+                                      sticker_direct=direct))
 
 
 # ── 1 · 候选过滤 + mtime 缓存 + 提示词原文 ─────────────────────
@@ -307,8 +314,8 @@ def test_rate():
         got.append((reply("在吗")[1] or {}).get("id"))
     check("6a 3 条 1 张：前 2 条不发、第 3 条发、第 4 条重新计数",
           got == [None, None, "s1", None], got)
-    check("6b 没到窗口时 detail 日志写清进度",
-          has("表情：跳过 s1（本会话 1/3 条，窗口未到）"),
+    check("6b 没到窗口时判定级日志写清进度（简洁模式也看得见）",
+          has("判定 · 表情：跳过 s1（窗口 1/3 未到）"),
           [x for x in logs() if "表情：跳过" in x])
 
     print("[7] 同图冷却")
@@ -337,8 +344,9 @@ def test_send():
     MODEL["out"] = "在的<sticker>s1</sticker>"
     group_send()
     kinds = [k for k, _ in API.sent]
-    check("8a 文字照发（表情失败绝不影响文字）",
-          kinds == ["group"] and API.sent[0][1].get("content") == "在的", API.sent)
+    check("8a 文字照发 + 补一句「图上不去了」（表情失败绝不影响文字）",
+          kinds == ["group", "group"] and API.sent[0][1].get("content") == "在的"
+          and API.sent[1][1].get("content") == br._STICKER_LOST, API.sent)
     check("8b 没有发出第二条富媒体消息", not any(kw.get("msg_type") == 7 for _k, kw in API.sent))
     check("8c 错误行：表情发送失败：…｜已回退纯文字",
           has("错误 · 表情发送失败：连接被重置｜已回退纯文字"),
@@ -739,6 +747,70 @@ def test_only_image():
           ret == "" and texts() == [] and len(imgs()) == 1, API.sent)
 
 
+# ── 21 · 用户点名要图：跳过窗口与冷却；没发出去不许装没发生 ──────────
+
+def test_direct():
+    print("[21] 用户点名要图 → 跳过窗口与冷却 / 没发出去要说明")
+    # 私聊 + 标记 + 会话回复数远不到 every_n(10) → 照样发
+    reset()
+    write_llm(sticker_every_n=10, sticker_cooldown_h=24)
+    lib10()
+    MODEL["out"] = "喏<sticker>s3</sticker>"
+    out, pend = reply("那你发一个", key="p" + UOID)
+    check("21a 私聊：本会话回复数 1/10 也照样选图（用户点名不受窗口限制）",
+          out == "喏" and pend and pend["id"] == "s3", (out, pend))
+    check("21b 放行路径照样记账（窗口清零 + 冷却打点，免得紧接着又发一张）",
+          br._sticker_state["replies"].get("p" + UOID) == 0
+          and list(br._sticker_state["sent"]) == [(BOT, "s3")],
+          (br._sticker_state["replies"], br._sticker_state["sent"]))
+
+    # 群里 at_state=yes（真人 @ 了本 bot）+ 同一张图正在冷却 → 照样发
+    reset()
+    write_llm(sticker_every_n=10, sticker_cooldown_h=24)
+    lib10()
+    br._sticker_state["sent"][(BOT, "s3")] = br.time.time()
+    MODEL["out"] = "行<sticker>s3</sticker>"
+    group_send(mid="md1", direct=True)
+    check("21c 群 @ 了本 bot：冷却中的那张也照发",
+          len(imgs()) == 1 and len(texts()) == 1 and texts() == ["行"], API.sent)
+    check("21d 判定级日志写清跳过了什么",
+          has("表情：用户点名 → 直接放行 s3") and "冷却" in " ".join(logs()),
+          [x for x in logs() if "点名" in x])
+
+    # 群里自动接话（非 @、非名字命中）+ 窗口未到 → 不发，且是「判定」级（简洁模式可见）
+    reset()
+    write_llm(sticker_every_n=10, sticker_cooldown_h=0, log_level="simple")
+    lib10()
+    MODEL["out"] = "嗯<sticker>s3</sticker>"
+    group_send(mid="md2")
+    check("21e 自动接话：窗口没到就不发图，也不补「图上不去了」",
+          imgs() == [] and texts() == ["嗯"], API.sent)
+    check("21f 跳过日志是「判定」级（简洁模式下真的看得到，不是 detail）",
+          any("判定 · 表情：跳过 s3（窗口 1/10 未到）" in x for x in logs()),
+          [x for x in logs() if "表情：跳过" in x])
+    check("21g 窗口拦下不算故障：不留「上一轮表情没发出去」",
+          br._sticker_state["fail"] == {}, br._sticker_state["fail"])
+
+    # id 不在候选 → 错误行 + 补一句 + 下一轮 system 里的事实
+    reset()
+    write_llm(sticker_every_n=1, sticker_cooldown_h=0)
+    lib10()
+    MODEL["out"] = "哈哈<sticker>zzz</sticker>"
+    group_send(mid="md3")
+    check("21h id 不在候选：错误行 + 正文之后补一句「图上不去了」",
+          has("错误 · 表情：id 不在候选里（zzz）")
+          and texts() == ["哈哈", br._STICKER_LOST], API.sent)
+    MODEL["out"] = "嗯"
+    reply("在吗")
+    check("21i 下一轮 system 里带一句事实：上一轮表情没发出去",
+          any("上一轮表情没发出去" in s for s in MODEL["systems"]),
+          MODEL["systems"][-1][-80:])
+    MODEL["out"] = "好"
+    reply("在吗")
+    check("21j 这句事实只保留一轮（第二句起不再念）",
+          "上一轮表情没发出去" not in MODEL["systems"][-1], MODEL["systems"][-1][-80:])
+
+
 def main():
     os.makedirs(BOT, exist_ok=True)
     with open(os.path.join(BOT, "persona.txt"), "w", encoding="utf-8") as f:
@@ -756,6 +828,7 @@ def main():
     test_stick_line()
     test_nl()
     test_only_image()
+    test_direct()
 
     shutil.rmtree(TMP, ignore_errors=True)
     bad = [r for r in RESULTS if not r[1]]
