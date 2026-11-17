@@ -65,7 +65,7 @@ fun BackupPanel(show: Boolean, onDismiss: () -> Unit) {
         ActivityResultContracts.CreateDocument("application/json")
     ) { uri: Uri? ->
         if (uri == null) {
-            msg = "已取消导出"
+            msg = "取消了，没导出"
             return@rememberLauncherForActivityResult
         }
         scope.launch {
@@ -81,7 +81,7 @@ fun BackupPanel(show: Boolean, onDismiss: () -> Unit) {
         ActivityResultContracts.OpenDocument()
     ) { uri: Uri? ->
         if (uri == null) {
-            msg = "已取消选择文件"
+            msg = "取消了，没选文件"
             return@rememberLauncherForActivityResult
         }
         scope.launch {
@@ -94,7 +94,7 @@ fun BackupPanel(show: Boolean, onDismiss: () -> Unit) {
                 askReplace = false
                 msg = ""
             } else {
-                msg = "导入失败：" + c.error + "（现有数据没动）"
+                msg = "没导进来：" + c.error + "，现有数据没动"
             }
         }
     }
@@ -109,14 +109,13 @@ fun BackupPanel(show: Boolean, onDismiss: () -> Unit) {
                 verticalArrangement = Arrangement.spacedBy(PanelTokens.RowSpacing),
             ) {
                 Text(
-                    text = "导出一个 JSON 文件：全局模型配置（只含地址与模型名）、通知 / 自动拉回 / " +
-                        "运行模式、每个 bot 的名称与人格、称呼与问候、记忆全文、自定义人格正文。",
+                    text = "导出一个 JSON，换机器时拿它搬回来。",
                     style = MiuixTheme.textStyles.body2,
                     color = colorScheme.onBackground,
                 )
                 Text(
-                    text = "AppSecret 与 API Key 不在备份里（写成 " + BackupIO.PLACEHOLDER +
-                        "），恢复后需要重新填写。",
+                    text = "AppSecret 和 API Key 不进备份，存成 " + BackupIO.PLACEHOLDER +
+                        "，恢复后自己重填。",
                     style = MiuixTheme.textStyles.body2,
                     color = PanelTokens.ErrorColor,
                 )
@@ -128,7 +127,7 @@ fun BackupPanel(show: Boolean, onDismiss: () -> Unit) {
                         text = "导出配置",
                         onClick = {
                             if (!busy) {
-                                msg = "准备导出…"
+                                msg = "挑个位置存…"
                                 exportLauncher.launch(
                                     "andbna-backup-" + android.text.format.DateFormat.format(
                                         "yyyyMMdd-HHmm", System.currentTimeMillis()
@@ -142,7 +141,7 @@ fun BackupPanel(show: Boolean, onDismiss: () -> Unit) {
                         text = "导入配置",
                         onClick = {
                             if (!busy) {
-                                msg = "选一个备份 JSON…"
+                                msg = "挑一个备份 JSON…"
                                 // OpenDocument 的入参是 mime 过滤：这里认 json 与 text/*
                                 importLauncher.launch(arrayOf("application/json", "text/plain", "*/*"))
                             }
@@ -152,14 +151,14 @@ fun BackupPanel(show: Boolean, onDismiss: () -> Unit) {
                 }
                 if (busy) {
                     Text(
-                        text = "正在处理，请稍候…",
+                        text = "在弄了…",
                         style = MiuixTheme.textStyles.body2,
                         color = colorScheme.onBackground,
                     )
                 }
                 if (summary.isNotBlank() && plan != null) {
                     Text(
-                        text = "文件里读到 " + summary + "，选择导入方式：",
+                        text = "文件里读到 " + summary + "，挑个导入方式：",
                         style = MiuixTheme.textStyles.body2,
                         color = colorScheme.onBackground,
                     )
@@ -181,7 +180,7 @@ fun BackupPanel(show: Boolean, onDismiss: () -> Unit) {
                         )
                     }
                     TextButton(
-                        text = "取消（先不导入）",
+                        text = "先不导入",
                         onClick = {
                             if (!busy) {
                                 plan = null
@@ -194,8 +193,8 @@ fun BackupPanel(show: Boolean, onDismiss: () -> Unit) {
                 }
                 if (askReplace) {
                     Text(
-                        text = "替换会先清空本机的 bot 清单，再写入备份里的 " +
-                            (plan?.bots?.size ?: 0) + " 个 bot（本机密钥保留，不清）。确定替换？",
+                        text = "先清空本机 bot，再写进备份的 " +
+                            (plan?.bots?.size ?: 0) + " 个。密钥留着，确定？",
                         style = MiuixTheme.textStyles.body2,
                         color = PanelTokens.ErrorColor,
                     )

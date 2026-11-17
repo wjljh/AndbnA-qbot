@@ -134,7 +134,7 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
                 ctx.stickerEnabled = on
                 BotStore.writeLlmJson(ctx)
             }
-            msg = if (on) "已允许 bot 自己发表情" else "已关闭：一条表情都不发（库还留着）"
+            msg = if (on) "已允许 bot 自己发表情" else "已关闭：一条都不发，库还留着"
         }
     }
 
@@ -148,9 +148,9 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
             items = list
             msg = when {
                 out.added.isNotEmpty() && out.errors.isEmpty() ->
-                    "已导入 " + out.added.size + " 张：给每张写个描述（空着不会进候选）"
+                    "已导入 " + out.added.size + " 张：给每张写个描述，空着不进候选"
                 out.added.isNotEmpty() ->
-                    "已导入 " + out.added.size + " 张；另有 " + out.errors.size + " 张没导入：" + out.errors.first()
+                    "导入 " + out.added.size + " 张，" + out.errors.size + " 张没成：" + out.errors.first()
                 else -> "没导入：" + (out.errors.firstOrNull() ?: "没有可用的图片")
             }
             // 导入后立刻要求写描述（多张就先填第一张，其余的网格里点开补）
@@ -176,7 +176,7 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
                 BotFormSection(title = "表情 / 图片库") {
                     BotFormSwitchRow(
                         title = "允许 bot 自己发表情",
-                        summary = if (enabled) "聊天时它会偶尔挑一张发；不想用就关掉" else "已关闭：它不会发表情（图还留着）",
+                        summary = if (enabled) "开着 · 它会偶尔挑一张发" else "关着 · 一条都不发，图还留着",
                         checked = enabled,
                         onCheckedChange = { switchEnabled(it) },
                     )
@@ -207,7 +207,7 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
                         PanelEmptyState(
                             icon = Icons.Rounded.Image,
                             title = "还没有表情：点右下角导入",
-                            body = "能用的格式：png / jpg / gif / webp / bmp。单张 ≤5 MB，整个库 ≤200 MB。",
+                            body = "png / jpg / gif / webp / bmp 都能用。单张 ≤5 MB，整库 ≤200 MB。",
                         )
                     }
                 } else {
@@ -308,7 +308,7 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
     PanelConfirmDialog(
         show = showDelete,
         title = "删除这张表情",
-        body = deleting?.let { "原图和缩略图会一起删掉，删了没法恢复。" } ?: "",
+        body = deleting?.let { "原图和缩略图一起删，删了没法恢复。" } ?: "",
         confirmLabel = "删除",
         onConfirm = {
             val target = deleting
@@ -417,7 +417,7 @@ private fun StickerEditDialog(
 
     WindowDialog(
         show = show,
-        title = if (item.desc.isBlank()) "填写描述（必填）" else "编辑表情",
+        title = if (item.desc.isBlank()) "填写描述，必填" else "编辑表情",
         onDismissRequest = onDismiss,
         content = {
             Column(Modifier.fillMaxWidth()) {
@@ -440,13 +440,13 @@ private fun StickerEditDialog(
                     modifier = Modifier.padding(start = 4.dp, bottom = 4.dp),
                 )
                 BotFormField(
-                    label = "描述（必填）",
+                    label = "描述",
                     value = desc,
                     onValueChange = {
                         desc = it
                         if (err.isNotBlank()) err = ""
                     },
-                    hint = "这张图是什么表情？例如：无语地翻了个白眼",
+                    hint = "例如：无语地翻了个白眼",
                     singleLine = false,
                     minLines = 2,
                 )
@@ -455,7 +455,7 @@ private fun StickerEditDialog(
                     label = "标签",
                     value = tags,
                     onValueChange = { tags = it },
-                    hint = "可留空，用逗号分隔：无语，嫌弃",
+                    hint = "能留空，逗号分隔：无语，嫌弃",
                 )
                 if (err.isNotBlank()) {
                     Spacer(Modifier.height(PanelTokens.ButtonGap))
@@ -472,7 +472,7 @@ private fun StickerEditDialog(
                         text = "保存",
                         onClick = {
                             if (desc.isBlank()) {
-                                err = "描述空着不行：空着不会进候选，等于没导入。写一句再保存"
+                                err = "没写描述：空着不进候选。写一句再保存"
                             } else {
                                 onSave(desc, splitTags(tags))
                             }

@@ -207,7 +207,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
         onImported = { n ->
             personas = PersonaAssets.listAll(ctx)
             persona = PersonaAssets.CUSTOM_PREFIX + n
-            msg = "已导入自定义人格：" + n
+            msg = "人格导进来了：" + n
         },
         onMessage = { msg = it },
     )
@@ -218,10 +218,10 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
         owner = ids.owner
         groups = ids.groups
         idMsg = when {
-            ids.owner.isNotBlank() && ids.groups.isEmpty() -> "已定位主人（还没记到群）"
-            ids.owner.isNotBlank() -> "已定位主人，另记到 " + ids.groups.size + " 个群"
-            ids.groups.isEmpty() -> "还没采到：先启动 bot 让它收到一条群消息或私聊，再点一次"
-            else -> "还没定位到主人：让主人私聊 bot 一次再来"
+            ids.owner.isNotBlank() && ids.groups.isEmpty() -> "主人认到了，还没记到群"
+            ids.owner.isNotBlank() -> "主人认到了，另外记在 " + ids.groups.size + " 个群"
+            ids.groups.isEmpty() -> "还没采到：先启动 bot 收条消息，再点一次"
+            else -> "没认出主人：让主人私聊 bot 一次再来"
         }
     }
 
@@ -403,7 +403,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                         prevWords.groupsTarget != greetGroups
                 }
                 val note = if (!changed || !BotRestarts.requestOne(ctx, appid, "编辑保存")) "" else {
-                    "正在重启「" + name.trim().ifBlank { appid } + "」…"
+                    "在重启「" + name.trim().ifBlank { appid } + "」…"
                 }
                 SavedNote(note = note, wordsErr = wordsErr, slotChanged = slotChanged)
             }
@@ -436,7 +436,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
             // ① 基本信息：AppID 只读 + 启用开关 + 名字
             BotFormSection(title = "基本信息") {
                 Text(
-                    text = "AppID（不可修改）",
+                    text = "AppID 改不了",
                     fontSize = 13.sp,
                     fontWeight = FontWeight(550),
                     color = PanelColors.onSurfaceVariantSummary,
@@ -457,7 +457,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 )
                 BotFormSwitchRow(
                     title = "启用",
-                    summary = if (enabled) "已启用 · 保存后立刻上线" else "未启动 · 保存后立刻下线",
+                    summary = if (enabled) "保存就上线" else "保存就下线",
                     checked = enabled,
                     onCheckedChange = { enabled = it },
                 )
@@ -466,7 +466,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                     label = "名字",
                     value = name,
                     onValueChange = { name = it },
-                    hint = "方便管理，可留空",
+                    hint = "方便认，可留空",
                 )
             }
 
@@ -480,14 +480,14 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
             // ③ 主人 openid：只留这一项（群 / 私聊 openid 两组按用户要求删掉）
             BotFormSection(title = "主人 openid") {
                 Text(
-                    text = "问候发私聊时发给这个 openid",
+                    text = "定时问候私聊就发给它",
                     fontSize = 13.sp,
                     color = PanelColors.onSurfaceVariantSummary,
                     modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
                 )
                 if (owner.isBlank()) {
                     Text(
-                        text = "还没采到：先让主人私聊 bot 一次，再点下面这个按钮",
+                        text = "还没采到：让主人私聊 bot 一次，再点下面",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
@@ -533,7 +533,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                     PersonaAssets.deleteCustom(ctx, full)
                     personas = PersonaAssets.listAll(ctx)
                     if (persona == full) persona = ""
-                    msg = "已删除自定义人格：" + full.removePrefix(PersonaAssets.CUSTOM_PREFIX)
+                    msg = "人格删了：" + full.removePrefix(PersonaAssets.CUSTOM_PREFIX)
                 },
             )
 
@@ -552,7 +552,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                     hint = "怎么称呼其他人",
                 )
                 Text(
-                    text = "主人 = 该 bot 的主人 openid（在「主人 openid」区可见）",
+                    text = "主人就是上面那个 openid",
                     fontSize = 13.sp,
                     color = PanelColors.onSurfaceVariantSummary,
                     modifier = Modifier.padding(start = 4.dp, top = 6.dp),
@@ -575,7 +575,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                             color = PanelColors.onSurface,
                         )
                         Text(
-                            text = "点开管理：导入图片、写描述、删除",
+                            text = "点开管理：导图、删图",
                             fontSize = PanelMetrics.ValueSize,
                             color = PanelColors.onSurfaceVariantSummary,
                             modifier = Modifier.padding(top = PanelTokens.RowSpacing),
@@ -601,26 +601,26 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
             BotFormSection(title = "问候") {
                 BotFormSwitchRow(
                     title = "启用定时问候",
-                    summary = if (greetOn) "时段到了就发；关掉这一项一条都不发" else "已关闭（时段配置还留着）",
+                    summary = if (greetOn) "到点就发" else "一条都不发",
                     checked = greetOn,
                     onCheckedChange = { greetOn = it },
                 )
                 Spacer(Modifier.height(12.dp))
                 BotFormSwitchRow(
                     title = "发到主人私聊",
-                    summary = "发给主人 openid 的私聊窗口",
+                    summary = "发给主人的私聊",
                     checked = greetOwner,
                     onCheckedChange = { greetOwner = it },
                 )
                 Spacer(Modifier.height(12.dp))
                 BotFormSwitchRow(
                     title = "发到所有已知群",
-                    summary = "本 bot 在运行记录里出现过的群，逐个发",
+                    summary = "运行记录里出现过的群都发",
                     checked = greetGroups,
                     onCheckedChange = { greetGroups = it },
                 )
                 Text(
-                    text = "在窗口内每天随机一个时刻发，每个 bot 会错开（不是整点群发）。",
+                    text = "每天在窗口里随机挑一刻，bot 之间错开。",
                     fontSize = 13.sp,
                     color = PanelColors.onSurfaceVariantSummary,
                     modifier = Modifier.padding(start = 4.dp, top = 6.dp),
@@ -633,12 +633,12 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 // 进群欢迎：写 <botdir>/group_admin/_default.json 的 welcome（契约与群管理规则页同一份）
                 BotFormSwitchRow(
                     title = "进群欢迎",
-                    summary = "有人进群时 @ 他并说一句欢迎语",
+                    summary = "@ 一下并说句欢迎语",
                     checked = welcomeOn,
                     onCheckedChange = { welcomeOn = it },
                 )
                 Text(
-                    text = "需要先在 QQ 开放平台为该机器人开通「群成员事件」，否则收不到进群通知",
+                    text = "先去 QQ 开放平台开「群成员事件」，不然收不到",
                     fontSize = 13.sp,
                     color = PanelColors.onSurfaceVariantSummary,
                     modifier = Modifier.padding(start = 4.dp, top = 6.dp),
@@ -646,7 +646,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 Spacer(Modifier.height(12.dp))
                 BotFormSwitchRow(
                     title = "@ 新成员",
-                    summary = if (welcomeAt) "欢迎语前面带一个 @ 新成员（他一定会收到提醒）" else "不 @，只发一句欢迎语",
+                    summary = if (welcomeAt) "欢迎语前面 @ 一下新成员" else "不 @，只发欢迎语",
                     checked = welcomeAt,
                     onCheckedChange = { welcomeAt = it },
                 )
@@ -654,14 +654,14 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                     // 内置人格：文案由人格定死（与 Python 侧预设一致），输入框置灰只读
                     ReadOnlyWelcomeField(
                         value = builtinWelcome(welcomeName),
-                        hint = "内置人格使用固定欢迎语，不能修改",
+                        hint = "内置人格的欢迎语改不了",
                     )
                 } else {
                     BotFormField(
                         label = "欢迎语",
                         value = welcomeText,
                         onValueChange = { welcomeText = it },
-                        hint = "例如：欢迎～有不懂的随时问",
+                        hint = "比如：欢迎～随便问",
                         singleLine = false,
                         minLines = 2,
                         modifier = Modifier.padding(top = 8.dp),
@@ -674,23 +674,23 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 )
                 Text(
                     text = if (preset) {
-                        "内置人格：候选文本自带、不可修改；开始时刻、窗口分钟可以改，行首开关能关掉整个时段"
+                        "自带文案改不了，时刻和窗口能改"
                     } else {
-                        "自定义人格：时段与候选问候都能增删，行首开关能关掉整个时段"
+                        "时段和问候能增删，行首开关能关掉"
                     },
                     fontSize = 13.sp,
                     color = if (preset) PanelColors.onSurfaceVariantSummary else PanelColors.primary,
                     modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
                 )
                 Text(
-                    text = "关掉后该时段不再发（配置留着，随时能开回来）。",
+                    text = "关掉就不发，配置还留着，随时开回来。",
                     fontSize = 13.sp,
                     color = PanelColors.onSurfaceVariantSummary,
                     modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
                 )
                 if (slots.isEmpty()) {
                     Text(
-                        text = "还没有时段：加一个才会到点发问候",
+                        text = "还没时段：加一个才会到点发",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(start = 4.dp, bottom = 8.dp),
@@ -745,7 +745,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 OverlayDropdownPreference(
                     insideMargin = PanelTokens.PrefInside,
                     title = "群里自动接话",
-                    summary = "关着时群里只有 @ 才会回",
+                    summary = "关着时群里只回 @",
                     items = AUTOCHAT_LABELS,
                     selectedIndex = autochatIndex(autochatOverride),
                     onSelectedIndexChange = { i ->
@@ -771,19 +771,19 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                     // 这一行只留灰字说明、不给下拉 —— 点了也改不了任何东西。
                     PanelListRow(
                         title = "回复判定",
-                        meta = "跟随全局（随机模式）",
+                        meta = "跟随全局 · 随机模式",
                         enabled = false,
                     )
                 } else {
                     OverlayDropdownPreference(
                         insideMargin = PanelTokens.PrefInside,
                         title = "回复判定",
-                        summary = "没被 @ 时多主动才插话；右侧括号里是实际生效的那一档",
+                        summary = "没被 @ 时多主动才插话，右边是实际生效档",
                         items = judgeLabels(globalJudge),
                         selectedIndex = judgeIndex(judgeOverride),
                         onSelectedIndexChange = { i ->
                             judgeOverride = judgeValue(i)
-                            msg = "回复判定：" + judgeLabels(globalJudge)[i] + "（保存后生效）"
+                            msg = "回复判定：" + judgeLabels(globalJudge)[i] + "，保存后生效"
                         },
                     )
                 }
@@ -795,7 +795,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 OverlayDropdownPreference(
                     insideMargin = PanelTokens.PrefInside,
                     title = "回复延迟",
-                    summary = "在区间内随机等一会儿再回；跟随全局就按设置页那一档",
+                    summary = "区间里随机等一下再回",
                     items = botDelayLabels(globalDelayMin, globalDelayMax, delayMinMs, delayMaxMs),
                     selectedIndex = botDelayIndex(delayMinMs, delayMaxMs),
                     onSelectedIndexChange = { i ->
@@ -804,7 +804,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                             i == 0 -> {
                                 delayMinMs = 0
                                 delayMaxMs = 0
-                                msg = "回复延迟：跟随全局（保存后生效）"
+                                msg = "回复延迟：跟随全局，保存后生效"
                             }
                             // 最后一项 = 自定义…：弹两行秒数面板，值回来再写状态
                             i >= BOT_DELAY_CHOICES.size + 1 -> showDelayDialog = true
@@ -812,7 +812,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                                 val c = BOT_DELAY_CHOICES[i - 1]
                                 delayMinMs = c.min
                                 delayMaxMs = c.max
-                                msg = "回复延迟：" + c.label + "（保存后生效）"
+                                msg = "回复延迟：" + c.label + "，保存后生效"
                             }
                         }
                     },
@@ -824,7 +824,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
             BotFormSection(title = "群配置") {
                 PanelArrowRow(
                     title = "按群单独设置",
-                    summary = "自动接话 / 每日额度 / 联网 / 整群静音；没配过的群沿用上面的设置",
+                    summary = "单独拧开关，没配过的群跟上面的走",
                     feedback = false,
                     onClick = { sub = "groups" },
                 )
@@ -847,7 +847,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                             color = PanelColors.onSurface,
                         )
                         Text(
-                            text = "关键词判定 / 惩罚阶梯 / 撤回与警告；点开挑群",
+                            text = "关键词和惩罚阶梯，点开挑群",
                             fontSize = PanelMetrics.ValueSize,
                             color = PanelColors.onSurfaceVariantSummary,
                         )
@@ -984,11 +984,11 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
             if (lo <= 0 && hi <= 0) {
                 delayMinMs = 1
                 delayMaxMs = 1
-                msg = "回复延迟：不延迟（保存后生效）"
+                msg = "回复延迟：不延迟，保存后生效"
             } else {
                 delayMinMs = minOf(lo, hi).coerceAtLeast(1) * 1000
                 delayMaxMs = maxOf(lo, hi).coerceAtLeast(1) * 1000
-                msg = "回复延迟：" + botDelayText(delayMinMs, delayMaxMs) + "（保存后生效）"
+                msg = "回复延迟：" + botDelayText(delayMinMs, delayMaxMs) + "，保存后生效"
             }
         },
         onDismiss = { showDelayDialog = false },
@@ -1257,7 +1257,7 @@ private fun GreetSlotRow(
             ) {
                 Text(
                     text = slot.name.ifBlank { at } + " · " + at + " – " + endHm(at, win) +
-                        "（窗口 " + win + " 分钟）",
+                        " · " + win + " 分钟内发",
                     fontSize = PanelTokens.InfoTitleSize,
                     fontWeight = FontWeight(550),
                     color = if (slot.on) PanelColors.onSurface else PanelColors.onSurfaceVariantSummary,
@@ -1266,8 +1266,8 @@ private fun GreetSlotRow(
                 )
                 Text(
                     text = when {
-                        !slot.on -> "已关闭：保存后该时段不再发（配置留着，能开回来）"
-                        preset -> "候选 " + slot.lines.size + " 条 · 该人格自带，不可修改"
+                        !slot.on -> "关着：保存后这段不发，配置留着"
+                        preset -> "候选 " + slot.lines.size + " 条 · 自带，改不了"
                         slot.lines.isEmpty() -> "还没有候选问候"
                         else -> "候选 " + slot.lines.size + " 条 · 窗口内随机挑一条"
                     },
@@ -1311,7 +1311,7 @@ private fun GreetSlotRow(
             }
             if (preset) {
                 Text(
-                    text = "候选文本（该人格自带，不可修改）",
+                    text = "自带文案，改不了",
                     fontSize = 13.sp,
                     fontWeight = FontWeight(550),
                     color = PanelColors.onSurfaceVariantSummary,
@@ -1319,7 +1319,7 @@ private fun GreetSlotRow(
                 )
                 if (slot.lines.isEmpty()) {
                     Text(
-                        text = "启动一次 bot 后就能从运行时读到候选文本",
+                        text = "启动一次 bot 才能读到候选",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(start = 8.dp, top = 4.dp),
@@ -1342,7 +1342,7 @@ private fun GreetSlotRow(
                     hint = "早上",
                 )
                 Text(
-                    text = "候选问候（窗口内随机挑一条发）",
+                    text = "窗口里随机挑一条发",
                     fontSize = 13.sp,
                     fontWeight = FontWeight(550),
                     color = PanelColors.onSurfaceVariantSummary,
@@ -1427,7 +1427,7 @@ private fun autochatValue(index: Int): String = when (index) {
  * 「跟随全局（当前：标准）」—— 不用另开一行小字。叫法与顺序统一取 [JudgeLabels]。
  */
 private fun judgeLabels(globalLevel: String): List<String> =
-    listOf("跟随全局（当前：" + JudgeLabels.labelOf(globalLevel) + "）") + JudgeLabels.labels
+    listOf("跟随全局 · 现在 " + JudgeLabels.labelOf(globalLevel)) + JudgeLabels.labels
 
 /** 落盘值（judge_level_override）→ 下拉下标：""=跟随全局，其余按 [JudgeLabels] 的强度顺序顺延。 */
 private fun judgeIndex(value: String): Int {
@@ -1469,9 +1469,9 @@ private fun botDelayLabels(
     maxMs: Int,
 ): List<String> {
     val custom = botDelayIndex(minMs, maxMs) == BOT_DELAY_CHOICES.size + 1
-    return listOf("跟随全局（" + botDelayText(globalMin, globalMax) + "）") +
+    return listOf("跟随全局 · " + botDelayText(globalMin, globalMax)) +
         BOT_DELAY_CHOICES.map { it.label } +
-        if (custom) "自定义（" + botDelayText(minMs, maxMs) + "）" else "自定义…"
+        if (custom) "自定义 · " + botDelayText(minMs, maxMs) else "自定义…"
 }
 
 /** 毫秒区间 → "3~7 秒" / "不延迟"。 */
@@ -1506,12 +1506,12 @@ private fun BotDelayDialog(
     var maxSec by remember(show) { mutableStateOf(initialMaxSec) }
     WindowDialog(
         show = show,
-        title = "回复延迟（本 bot）",
+        title = "回复延迟 · 本 bot",
         onDismissRequest = onDismiss,
         content = {
             Column(Modifier.fillMaxWidth()) {
                 Text(
-                    text = "在这两个秒数之间随机等一会儿再回；两个都填 0 = 不延迟。",
+                    text = "两个秒数之间随机等一下，都填 0 不延迟。",
                     fontSize = 13.sp,
                     color = PanelColors.onSurfaceVariantSummary,
                 )

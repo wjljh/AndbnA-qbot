@@ -153,14 +153,14 @@ private fun GroupListPage(
                         PanelEmptyState(
                             icon = Icons.Filled.Forum,
                             title = "还没有记录到群",
-                            body = "让 bot 在群里被 @ 一次（或收到一条群消息），再回来这里就能看到。" +
-                                "没配置过的群完全沿用 bot 全局设置，与升级前一致。",
+                            body = "让 bot 在群里被 @ 一次，再回来就能看到。" +
+                                "没配过的群跟 bot 设置走。",
                         )
                     }
                 }
 
                 if (rows.isNotEmpty()) {
-                    SectionCard(metrics, title = "群（" + rows.size + "）", gap = 10.dp) {
+                    SectionCard(metrics, title = "群 · " + rows.size, gap = 10.dp) {
                         rows.forEach { row ->
                             PanelArrowRow(
                                 title = groupTitle(row.id, names[row.id]),
@@ -174,8 +174,7 @@ private fun GroupListPage(
                 }
 
                 PanelNotice(
-                    "每个群一份覆盖（<botdir>/groups/<openid>.json）；没配过的群完全按 bot 全局设置走" +
-                        " —— 与升级前一模一样。",
+                    "一个群一份覆盖文件：groups/<openid>.json。没配过的群跟 bot 设置走",
                 )
             }
         }
@@ -246,9 +245,9 @@ private fun GroupEditScreen(
                 // 值没变就不重启（点开又关掉不该把 bot 踢下线）。
                 val restarted = conf != baseline && BotRestarts.requestOne(ctx, appid, "群配置保存")
                 onSaved(
-                    (if (conf.isDefault) "已保存：所有项都是跟随，覆盖已删除（这个群回到 bot 全局）"
+                    (if (conf.isDefault) "已保存：都跟随，覆盖已删，回到 bot 设置"
                     else "已保存：" + GroupNames.label(gid, name) + " 的覆盖") +
-                        if (restarted) "，正在重启该 bot…" else "",
+                        if (restarted) "，顺手把 bot 重启了" else "",
                 )
             } else {
                 error = err
@@ -357,7 +356,7 @@ private fun GroupEditScreen(
                             onValueChange = { v ->
                                 limit = v.filter { c -> c.isDigit() }.take(4).toIntOrNull() ?: 0
                             },
-                            label = "自定义额度（条/天，留空 = 不限）",
+                            label = "自定义额度，空着就是不限",
                             numeric = true,
                         )
                     }
@@ -367,8 +366,8 @@ private fun GroupEditScreen(
                     SwitchPreference(
                         insideMargin = PanelTokens.PrefInside,
                         title = "整群静音",
-                        summary = if (enabled) "关闭 · 这个群照常回（其它项照生效）"
-                        else "已开启 · 该群完全静默（@ 也不回，问候 / 定时群发也跳过）",
+                        summary = if (enabled) "关着 · 这个群照常回"
+                        else "开着 · @ 也不回，定时群发也跳过",
                         startAction = { RowIcon(Icons.Filled.Notes, PanelColors.onSurfaceVariantSummary) },
                         checked = !enabled,
                         onCheckedChange = { muted -> enabled = !muted },
@@ -424,9 +423,9 @@ private fun limitText(v: Int?): String = when {
 
 /** 下拉文案：首项括号里是**设置页当前那一档**，一眼看出跟随的是多少。 */
 private fun limitItems(global: Int, customValue: Int?): List<String> =
-    listOf("跟随全局（" + limitText(global) + "）", "不限") +
+    listOf("跟随全局：" + limitText(global), "不限") +
         LIMIT_PRESETS.map { it.toString() + " 条/天" } +
-        listOf(if (customValue != null) "自定义（" + limitText(customValue) + "）" else "自定义…")
+        listOf(if (customValue != null) "自定义：" + limitText(customValue) else "自定义…")
 
 /** 落盘值 → 下拉下标（null = 跟随全局，0 = 不限，预设档落在 2..5，其它算「自定义…」）。 */
 private fun limitIndexOf(value: Int?): Int = when {
@@ -438,17 +437,17 @@ private fun limitIndexOf(value: Int?): Int = when {
 /** 预设之外的数字 = 停在「自定义…」那行（读盘时决定输入框摊不摊开）。 */
 private fun limitPresetIndex(value: Int): Int = limitIndexOf(value)
 
-private val AUTO_LABELS = listOf("跟随 bot 设置", "开（该群自动接话）", "关（只回 @）")
+private val AUTO_LABELS = listOf("跟随 bot 设置", "开：该群自动接话", "关：只回 @")
 private val AUTO_SUMMARIES = listOf(
     "跟随 bot 设置",
-    "开着 · 没 @ 也会按「回复判定」插话",
+    "开着 · 没 @ 也插话",
     "关着 · 只回 @ 的消息",
 )
-private val WEB_LABELS = listOf("跟随 bot 设置", "开（允许联网）", "关（该群禁止联网）")
+private val WEB_LABELS = listOf("跟随 bot 设置", "开：允许联网", "关：这个群不联网")
 private val WEB_SUMMARIES = listOf(
     "跟随 bot 设置",
-    "开着 · 自判搜索与 #搜 / #读 都能用",
-    "关着 · 自判搜索与 #搜 / #读 都不发请求（主人也不行）",
+    "开着 · 自判搜索和 #搜 #读 都能用",
+    "关着 · 自判搜索和 #搜 #读 都不出网",
 )
 
 /** 三态值 → 下拉下标（0 跟随 / 1 开 / 2 关）。 */

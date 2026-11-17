@@ -214,7 +214,7 @@ fun LocalTextsContent(
                 sessions = m
                 val n = m.values.sumOf { it.size }
                 Log.i(TAG, "记忆刷新：$n 段")
-                if (!undoable) msg = "记忆刷新：$n 段"
+                if (!undoable) msg = "刷新完：$n 段"
             } catch (e: Throwable) {
                 undoable = false
                 msg = "刷新失败：" + (e.message ?: "未知错误")
@@ -494,7 +494,7 @@ fun LocalTextsContent(
                 )
                 if (addressBook.isEmpty()) {
                     Text(
-                        text = "记忆里还没有称呼 —— 先聊几句再回来看",
+                        text = "记忆里还没有称呼，先聊几句",
                         fontSize = PanelTokens.EntitySubtitleSize,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(vertical = PanelTokens.ContentGap),
@@ -518,7 +518,7 @@ fun LocalTextsContent(
     PanelConfirmDialog(
         show = confirmDel,
         title = "删除所选记忆",
-        body = "将删除 " + sel.size + " 段记忆，10 秒内可撤销。",
+        body = "要删 " + sel.size + " 段记忆，10 秒内能撤销",
         confirmLabel = "删除 " + sel.size + " 段",
         onConfirm = {
             confirmDel = false
@@ -692,7 +692,7 @@ fun MemoryDetailContent(
         item(key = "groups") {
             PanelGroupCard {
                 Text(
-                    text = "群聊（${groups.size}）",
+                    text = "群聊 · ${groups.size}",
                     fontSize = PanelTokens.EntityTitleSize,
                     fontWeight = FontWeight(550),
                     color = PanelColors.onSurface,
@@ -727,7 +727,7 @@ fun MemoryDetailContent(
         item(key = "sessions") {
             PanelGroupCard {
                 Text(
-                    text = "记忆（$totalCount 条 / ${chats.size} 个会话）",
+                    text = "记忆：$totalCount 条 · ${chats.size} 个会话",
                     fontSize = PanelTokens.EntityTitleSize,
                     fontWeight = FontWeight(550),
                     color = PanelColors.onSurface,
@@ -773,7 +773,7 @@ fun MemoryDetailContent(
                         modifier = Modifier.weight(1f),
                     )
                     PanelTertiaryButton(
-                        text = "清空该 bot",
+                        text = "清空这个 bot",
                         onClick = {
                             scope.launch {
                                 msg = withContext(Dispatchers.IO) { MemoryRepo.clear(ctx, appid).text }

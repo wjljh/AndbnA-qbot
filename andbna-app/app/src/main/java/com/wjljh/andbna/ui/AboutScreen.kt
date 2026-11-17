@@ -111,7 +111,7 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
                             color = PanelColors.onBackground,
                         )
                         Text(
-                            text = "版本 " + about.versionName + "（" + about.versionCode + "）",
+                            text = "版本 " + about.versionName + " · " + about.versionCode,
                             fontSize = 14.sp,
                             color = PanelColors.onSurfaceVariantSummary,
                         )
@@ -143,7 +143,7 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
                     SuperRow(
                         icon = Icons.Filled.Refresh,
                         title = "立即检查",
-                        subtitle = checkNote.ifBlank { "不管 30 分钟的节流，马上查一次" },
+                        subtitle = checkNote.ifBlank { "不管 30 分钟节流，马上查一次" },
                         onClick = {
                             if (!checking) {
                                 checking = true
@@ -156,7 +156,7 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
                                             c.note
                                         }
                                         Updater.Result.Latest -> c.note
-                                        Updater.Result.Failed -> "没查成（" + c.note + "），过会儿再点一次"
+                                        Updater.Result.Failed -> "没查成：" + c.note + "，过会儿再点一次"
                                     }
                                     checking = false
                                 }
@@ -174,8 +174,8 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
                         color = PanelColors.onBackground,
                     )
                     Text(
-                        text = "QQ 机器人的 Python 运行时打包在 App 里，由本机前台服务托管，不用另装模块。" +
-                            "可以同时挂几个 bot，人格、长期记忆、定时消息各管各的。",
+                        text = "Python 打包在 App 里，前台服务托管，不用另装模块。" +
+                            "能同时挂几个 bot，人格和记忆各管各的。",
                         fontSize = 14.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                     )
@@ -197,13 +197,13 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
                     CreditRow("Miuix（miuix-kmp）", "组件与主题 · Apache-2.0")
                     CreditRow("DGP-Studio / Genshin.Skill", "内置人格文本来源 · MIT")
                     CreditRow("linsport / dsh-whale-persona", "鲸鱼娘人格 · MIT")
-                    CreditRow("JetBrains / compose-multiplatform", "引导页结构与动效参考（Apache-2.0）")
+                    CreditRow("JetBrains / compose-multiplatform", "引导页结构与动效参考 · Apache-2.0")
                 }
 
                 // ⑤ 许可证说明
                 SectionCard(metrics, title = "许可证说明") {
                     Text(
-                        text = "上面这些组件的著作权归各自作者，许可证看各自仓库。" +
+                        text = "著作权归各自作者，许可证看各自仓库。" +
                             "本 App 只按规格复刻界面，没打包它们的源码。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
@@ -227,7 +227,7 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
 }
 
 /** 成本金额的口径说明：hero 只写「约 ¥x.xx（余额差值估算）」，完整一句挂在这里。 */
-internal const val COST_NOTE = "金额按上游余额差值估算，含同一 Key 的其它端消耗"
+internal const val COST_NOTE = "金额按上游余额差值估算，含其它端消耗"
 
 /** 顶栏：细线返回箭头一行，大标题「关于」独占下一行（与主题设置页同一套）。 */
 @Composable
@@ -388,7 +388,7 @@ private fun buildTime(pi: android.content.pm.PackageInfo?): String {
  */
 private fun pythonVersion(): String {
     val v = runCatching { BotHost.pythonVersion() }.getOrDefault("")
-    return v.ifBlank { "未知（Python 未初始化）" }
+    return v.ifBlank { "未知：Python 没起来" }
 }
 
 /**

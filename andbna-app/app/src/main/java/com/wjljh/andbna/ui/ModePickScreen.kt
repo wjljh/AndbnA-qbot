@@ -86,7 +86,7 @@ fun ModePickScreen(
                 item(key = "modes") {
                     PanelGroupCard {
                         Text(
-                            text = "挑一个顺手的，以后随时能换。",
+                            text = "挑一个顺手的，随时能换。",
                             fontSize = PanelTokens.InfoValueSize,
                             color = PanelColors.onSurfaceVariantSummary,
                             modifier = Modifier.padding(bottom = PanelTokens.ContentGap),
@@ -101,19 +101,19 @@ fun ModePickScreen(
                                 // 点一下就生效，不再二次确认；root / ADB 要先验证
                                 onClick = {
                                     if (mode.key == "root" && !RootHost.hasRoot()) {
-                                        blocked = "没拿到 root：在 KernelSU / Magisk 里授权，再重启 App"
+                                        blocked = "没拿到 root：去 KernelSU 或 Magisk 授权，再重启 App"
                                     } else if (mode == RunMode.ADB) {
                                         // ADB 不能静默写盘：授权 + 绑定都成功才算切过去
                                         if (!busy) {
                                             busy = true
-                                            blocked = "正在申请 Shizuku 授权…"
+                                            blocked = "等 Shizuku 授权…"
                                             ShizukuShell.switchToAdb(ctx) { r ->
                                                 busy = false
                                                 if (r.ok) {
                                                     blocked = ""
                                                     onPick(RunMode.ADB)
                                                 } else {
-                                                    blocked = "没切到 ADB 模式（模式仍是「" +
+                                                    blocked = "没切到 ADB 模式，还是「" +
                                                         (current?.label ?: "未选") + "」）；" +
                                                         r.text + "。下一步：" + r.hint
                                                 }

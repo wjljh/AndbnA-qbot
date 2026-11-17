@@ -195,13 +195,13 @@ private fun AdminListPage(
                 PanelEmptyState(
                     icon = Icons.Filled.Forum,
                     title = "还没有记录到群",
-                    body = "让 bot 在群里被 @ 一次（或收到一条群消息），再回来这里就能挑群设规则。",
+                    body = "让 bot 在群里被 @ 一次，再回来就能挑群设规则。",
                 )
             }
         }
 
         if (rows.isNotEmpty()) {
-            SectionCard(metrics, title = "群（" + rows.size + "）", gap = 10.dp) {
+            SectionCard(metrics, title = "群 · " + rows.size, gap = 10.dp) {
                 rows.forEach { row ->
                     PanelArrowRow(
                         title = adminGroupTitle(row.gid, names[row.gid]),
@@ -215,8 +215,7 @@ private fun AdminListPage(
         }
 
         PanelNotice(
-            "每个群一份规则（<botdir>/group_admin/<openid>.json）：关键词判定、惩罚阶梯、撤回与警告。" +
-                "没配过的群完全不管，与升级前一致。",
+            "一个群一份规则：group_admin/<openid>.json。没配过的群我不管",
         )
     }
 }
@@ -273,7 +272,7 @@ private fun AdminRuleScreen(
     val r = rule
     if (r == null) {
         AdminShell(metrics, "群管理", adminGroupTitle(gid, null), onBack) {
-            PanelNotice("正在读取规则…")
+            PanelNotice("读规则…")
         }
         return
     }
@@ -310,15 +309,15 @@ private fun AdminRuleScreen(
         SectionCard(metrics, title = "开关", gap = 10.dp) {
             AdminSwitchRow(
                 title = "启用本群管理",
-                summary = if (r.enabled) "开着 · 命中关键词就按下面的阶梯处理"
-                else "关着 · 这个群完全不管（规则留着，随时能开回来）",
+                summary = if (r.enabled) "开着 · 命中就按下面的阶梯处理"
+                else "关着 · 这个群不管，规则还留着",
                 checked = r.enabled,
                 onCheckedChange = { edit(r.copy(enabled = it)) },
                 icon = Icons.Filled.Notes,
             )
             AdminSwitchRow(
                 title = "命中后撤回该消息",
-                summary = if (r.recallEnabled) "开 · 先撤回那条违规消息再处理" else "关 · 只警告，消息留在群里",
+                summary = if (r.recallEnabled) "开 · 先撤那条违规消息" else "关 · 只警告，消息留在群里",
                 checked = r.recallEnabled,
                 onCheckedChange = { edit(r.copy(recallEnabled = it)) },
                 icon = Icons.Filled.Tune,
@@ -345,9 +344,9 @@ private fun AdminRuleScreen(
             )
             Text(
                 text = if (r.keywords.isEmpty() && r.mode != GroupAdmin.MODE_MODEL) {
-                    "现在是「" + MODE_LABELS[modeIndex(r.mode)] + "」，但词库是空的：至少加一个词，或者改成「只用模型」"
+                    "词库是空的：加一个词，或者改用「只用模型」"
                 } else {
-                    "模型复核只在关键词命中后多问一次模型（更不准杀错），比只用关键词稳；只用模型不看词库"
+                    "复核在命中后多问一次模型，杀错更少"
                 },
                 fontSize = 13.sp,
                 color = if (r.keywords.isEmpty() && r.mode != GroupAdmin.MODE_MODEL) PanelColors.error
@@ -357,10 +356,10 @@ private fun AdminRuleScreen(
         }
 
         // ③ 关键词：一行一个词 + 删除按钮 + 底部「添加关键词」
-        SectionCard(metrics, title = "关键词（" + r.keywords.size + " 个）", gap = 6.dp) {
+        SectionCard(metrics, title = "关键词 · " + r.keywords.size + " 个", gap = 6.dp) {
             if (r.keywords.isEmpty()) {
                 Text(
-                    text = "词库是空的：点下面「添加关键词」补一个（默认词库：卖挂 / 开挂 / 外挂 / 挂机脚本 / 辅助脚本）",
+                    text = "词库是空的：点下面「添加关键词」补一个",
                     fontSize = 13.sp,
                     color = PanelColors.onSurfaceVariantSummary,
                     modifier = Modifier.padding(start = 4.dp, bottom = 4.dp),
@@ -406,7 +405,7 @@ private fun AdminRuleScreen(
                 OverlayDropdownPreference(
                     insideMargin = PanelTokens.PrefInside,
                     title = "第 " + step.n + " 次",
-                    summary = "禁言 " + muteText(step.muteMin) + "（点这里改，最后一项是删掉这一级）",
+                    summary = "禁言 " + muteText(step.muteMin) + " · 点这里改，最后一项是删掉",
                     startAction = { RowIcon(Icons.Filled.Speed, PanelColors.onSurfaceVariantSummary) },
                     items = muteItems(step.muteMin),
                     selectedIndex = muteIndexOf(step.muteMin),
@@ -469,7 +468,7 @@ private fun AdminRuleScreen(
             OverlayDropdownPreference(
                 insideMargin = PanelTokens.PrefInside,
                 title = "第 " + r.kickAt + " 次 → 踢出群",
-                summary = "累计到这一次直接踢（阶梯用尽后的一档，数字可改）",
+                summary = "累计到这一次直接踢，数字可改",
                 startAction = { RowIcon(Icons.Filled.Notes, PanelColors.onSurfaceVariantSummary) },
                 items = KICK_LABELS,
                 selectedIndex = (r.kickAt - 1).coerceIn(0, KICK_LABELS.size - 1),
@@ -482,11 +481,11 @@ private fun AdminRuleScreen(
             val s = stats
             PanelListRow(
                 title = if (s == null) "—" else s.users.toString() + " 人 / 共 " + s.hits + " 次",
-                meta = if (s == null) "共享计数文件里还没这一行，等运行侧统计落盘就会显示"
-                else "本群最近统计（group_admin/_stats.json）",
+                meta = if (s == null) "还没统计到这一行，跑一阵就有了"
+                else "本群最近统计：group_admin/_stats.json",
             )
             Text(
-                text = "统计只读不写：这一页改的是规则，不是计数。",
+                text = "这一页改规则，不动计数",
                 fontSize = 13.sp,
                 color = PanelColors.onSurfaceVariantSummary,
                 modifier = Modifier.padding(start = 4.dp),
@@ -637,16 +636,16 @@ private fun AdminSwitchRow(
 }
 
 /** 群列表页顶部那张「使用前提」卡的标题与文案（逐字照用户给的稿，别改写语气）。 */
-private const val PREREQ_TITLE = "使用前提（先看这几条）"
+private const val PREREQ_TITLE = "使用前提"
 
 private const val PREREQ_INTRO =
-    "这些操作不是我这边想干就能干的，得平台给权限，说清楚免得你以为是我坏了："
+    "这些得平台给权限，不是我坏了："
 
 private val PREREQ_ITEMS = listOf(
-    "1. 机器人要有群管理权限。去 QQ 开放平台 → 你的机器人 → 权限 / 事件订阅，把「撤回消息」「群管理」「禁言」「踢人」这些勾上。",
-    "2. 开放平台勾完还不够，群主得在群里单独再授权一次。没授权的时候我发指令过去，接口会直接拒，日志里能看到错误码。",
-    "3. 「进群欢迎」要靠「群成员事件」，这个不勾就收不到通知，欢迎语永远发不出去 —— 不是坏了，是平台压根没告诉我有新人进来。",
-    "4. 禁言和踢人只对普通成员有效，群主和管理员动不了；没权限的时候我会降级成「撤回 + 警告」，不会硬发指令把错误刷满日志。",
+    "1. 先给机器人开群管理权限。QQ 开放平台 → 你的机器人 → 权限 / 事件订阅，把「撤回消息」「群管理」勾上。",
+    "2. 勾完还不够，群主得在群里再授权一次。没授权时接口直接拒，日志里有错误码。",
+    "3. 「进群欢迎」要靠群成员事件。这个不勾就收不到通知，不是坏了。",
+    "4. 禁言和踢人只对普通成员有效，群主和管理员动不了。没权限时我降级成「撤回 + 警告」。",
 )
 
 /** 判定方式：下标 ↔ 契约值（顺序就是下拉里的顺序）。 */
@@ -659,9 +658,9 @@ private val MODE_VALUES = listOf(
 private val MODE_LABELS = listOf("关键词", "关键词 + 模型复核（推荐）", "只用模型")
 
 private val MODE_SUMMARIES = listOf(
-    "只比对词库：最快，可能杀错（词库要写准）",
-    "先命中词库，再问模型复核一次：更稳，推荐",
-    "不看词库，每条消息都问模型：最灵活，最花钱",
+    "只比对词库，最快，可能杀错",
+    "先命中词库再让模型确认，更稳",
+    "不看词库，每条都问模型，最花钱",
 )
 
 private fun modeIndex(mode: String): Int =
@@ -684,7 +683,7 @@ private fun muteText(min: Int): String = when {
 
 private fun muteItems(current: Int): List<String> =
     MUTE_PRESETS.map { "禁言 " + muteText(it) } +
-        listOf(if (muteIndexOf(current) == MUTE_CUSTOM) "自定义（禁言 " + muteText(current) + "）" else "自定义…") +
+        listOf(if (muteIndexOf(current) == MUTE_CUSTOM) "自定义：禁言 " + muteText(current) else "自定义…") +
         listOf("删除这一级")
 
 private fun muteIndexOf(min: Int): Int =

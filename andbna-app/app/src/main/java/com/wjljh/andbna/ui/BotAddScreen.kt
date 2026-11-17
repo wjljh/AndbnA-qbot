@@ -119,7 +119,7 @@ fun BotAddScreen(metrics: Metrics, onBack: () -> Unit, onCreated: (String) -> Un
     fun create() {
         val id = appid.trim()
         if (id.isBlank()) {
-            msg = "AppID 没填，填一个再创建"
+            msg = "没填 AppID：填一个再点创建"
             return
         }
         // 读盘 / 写盘（含密钥加密）都在 IO：点一下「创建」不再卡主线程
@@ -217,7 +217,7 @@ fun BotAddScreen(metrics: Metrics, onBack: () -> Unit, onCreated: (String) -> Un
                     PersonaAssets.deleteCustom(ctx, full)
                     personas = PersonaAssets.listAll(ctx)
                     if (persona == full) persona = ""
-                    msg = "人格已删：" + full.removePrefix(PersonaAssets.CUSTOM_PREFIX)
+                    msg = "人格删了：" + full.removePrefix(PersonaAssets.CUSTOM_PREFIX)
                 },
             )
 

@@ -227,7 +227,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
     fun detect() {
         if (detecting) return
         detecting = true
-        probe = ProbeResult(ProbeState.NOT_TESTED, "正在检测…")
+        probe = ProbeResult(ProbeState.NOT_TESTED, "检测中…")
         scope.launch {
             val r = withContext(Dispatchers.IO) { runProbe(ctx, mode) }
             probe = r
@@ -244,8 +244,8 @@ fun OnboardingScreen(onFinish: () -> Unit) {
         if (detecting) return
         probe = ProbeResult(
             ProbeState.NOT_TESTED,
-            "正在申请 Shizuku 授权…",
-            hint = "弹出的确认框点「允许」，结果回来会自动重新检测。",
+            "申请授权中…",
+            hint = "弹框点「允许」，结果回来会自动再检一次。",
         )
         ShizukuShell.switchToAdb(ctx) { r ->
             if (r.ok) {
@@ -256,7 +256,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                     ProbeState.FAIL,
                     "没进 ADB 模式：" + r.auth.label,
                     r.text + "；state=" + ShizukuShell.state().name,
-                    r.hint + "。弄好以后回来点「申请 Shizuku 授权」；下面「用电脑 adb」那栏的命令可以直接复制。",
+                    r.hint + "。弄好回来再点「申请 Shizuku 授权」，下面 adb 命令直接复制。",
                 )
             }
         }
@@ -266,7 +266,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
     fun grantWhitelist() {
         if (detecting) return
         detecting = true
-        probe = ProbeResult(ProbeState.NOT_TESTED, "正在写入电池白名单…")
+        probe = ProbeResult(ProbeState.NOT_TESTED, "写电池白名单中…")
         scope.launch {
             withContext(Dispatchers.IO) {
                 val pkg = ctx.packageName
@@ -351,8 +351,8 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                         // 决定（授权 + 绑定都成功才写），这里写了就是没权限也自称 ADB 的半死状态
                         if (picked == RunMode.ADB) {
                             mode = picked
-                            modeNotice = "ADB 模式要先拿到 Shizuku 授权：第 ④ 步点「申请 Shizuku 授权」，" +
-                                "授权并绑定成功后才真正切过去；没成会保持原来的模式。"
+                            modeNotice = "ADB 模式得先拿到 Shizuku 授权：第 ④ 步点「申请 Shizuku 授权」。" +
+                                "没成会保持原来的模式。"
                         } else {
                             ModeStore.set(ctx, picked)
                             mode = picked
@@ -503,9 +503,9 @@ private fun StepHero(icon: ImageVector, title: String, body: String) {
 
 /** 欢迎页的三条简介（标题 to 说明），不再列「第几步做什么」的清单。 */
 private val WELCOME_POINTS = listOf(
-    "QQ 机器人跑在本机" to "Python 运行时打包在 App 内，不依赖模块，也不用开电脑",
-    "不收集任何数据" to "聊天与凭据只存在本机，App 不上报任何内容",
-    "多个 bot 一起挂" to "人格、记忆、定时消息按 bot 各自独立",
+    "QQ 机器人跑在本机" to "Python 打包在 App 里，不用模块，也不用开电脑",
+    "不上报数据" to "聊天和凭据只在本机",
+    "多个 bot 一起挂" to "人格和记忆按 bot 各自独立",
 )
 
 @Composable
@@ -513,7 +513,7 @@ private fun ColumnScope.WelcomeStep() {
     StepHero(
         icon = OnboardIcons.Welcome,
         title = "欢迎使用 AndbnA",
-        body = "QQ 机器人整套跑在手机里。Python 运行时打包在 APK 内，由本机前台服务托管，不依赖模块，也不收任何数据。",
+        body = "QQ 机器人整套跑在手机里，不用另装模块",
     )
     PanelGroupCard {
         WELCOME_POINTS.forEachIndexed { index, point ->
@@ -548,7 +548,7 @@ private fun ColumnScope.WelcomeStep() {
         }
     }
     Text(
-        text = "随时可以在「设置 → 重看使用引导」里重看本引导。",
+        text = "想重看：设置 → 重看使用引导",
         fontSize = PanelTokens.OnboardWelcomeSize,
         lineHeight = PanelTokens.OnboardHeroBodyLineHeight,
         color = PanelColors.onSurfaceVariantSummary,
@@ -565,11 +565,11 @@ private fun ColumnScope.WelcomeStep() {
  */
 private val AT_RULE_POINTS = listOf(
     "群里默认只有 @ 它时才回" to
-        "不 @ 就不出声，免得刷屏 —— 不是坏了，默认就是这样。",
+        "不 @ 就不出声，免得刷屏",
     "想让它自己判断要不要接话" to
         "Bot → 编辑 → 打开「群里自动接话」",
     "只想让某些群活跃" to
-        "Bot → 编辑 → 群配置 → 单独给那个群开，别的群保持安静。",
+        "Bot → 编辑 → 群配置 → 只给那个群开",
 )
 
 @Composable
@@ -577,7 +577,7 @@ private fun ColumnScope.AtRuleStep() {
     StepHero(
         icon = OnboardIcons.AtRule,
         title = "群聊里它默认只回 @",
-        body = "群里被 @ 才开口，这是默认的。要不要它自己接话，开关在 bot 编辑页。",
+        body = "群里被 @ 才开口，这是默认的",
     )
     PanelGroupCard {
         AT_RULE_POINTS.forEachIndexed { index, point ->
@@ -612,7 +612,7 @@ private fun ColumnScope.AtRuleStep() {
         }
     }
     Text(
-        text = "点「知道了」继续。这两处开关随时能在 Bot 编辑页改。",
+        text = "两处开关都在 Bot 编辑页",
         fontSize = PanelTokens.OnboardWelcomeSize,
         lineHeight = PanelTokens.OnboardHeroBodyLineHeight,
         color = PanelColors.onSurfaceVariantSummary,
@@ -632,7 +632,7 @@ private fun ColumnScope.ModeStep(
     StepHero(
         icon = OnboardIcons.KeepAlive,
         title = "挑一种保活方式",
-        body = "三种模式的内核完全一样（Python 打包在 APK 里，bot 跑在 App 进程内），差的只是有没有额外保活权限。",
+        body = "三种模式内核一样，差的只是保活权限",
     )
     if (notice.isNotBlank()) {
         PanelNotice(text = notice)
@@ -695,7 +695,7 @@ private fun ColumnScope.ProbeStep(
     StepHero(
         icon = OnboardIcons.Probe,
         title = "权限检测",
-        body = "按第 ③ 步选的方式，真的去问系统要一次结论 —— 原始返回值都留着，不是预估。",
+        body = "真去问系统要一次结论，原始返回值都留着",
     )
     var detailOpen by remember { mutableStateOf(false) }
     val tint = stateTint(probe.state)
@@ -729,7 +729,7 @@ private fun ColumnScope.ProbeStep(
                     color = tint,
                 )
                 Text(
-                    text = "当前方式：" + mode.label,
+                    text = "方式：" + mode.label,
                     fontSize = PanelTokens.OnboardListNoteSize,
                     color = PanelColors.onSurfaceVariantSummary,
                     modifier = Modifier.padding(top = PanelTokens.InfoValueGap),
@@ -883,7 +883,7 @@ private fun ColumnScope.AdbCommandCard() {
             }
         }
         Text(
-            text = "建议使用 Shizuku 13.7 及以上版本（旧版在 Android 17 上服务会自行退出）",
+            text = "Shizuku 用 13.7+ 的版本，旧版在 Android 17 上会自己退出",
             fontSize = PanelTokens.OnboardListNoteSize,
             lineHeight = PanelTokens.OnboardHeroBodyLineHeight,
             color = PanelColors.onSurfaceVariantSummary,
@@ -891,7 +891,7 @@ private fun ColumnScope.AdbCommandCard() {
         )
         // 两条命令各自干什么，压成一行小字（原来的长句已按需求删掉）
         Text(
-            text = "第一条启动 Shizuku 服务（手机重启后要再来一次）；第二条加电池白名单。",
+            text = "第一条启动 Shizuku 服务，手机重启后要再来一次。第二条加电池白名单。",
             fontSize = PanelTokens.OnboardListNoteSize,
             color = PanelColors.onSurfaceVariantSummary,
             modifier = Modifier.padding(top = PanelTokens.InfoValueGap),
@@ -960,12 +960,12 @@ private fun ColumnScope.NotifPermCard(
             }
         }
         val note = when (state) {
-            NotifState.GRANTED -> "运行时通知栏会显示「bot 运行中」，方便确认服务还在跑。"
-            NotifState.NOT_NEEDED -> "当前系统不需要单独授权：低于 Android 13，通知默认可用。"
+            NotifState.GRANTED -> "通知栏显示「bot 运行中」，一眼看出服务在跑"
+            NotifState.NOT_NEEDED -> "系统不用单独授权：低于 Android 13 默认就能用"
             NotifState.DENIED -> if (asked) {
                 NOTIF_STATEMENT
             } else {
-                "运行时会在通知栏挂一条「bot 运行中」，方便你确认服务还在跑。"
+                "通知栏会挂一条「bot 运行中」，好确认服务在跑"
             }
         }
         Text(
@@ -1040,7 +1040,7 @@ private fun ColumnScope.ModelStep(
     StepHero(
         icon = OnboardIcons.Model,
         title = "接入模型",
-        body = "现在配、以后配都行。没配 Key 的 bot 只回连通测试，不会真的回消息。",
+        body = "现在配、以后配都行。没配 Key 只回连通测试",
     )
     SectionCard(metrics, title = "接口") {
         PanelEllipsisField(
@@ -1165,7 +1165,7 @@ private fun ColumnScope.DoneStep(mode: RunMode, probe: ProbeResult, modelConfigu
             value = when {
                 mode == RunMode.NORMAL -> "不需要额外权限"
                 whitelistPass -> "已加入，通过检测"
-                probe.state == ProbeState.FAIL -> probe.headline + "（可回上一步处理）"
+                probe.state == ProbeState.FAIL -> probe.headline + "，回上一步能处理"
                 else -> "未检测"
             },
             topGap = PanelTokens.ContentGap,
@@ -1174,12 +1174,12 @@ private fun ColumnScope.DoneStep(mode: RunMode, probe: ProbeResult, modelConfigu
             icon = if (modelConfigured) OnboardIcons.Pass else OnboardIcons.Unknown,
             tint = if (modelConfigured) PanelColors.primary else PanelColors.onSurfaceVariantSummary,
             label = "模型",
-            value = if (modelConfigured) "已配置" else "未配置（只回连通测试，可在「设置 → 模型配置」补）",
+            value = if (modelConfigured) "已配置" else "未配置，只回连通测试；设置 → 模型配置能补",
             topGap = PanelTokens.ContentGap,
         )
     }
     Text(
-        text = "点「开始使用」进主页。想重看，在「设置 → 重看使用引导」里点一下。",
+        text = "进主页。想重看：设置 → 重看使用引导",
         fontSize = PanelTokens.OnboardWelcomeSize,
         lineHeight = PanelTokens.OnboardHeroBodyLineHeight,
         color = PanelColors.onSurfaceVariantSummary,
@@ -1196,7 +1196,7 @@ private fun runProbe(ctx: Context, mode: RunMode): ProbeResult = when (mode) {
         ProbeState.PASS,
         "普通模式：不需要额外权限",
         "托管方式 normal；没有申请电池白名单，也没有 su / Shizuku 授权。",
-        "不用装任何东西。被系统清理后新消息会收不到，想更稳就回上一步换 ADB 或 root。",
+        "不用装东西。想更稳就回上一步换 ADB 或 root。",
     )
 
     RunMode.ADB -> probeAdb(ctx)
@@ -1219,7 +1219,7 @@ private fun probeAdb(ctx: Context): ProbeResult {
     val whitelisted = ShizukuShell.isWhitelisted(pkg)
     val dump = ShizukuShell.exec("dumpsys deviceidle whitelist")
     val raw = dump.lines().map { it.trim() }.filter { it.contains(pkg) }
-        .joinToString(" / ").ifBlank { dump.trim().take(80).ifBlank { "（空输出）" } }
+        .joinToString(" / ").ifBlank { dump.trim().take(80).ifBlank { "空输出" } }
     val detail = "ShizukuShell.state()=" + st.name + "（running=" + running + "，granted=" + granted + "）" +
         "；ShizukuShell.bind(" + pkg + ") → bound=" + ShizukuShell.bound +
         "；ShizukuShell.isWhitelisted(" + pkg + ")=" + whitelisted +
@@ -1227,8 +1227,8 @@ private fun probeAdb(ctx: Context): ProbeResult {
         "；whitelist 返回：" + raw
     return when {
         !running -> ProbeResult(
-            ProbeState.FAIL, "Shizuku 没在运行（未连接）", detail,
-            "去装 Shizuku 并启动它（用 adb 启动或打开 Shizuku App），然后点「重新检测」。",
+            ProbeState.FAIL, "Shizuku 没在运行", detail,
+            "装 Shizuku 并启动它，然后点「重新检测」",
         )
         !granted -> ProbeResult(
             ProbeState.FAIL, "Shizuku 在运行，但本 App 还没被授权", detail,
@@ -1236,11 +1236,11 @@ private fun probeAdb(ctx: Context): ProbeResult {
         )
         !ShizukuShell.bound -> ProbeResult(
             ProbeState.FAIL, "Shizuku 已授权，但 UserService 没连上", detail,
-            "把 Shizuku 重启一次（Shizuku App 里停止再启动），然后点「重新检测」。",
+            "在 Shizuku App 里停止再启动，然后点「重新检测」",
         )
         !whitelisted -> ProbeResult(
             ProbeState.FAIL, "Shizuku 已连上，但还没进电池白名单", detail,
-            "点下面的「加入电池白名单」，会以 shell 身份执行 dumpsys deviceidle whitelist。",
+            "点下面的「加入电池白名单」，会用 shell 跑 dumpsys deviceidle whitelist",
         )
         else -> ProbeResult(
             ProbeState.PASS, "Shizuku 已连上，且已在电池白名单", detail, "",
@@ -1264,7 +1264,7 @@ private fun probeRoot(pkg: String): ProbeResult {
     } else {
         ProbeResult(
             ProbeState.FAIL, "root 已可用，但还没进电池白名单", detail,
-            "点下面的「加入电池白名单」，会以 root 身份执行 dumpsys deviceidle whitelist +" + pkg + "。",
+            "点下面的「加入电池白名单」，会用 root 跑 whitelist +" + pkg,
         )
     }
 }

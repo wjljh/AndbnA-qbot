@@ -154,10 +154,10 @@ fun SettingsPage(
                         ctx.contentResolver.openOutputStream(uri)?.use { os ->
                             os.write(text.toByteArray(Charsets.UTF_8))
                         }
-                        "已导出（" + text.lineSequence().count() + " 行）"
+                        "已导出 " + text.lineSequence().count() + " 行"
                     }
                 } catch (e: Exception) {
-                    "导出没成：" + (e.message ?: e.javaClass.simpleName) + "，换个位置再存一次"
+                    "导出没成：" + (e.message ?: e.javaClass.simpleName) + "。换个位置再存一次"
                 }
             }
             vm.msg = line
@@ -215,7 +215,7 @@ fun SettingsPage(
     PanelConfirmDialog(
         show = confirmClearArchive,
         title = "清空消息存档",
-        body = "清空本机的聊天存档？清空后没法恢复（记忆和配置还在）。",
+        body = "清空本机的聊天存档？清完没法恢复，记忆和配置不动。",
         confirmLabel = "清空",
         onConfirm = {
             confirmClearArchive = false
@@ -264,9 +264,9 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
     /** 入口行的小字：当前主模型 + 识图模型（留空就写「同主模型」） */
     val llmSummary: String
         get() = if (!keyConfigured) {
-            "未配置（只回连通测试）"
+            "没配 Key：只跑连通测试"
         } else {
-            "当前：" + curModel + " · 识图：" + curVision.ifBlank { "同主模型" }
+            "在用 " + curModel + " · 识图 " + curVision.ifBlank { "同主模型" }
         }
 
     /**
@@ -278,7 +278,7 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
         SettingsPrefs.put(ctx, "group_autochat", if (on) "1" else "0")
         scope.launch {
             withContext(Dispatchers.IO) { BotHost.setGroupAutochat(on) }
-            msg = if (on) "群里自动接话已打开：它会自己判断要不要插话" else "群里自动接话已关闭：群里只有 @ 才回"
+            msg = if (on) "群里自动接话开了：它会自己判断要不要插话" else "群里自动接话关了：只有 @ 才回"
         }
     }
 
@@ -295,7 +295,7 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
         ReplyJudgeMode.set(ctx, if (index == 1) ReplyJudgeMode.RANDOM else ReplyJudgeMode.LLM)
         val n = if (changed) BotRestarts.requestAllEnabled(ctx, "设置保存") else 0
         msg = "已切到「" + judgeOptions.getOrElse(index) { "" } + "」" +
-            if (n > 0) "，正在重启 " + n + " 个 bot…" else ""
+            if (n > 0) "，重启 " + n + " 个 bot 中…" else ""
     }
 
     // ── 回复判定-模型判断配置（1.0.8 从模型配置页最底下搬进「回复节奏」组）──
@@ -312,14 +312,14 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
         judgeLevel = wire
         ctx.llmJudgeLevel = wire
         BotStore.writeLlmJson(ctx)
-        msg = "主动程度已切到「" + JudgeLabels.labelOf(wire) + "」"
+        msg = "主动程度改成「" + JudgeLabels.labelOf(wire) + "」了"
     }
 
     fun switchNameHit(on: Boolean) {
         nameHit = on
         ctx.nameHitAsCall = on
         BotStore.writeLlmJson(ctx)
-        msg = "名字命中就当被叫：" + if (on) "已开启" else "已关闭"
+        msg = "名字命中就当被叫：" + if (on) "开了" else "关了"
     }
 
     // ── 每日上限：5 个预设 +「无上限」+「自定义…」（选自定义就地输入数字）──
@@ -343,8 +343,8 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
             listOf(
                 when {
                     !dailyLimitCustomShown -> "自定义…"
-                    dailyLimit > 0 -> "自定义（" + dailyLimitText() + "）"
-                    else -> "自定义（留空 = 无上限）"
+                    dailyLimit > 0 -> "自定义 " + dailyLimitText()
+                    else -> "自定义，留空就是无上限"
                 },
             )
 
@@ -378,7 +378,7 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
     /** 一行里写清「占用 3.2 MB · 12,345 条」（条数要问 Python，没起来就写未知） */
     val archiveSummary: String
         get() = if (archiveBytes < 0L) {
-            "正在统计…"
+            "统计中…"
         } else {
             "占用 " + fmtSize(archiveBytes) + " · " + (
                 if (archiveRows < 0) "条数未知"
@@ -401,14 +401,14 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
             val st = withContext(Dispatchers.IO) { BotHost.archiveStats(ctx) }
             archiveBytes = st.first
             archiveRows = st.second
-            msg = if (res.first <= 0) "存档本来就是空的" else "已清空存档（" + res.first + " 条）"
+            msg = if (res.first <= 0) "存档本来就是空的" else "已清空 " + res.first + " 条"
         }
     }
 
     fun switchAutoStart(on: Boolean) {
         autoStart = on
         SettingsPrefs.put(ctx, "auto_start", if (on) "1" else "0")
-        msg = if (on) "开机自启已打开" else "开机自启已关闭"
+        msg = if (on) "开机自启开了" else "开机自启关了"
     }
 
     /**
@@ -419,7 +419,7 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
         autoPull = on
         scope.launch {
             withContext(Dispatchers.IO) { PullBack.setAutoEnabled(ctx, on) }
-            msg = if (on) "自动拉回：已开启，看门狗已上岗" else "自动拉回：已关闭，看门狗已退出"
+            msg = if (on) "自动拉回开了：看门狗上岗" else "自动拉回关了：看门狗退出"
         }
     }
 
@@ -464,7 +464,7 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
     /** 自定义生效时把真实秒数写进那一项的文案，别让这一行看不出自己填了什么 */
     val delayLabels: List<String>
         get() = delayPresets.map { it.label } + if (delayIndex == delayPresets.size) {
-            "自定义（" + delayText(delayMin, delayMax) + "）"
+            "自定义 " + delayText(delayMin, delayMax)
         } else {
             "自定义…"
         }
@@ -495,7 +495,7 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
         masterGuard = on
         persistBotChat(
             { ctx.masterWordGuard = on },
-            if (on) "非主人不称呼主人：开着，回复里的「主人」会换成你配的称呼"
+            if (on) "非主人不称呼主人：开着，「主人」换成你配的称呼"
             else "非主人不称呼主人：关了，只提示不改字",
         )
     }
@@ -608,14 +608,14 @@ private fun MiuixSettingsBody(
             SettingsMiuixGroup(topPadding = 0.dp) {
                 SwitchPreference(
                     title = "多 bot 由总模型决定谁回",
-                    summary = "打开后一句话只让一个 bot 回，由总模型挑谁；只有一个 bot 时不起作用",
+                    summary = "一句话只让一个 bot 回，总模型挑谁",
                     startAction = { SettingsRowIcon(Icons.Filled.Forum) },
                     checked = vm.gate,
                     onCheckedChange = { vm.switchGate(it) },
                 )
                 OverlayDropdownPreference(
                     title = "每个 bot 连续发言上限",
-                    summary = "连说到这么多条就先停一停，把话头让给人",
+                    summary = "连说这么多条就先停，把话头让人",
                     startAction = { SettingsRowIcon(Icons.Filled.Notes) },
                     items = vm.turnLabels,
                     selectedIndex = vm.turnIndex,
@@ -631,7 +631,7 @@ private fun MiuixSettingsBody(
                 )
                 OverlayDropdownPreference(
                     title = "真人每小时上限",
-                    summary = "真人比这说得还多时，bot 只围观",
+                    summary = "真人说得比这多，bot 就只围观",
                     startAction = { SettingsRowIcon(Icons.Filled.Person) },
                     items = vm.humanLabels,
                     selectedIndex = vm.humanIndex,
@@ -639,7 +639,7 @@ private fun MiuixSettingsBody(
                 )
                 OverlayDropdownPreference(
                     title = "回复延迟",
-                    summary = "区间内随机等一会儿再回，别秒回",
+                    summary = "随机等一会儿再回，别秒回",
                     startAction = { SettingsRowIcon(Icons.Filled.Speed) },
                     items = vm.delayLabels,
                     selectedIndex = vm.delayIndex,
@@ -677,7 +677,7 @@ private fun MiuixSettingsBody(
                 )
                 OverlayDropdownPreference(
                     title = "每日上限",
-                    summary = "每天最多回多少条，到点当天就不再回（群配置能按群覆盖）",
+                    summary = "每天最多回多少条，群配置能单设",
                     startAction = { SettingsRowIcon(Icons.Filled.Speed) },
                     items = vm.dailyLimitItems,
                     selectedIndex = vm.dailyLimitIndex,
@@ -700,14 +700,14 @@ private fun MiuixSettingsBody(
             SettingsMiuixGroup {
                 SwitchPreference(
                     title = "非主人不称呼主人",
-                    summary = "对方不是主人时，把回复里的「主人」换成你配置的称呼；关闭后只提示、不替换",
+                    summary = "对方不是主人时，「主人」换成你配的称呼",
                     startAction = { SettingsRowIcon(Icons.Filled.Person) },
                     checked = vm.masterGuard,
                     onCheckedChange = { vm.switchMasterGuard(it) },
                 )
                 SwitchPreference(
                     title = "群里自动接话",
-                    summary = "关着时群里只有 @ 才会回；打开后它会自己判断要不要插话（默认关）",
+                    summary = "关着群里只有 @ 才回",
                     startAction = { SettingsRowIcon(Icons.Filled.Forum) },
                     checked = vm.autochat,
                     onCheckedChange = { vm.switchAutochat(it) },
@@ -720,14 +720,14 @@ private fun MiuixSettingsBody(
             SettingsMiuixGroup {
                 SwitchPreference(
                     title = "开机自动启动",
-                    summary = if (vm.autoStart) "已开启" else "已关闭",
+                    summary = if (vm.autoStart) "开着" else "关着",
                     startAction = { SettingsRowIcon(Icons.Filled.PlayArrow) },
                     checked = vm.autoStart,
                     onCheckedChange = { vm.switchAutoStart(it) },
                 )
                 SwitchPreference(
                     title = "运行中的通知栏提醒",
-                    summary = "通知栏挂一条运行中的消息，点一下回到 App",
+                    summary = "通知栏挂一条，点一下回 App",
                     startAction = { SettingsRowIcon(Icons.Filled.Notifications) },
                     checked = vm.runNotif,
                     onCheckedChange = { vm.switchRunNotif(it) },
@@ -736,7 +736,7 @@ private fun MiuixSettingsBody(
                 if (curMode != RunMode.NORMAL) {
                     SwitchPreference(
                         title = "自动拉回",
-                        summary = if (vm.autoPull) "已开启 · 被杀后自动拉回来" else "已关闭 · 被杀后不会拉起",
+                        summary = if (vm.autoPull) "开着 · 被杀后自动拉回" else "关着 · 被杀后不拉",
                         startAction = { SettingsRowIcon(Icons.Filled.Refresh) },
                         checked = vm.autoPull,
                         onCheckedChange = { vm.switchAutoPull(it) },
@@ -750,19 +750,19 @@ private fun MiuixSettingsBody(
             SettingsMiuixGroup {
                 ArrowPreference(
                     title = "人格 / 文案",
-                    summary = "切换角色预设、直接编辑文本文件",
+                    summary = "换角色预设，直接改文本文件",
                     startAction = { SettingsRowIcon(Icons.Filled.Person) },
                     onClick = actions.onOpenTexts,
                 )
                 ArrowPreference(
                     title = "日志",
-                    summary = "查看 / 导出到系统文件",
+                    summary = "看日志，导出成文件",
                     startAction = { SettingsRowIcon(Icons.Filled.Notes) },
                     onClick = actions.onOpenLog,
                 )
                 ArrowPreference(
                     title = "备份与恢复",
-                    summary = "导出 / 导入配置，备份和换机用",
+                    summary = "导出导入配置，换机用",
                     startAction = { SettingsRowIcon(Icons.Rounded.Backup) },
                     onClick = onOpenBackup,
                 )
@@ -774,7 +774,7 @@ private fun MiuixSettingsBody(
             SettingsMiuixGroup {
                 ArrowPreference(
                     title = "关于",
-                    summary = "版本、技术信息和开源致谢",
+                    summary = "版本和开源致谢",
                     startAction = { SettingsRowIcon(Icons.Filled.Info) },
                     onClick = actions.onOpenAbout,
                 )
@@ -787,7 +787,7 @@ private fun MiuixSettingsBody(
                 SettingsMiuixGroup {
                     ArrowPreference(
                         title = "重看使用引导",
-                        summary = "清掉完成标记，重新走一遍引导",
+                        summary = "清掉完成标记，重新走引导",
                         startAction = { SettingsRowIcon(Icons.Filled.Refresh) },
                         onClick = actions.onReplayOnboarding,
                     )
@@ -825,12 +825,12 @@ private fun SettingsGroupTitle(text: String) {
 private const val JUDGE_CARD_TITLE = "回复判定-模型判断配置"
 
 /** 随机模式下卡里唯一的一行灰字。 */
-private const val JUDGE_CARD_RANDOM = "当前为随机模式，模型判定配置不生效"
+private const val JUDGE_CARD_RANDOM = "随机模式：模型判定配置不生效"
 
 /** 卡片底部的说明（原模型配置页那段，只把档位名换成 [JudgeLabels] 的叫法）。 */
 private const val JUDGE_CARD_NOTE =
-    "只影响没 @ 本 bot 的群消息：保守要明确叫你，标准（默认）拿不准就接，积极基本都接。" +
-        "判定模型答不出 1/0 就当接；判定调用失败时，只有保守档才当不接。"
+    "保守要叫明确，标准拿不准就接，积极都接。" +
+        "判定答不出就算接，只有保守档不算。"
 
 /** 卡内说明小字：13sp + 次要色（两套结构同一份字号与颜色）。 */
 @Composable
@@ -863,8 +863,7 @@ private fun JudgeConfigCardMiuix(vm: SettingsVm) {
             )
             SwitchPreference(
                 title = "名字命中就当被叫",
-                summary = if (vm.nameHit) "正文里出现人格名或称呼 → 跳过判定直接回"
-                else "只在 @ 本 bot 时才回（或交给回复判定）",
+                summary = "打开后正文里的人名或称呼也算叫它",
                 startAction = { SettingsRowIcon(Icons.Filled.Person) },
                 checked = vm.nameHit,
                 onCheckedChange = { vm.switchNameHit(it) },
@@ -897,8 +896,7 @@ private fun JudgeConfigCardMaterial(vm: SettingsVm) {
             item {
                 SegmentedSwitchItem(
                     title = "名字命中就当被叫",
-                    summary = if (vm.nameHit) "正文里出现人格名或称呼 → 跳过判定直接回"
-                    else "只在 @ 本 bot 时才回（或交给回复判定）",
+                    summary = "打开后正文里的人名或称呼也算叫它",
                     icon = Icons.Filled.Person,
                     checked = vm.nameHit,
                     onCheckedChange = { vm.switchNameHit(it) },
@@ -1003,7 +1001,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedSwitchItem(
                         title = "多 bot 由总模型决定谁回",
-                        summary = "打开后一句话只让一个 bot 回，由总模型挑谁；只有一个 bot 时不起作用",
+                        summary = "一句话只让一个 bot 回，总模型挑谁",
                         icon = Icons.Filled.Forum,
                         checked = vm.gate,
                         onCheckedChange = { vm.switchGate(it) },
@@ -1012,7 +1010,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedDropdownItem(
                         title = "每个 bot 连续发言上限",
-                        summary = "连说到这么多条就先停一停，把话头让给人",
+                        summary = "连说这么多条就先停，把话头让人",
                         icon = Icons.Filled.Notes,
                         items = vm.turnLabels,
                         selectedIndex = vm.turnIndex,
@@ -1032,7 +1030,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedDropdownItem(
                         title = "真人每小时上限",
-                        summary = "真人比这说得还多时，bot 只围观",
+                        summary = "真人说得比这多，bot 就只围观",
                         icon = Icons.Filled.Person,
                         items = vm.humanLabels,
                         selectedIndex = vm.humanIndex,
@@ -1042,7 +1040,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedDropdownItem(
                         title = "回复延迟",
-                        summary = "区间内随机等一会儿再回，别秒回",
+                        summary = "随机等一会儿再回，别秒回",
                         icon = Icons.Filled.Speed,
                         items = vm.delayLabels,
                         selectedIndex = vm.delayIndex,
@@ -1084,7 +1082,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedDropdownItem(
                         title = "每日上限",
-                        summary = "每天最多回多少条，到点当天就不再回（群配置能按群覆盖）",
+                        summary = "每天最多回多少条，群配置能单设",
                         icon = Icons.Filled.Speed,
                         items = vm.dailyLimitItems,
                         selectedIndex = vm.dailyLimitIndex,
@@ -1111,7 +1109,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedSwitchItem(
                         title = "非主人不称呼主人",
-                        summary = "对方不是主人时，把回复里的「主人」换成你配置的称呼；关闭后只提示、不替换",
+                        summary = "对方不是主人时，「主人」换成你配的称呼",
                         icon = Icons.Filled.Person,
                         checked = vm.masterGuard,
                         onCheckedChange = { vm.switchMasterGuard(it) },
@@ -1120,7 +1118,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedSwitchItem(
                         title = "群里自动接话",
-                        summary = "关着时群里只有 @ 才会回；打开后它会自己判断要不要插话（默认关）",
+                        summary = "关着群里只有 @ 才回",
                         icon = Icons.Filled.Forum,
                         checked = vm.autochat,
                         onCheckedChange = { vm.switchAutochat(it) },
@@ -1135,7 +1133,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedSwitchItem(
                         title = "开机自动启动",
-                        summary = if (vm.autoStart) "已开启" else "已关闭",
+                        summary = if (vm.autoStart) "开着" else "关着",
                         icon = Icons.Filled.PlayArrow,
                         checked = vm.autoStart,
                         onCheckedChange = { vm.switchAutoStart(it) },
@@ -1144,7 +1142,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedSwitchItem(
                         title = "运行中的通知栏提醒",
-                        summary = "通知栏挂一条运行中的消息，点一下回到 App",
+                        summary = "通知栏挂一条，点一下回 App",
                         icon = Icons.Filled.Notifications,
                         checked = vm.runNotif,
                         onCheckedChange = { vm.switchRunNotif(it) },
@@ -1155,7 +1153,7 @@ private fun MaterialSettingsBody(
                     item {
                         SegmentedSwitchItem(
                             title = "自动拉回",
-                            summary = if (vm.autoPull) "已开启 · 被杀后自动拉回来" else "已关闭 · 被杀后不会拉起",
+                            summary = if (vm.autoPull) "开着 · 被杀后自动拉回" else "关着 · 被杀后不拉",
                             icon = Icons.Filled.Refresh,
                             checked = vm.autoPull,
                             onCheckedChange = { vm.switchAutoPull(it) },
@@ -1171,7 +1169,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedArrowItem(
                         title = "人格 / 文案",
-                        summary = "切换角色预设、直接编辑文本文件",
+                        summary = "换角色预设，直接改文本文件",
                         icon = Icons.Filled.Person,
                         onClick = actions.onOpenTexts,
                     )
@@ -1179,7 +1177,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedArrowItem(
                         title = "日志",
-                        summary = "查看 / 导出到系统文件",
+                        summary = "看日志，导出成文件",
                         icon = Icons.Filled.Notes,
                         onClick = actions.onOpenLog,
                     )
@@ -1187,7 +1185,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedArrowItem(
                         title = "备份与恢复",
-                        summary = "导出 / 导入配置，备份和换机用",
+                        summary = "导出导入配置，换机用",
                         icon = Icons.Rounded.Backup,
                         onClick = onOpenBackup,
                     )
@@ -1201,7 +1199,7 @@ private fun MaterialSettingsBody(
                 item {
                     SegmentedArrowItem(
                         title = "关于",
-                        summary = "版本、技术信息和开源致谢",
+                        summary = "版本和开源致谢",
                         icon = Icons.Filled.Info,
                         onClick = actions.onOpenAbout,
                     )
@@ -1216,7 +1214,7 @@ private fun MaterialSettingsBody(
                     item {
                         SegmentedArrowItem(
                             title = "重看使用引导",
-                            summary = "清掉完成标记，重新走一遍引导",
+                            summary = "清掉完成标记，重新走引导",
                             icon = Icons.Filled.Refresh,
                             onClick = actions.onReplayOnboarding,
                         )
@@ -1298,7 +1296,7 @@ private fun DelayCustomDialog(
     val numberKeys = KeyboardOptions(keyboardType = KeyboardType.Number)
     WindowDialog(
         show = show,
-        title = "回复延迟（自定义）",
+        title = "自定义回复延迟",
         onDismissRequest = onDismiss,
         content = {
             Column(
@@ -1306,7 +1304,7 @@ private fun DelayCustomDialog(
                 verticalArrangement = Arrangement.spacedBy(PanelTokens.RowSpacing),
             ) {
                 Text(
-                    text = "在这两个秒数之间随机等一会儿再回；两个都填 0 = 不延迟。",
+                    text = "两个秒数之间随机等一会儿再回。都填 0 就是不延迟。",
                     style = MiuixTheme.textStyles.footnote2,
                     color = MiuixTheme.colorScheme.onBackground,
                 )
@@ -1368,8 +1366,8 @@ private fun ArchiveDialog(
                     color = MiuixTheme.colorScheme.onBackground,
                 )
                 Text(
-                    text = "每 20 条或 5 秒落一次盘。默认留 30 天，每个会话最多 5000 条，"
-                        + "超出的自动删最旧的。导出是一行一条纯文本。",
+                    text = "每 20 条或 5 秒写一次盘。留 30 天，每个会话最多 5000 条，"
+                        + "多的删最旧。导出的是纯文本。",
                     style = MiuixTheme.textStyles.footnote2,
                     color = MiuixTheme.colorScheme.onBackground,
                 )

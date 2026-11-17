@@ -170,7 +170,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
             } else {
                 models = emptyList()
                 sheetFor = ""
-                error = "没读到模型：" + out.error + "。地址和 Key 再核一遍"
+                error = "没读到模型：" + out.error + "，地址和 Key 再核一遍"
             }
         }
     }
@@ -195,18 +195,10 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
         }
         error = ""
         // 思考强度空串也存：等于「请求体不带该字段」，不是「没保存」
-        val v = if (visionModel.isBlank()) "识图留空→主模型" else "识图 " + visionModel.trim()
-        val j = if (judgeModel.isBlank()) "判定留空→主模型" else "判定 " + judgeModel.trim()
-        val s = if (summaryModel.isBlank()) "摘要留空→主模型" else "摘要 " + summaryModel.trim()
-        val q = if (searchModel.isBlank()) "搜索留空→主模型" else "搜索 " + searchModel.trim()
-        val e = if (effort.isBlank()) "思考强度留空 → 请求体不带该字段" else "思考强度 " + effort.trim()
-        notice = "已保存（主模型 " + mainModel.trim().ifBlank { "deepseek-chat" } + "，" + v +
-            "，" + j + "，" + s + "，" + q + "，窗口 " + contextWindow.trim().ifBlank { "131072" } +
-            "，" + (if (webOn) "联网开" else "联网关") +
-            (if (personaStyle) "，人设化回答开" else "，人设化回答关") +
-            (if (autoDecide) "，自判联网开" else "，自判联网关") +
-            "，搜索服务 " + providerLabel(provider) + "，" + e + "）" +
-            if (restarted > 0) "，正在重启 " + restarted + " 个 bot…" else ""
+        notice = "已保存 · 主模型 " + mainModel.trim().ifBlank { "deepseek-chat" } +
+            " · 窗口 " + contextWindow.trim().ifBlank { "131072" } +
+            (if (webOn) " · 联网开" else " · 联网关") +
+            if (restarted > 0) "，在重启 " + restarted + " 个 bot…" else ""
     }
 
     /** 验证思考强度：用当前配置发一次最小请求（留空也照发，那就是平台默认行为）。 */
@@ -215,7 +207,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
             error = "先填「接口地址」和「API Key」，再验证思考强度"
             return
         }
-        notice = if (effort.isBlank()) "当前未设置思考强度，这次验证等于平台默认行为" else ""
+        notice = if (effort.isBlank()) "没设思考强度，这次按平台默认验" else ""
         error = ""
         verifyBusy = true
         verifyLine = ""
@@ -301,7 +293,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 SlotCard(
                     metrics = metrics,
                     title = "识图模型",
-                    help = "留空就用主模型。收到图片时用它识图。",
+                    help = "留空就跟主模型，看图用它",
                     value = visionModel,
                     main = mainModel,
                     busy = busy == "vision",
@@ -312,7 +304,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 SlotCard(
                     metrics = metrics,
                     title = "判定模型",
-                    help = "留空就用主模型。「回复判定」只回一个 0/1，配个便宜的够用。",
+                    help = "留空就跟主模型，只回 0/1，配便宜的够",
                     value = judgeModel,
                     main = mainModel,
                     busy = busy == "judge",
@@ -323,7 +315,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 SlotCard(
                     metrics = metrics,
                     title = "摘要模型",
-                    help = "留空就用主模型。上下文压缩时用它把旧对话并成一段摘要。",
+                    help = "留空就跟主模型，压旧对话时用它",
                     value = summaryModel,
                     main = mainModel,
                     busy = busy == "summary",
@@ -334,7 +326,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 SlotCard(
                     metrics = metrics,
                     title = "搜索模型",
-                    help = "留空就用主模型。#搜 / #读 把结果按人格转述成中文时用它（一次一条，配便宜的够）。",
+                    help = "留空就跟主模型，#搜 / #读 转述靠它",
                     value = searchModel,
                     main = mainModel,
                     busy = busy == "search",
@@ -349,8 +341,8 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                         insideMargin = PanelTokens.PrefInside,
                         title = "取值",
                         // 不指定 = 请求体里不带 reasoning_effort（用平台默认），右侧直接显示选中项
-                        summary = if (effortTrim.isEmpty()) "不指定 = 请求体不带该字段"
-                        else "发送值 = " + effortTrim,
+                        summary = if (effortTrim.isEmpty()) "不带这个字段"
+                        else "发出去的是 " + effortTrim,
                         items = EFFORT_ITEMS,
                         selectedIndex = effortIndex,
                         onSelectedIndexChange = { i ->
@@ -362,12 +354,12 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                                 // 「自定义…」只是就地摊开输入框，不改当前值
                                 i == EFFORT_ITEMS.lastIndex -> {
                                     customOpen = true
-                                    notice = "填任意取值（各家不同，例如 default），填完点确定"
+                                    notice = "各家取值不同，比如 default，填完点确定"
                                 }
                                 i == 0 -> {
                                     customOpen = false
                                     effort = ""
-                                    notice = "已选「不指定」：请求体里不带 reasoning_effort"
+                                    notice = "选了不指定，请求里不带 reasoning_effort"
                                 }
                                 else -> {
                                     customOpen = false
@@ -382,8 +374,8 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                     // 大写只用于显示：这里把真正会发出去的值写死给用户看，免得以为发了 Upper
                     Text(
                         text = if (effortTrim.isEmpty())
-                            "本次发送：不带 reasoning_effort（用平台默认）"
-                        else "本次发送值 = " + effortTrim + "（列表里的大写只用于显示）",
+                            "这次不带 reasoning_effort，按平台默认"
+                        else "这次发出去的是 " + effortTrim + "，大写只是显示",
                         fontSize = 13.sp,
                         color = PanelColors.primary,
                         modifier = Modifier.padding(start = 4.dp),
@@ -402,8 +394,8 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                         )
                     }
                     Text(
-                        text = "官方 DeepSeek 的取值为 None / Minimal / Low / Medium / High / " +
-                            "Xhigh / Ultra / Max（发送时用小写）。不是每个模型都认，留空最稳。",
+                        text = "官方 DeepSeek 认 None / Minimal / Low / Medium / High / " +
+                            "Xhigh / Ultra / Max，发出去用小写。留空最稳。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 6.dp),
@@ -444,21 +436,21 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                         insideMargin = PanelTokens.PrefInside,
                         title = "取值",
                         summary = if (winCustomShown)
-                            "当前 " + contextWindow.trim().ifBlank { "131072" } + "（自定义）"
-                        else "当前 " + WINDOW_PRESETS[winPreset].first +
-                            "（" + WINDOW_PRESETS[winPreset].second + "）",
+                            "自己填的 " + contextWindow.trim().ifBlank { "131072" }
+                        else "现在 " + WINDOW_PRESETS[winPreset].first +
+                            " · " + WINDOW_PRESETS[winPreset].second,
                         items = WINDOW_ITEMS,
                         selectedIndex = if (winCustomShown) WINDOW_ITEMS.lastIndex else winPreset,
                         onSelectedIndexChange = { i ->
                             error = ""
                             if (i == WINDOW_ITEMS.lastIndex) {
                                 windowCustom = true
-                                notice = "填任意 token 数（各家上限不同，64K~1M 常见），填完点保存"
+                                notice = "各家上限不同，64K~1M 常见，填完点保存"
                             } else {
                                 windowCustom = false
                                 contextWindow = WINDOW_PRESETS[i].second
-                                notice = "已选「" + WINDOW_PRESETS[i].first + "」（" +
-                                    WINDOW_PRESETS[i].second + " tokens），点保存才落盘"
+                                notice = "已选「" + WINDOW_PRESETS[i].first + "」，" +
+                                    WINDOW_PRESETS[i].second + " tokens，点保存才落盘"
                             }
                         },
                     )
@@ -473,10 +465,8 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                     }
                     val win = contextWindow.trim().toLongOrNull() ?: 131072L
                     Text(
-                        text = "单位 token，默认 131072（128K）。这是估算阈值，不是硬上限：" +
-                            "估算到 " + (win * 75 / 100) + " tokens 才把旧对话压成摘要。" +
-                            "真正发出去的只有 system + 摘要 + 最近 12 条原文，填大一点不会" +
-                            "让每次请求变贵。压缩后没真的变小，这次压缩就作废（不落盘）。",
+                        text = "单位 token，默认 131072（128K）。估到 " + (win * 75 / 100) +
+                            " tokens 才压旧对话，填大了也不多花钱。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 6.dp),
@@ -487,8 +477,8 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                 SectionCard(metrics, title = "联网搜索", titleOutside = true) {
                     SwitchPreference(
                         title = "联网搜索",
-                        summary = if (webOn) "已开启 · #搜 / #读 和自动搜索都能用"
-                        else "已关闭 · 不发送任何联网请求",
+                        summary = if (webOn) "开着 · #搜 / #读 和自动搜索都能用"
+                        else "关了就完全不出网",
                         checked = webOn,
                         onCheckedChange = { webOn = it },
                     )
@@ -497,9 +487,9 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                         insideMargin = PanelTokens.PrefInside,
                         title = "搜索服务",
                         summary = providerLabel(provider) +
-                            if (provider == "deepseek") "（用主模型 Key 调 /v1/tools）"
-                            else if (provider == "off") "" else "（" +
-                                searchBase.ifBlank { "还没填地址" } + "）",
+                            if (provider == "deepseek") " · 用主模型 Key 调 /v1/tools"
+                            else if (provider == "off") "" else " · " +
+                                searchBase.ifBlank { "还没填地址" },
                         items = PROVIDER_LABELS,
                         selectedIndex = PROVIDERS.indexOf(provider).coerceAtLeast(0),
                         onSelectedIndexChange = { i ->
@@ -536,7 +526,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                             )
                             PanelEllipsisField(
                                 value = authValue, onValueChange = { authValue = it },
-                                hint = "值（不会写进日志）", label = "Header 值", secret = true,
+                                hint = "值，不进日志", label = "Header 值", secret = true,
                             )
                         }
                     }
@@ -552,27 +542,25 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                     SwitchPreference(
                         title = "让模型自己决定要不要查",
                         summary = if (autoDecide)
-                            "已开启 · 聊天时它拿不准/需要最新信息就自己先搜再答（一条最多搜 5 次）"
-                        else "已关闭 · 只有 #搜 / #读 和「最近/新闻/价格」这类触发词才联网",
+                            "开着 · 拿不准就先搜再答，最多 5 次"
+                        else "关着 · 只有 #搜 / #读 和几个触发词才联网",
                         checked = autoDecide,
                         onCheckedChange = { autoDecide = it },
                     )
                     SwitchPreference(
                         title = "搜索结果人设化回答",
                         summary = if (personaStyle)
-                            "已开启 · 搜完按人格合成一段自然回答（至多 1 条干净链接），不列清单"
-                        else "已关闭 · 原始列表贴法（标题｜摘要 + 链接逐条贴，调试/对比用）",
+                            "开着 · 搜完按人格说一段，最多带 1 条链接"
+                        else "关着 · 原始列表，标题摘要加链接逐条贴",
                         checked = personaStyle,
                         onCheckedChange = { personaStyle = it },
                     )
                     Text(
-                        text = "不用打前缀：聊天里它不确定就会自己搜（「最近/今天/新闻/多少钱/" +
-                            "价格/什么时候/谁是/查一下」这类词也会兜底搜一次），最多连查 5 轮。" +
-                            "#搜 / #读 只有主人能用，别人发 # 就是普通聊天。回复是一段话，" +
-                            "最多带一条链接。中转站和第三方模型通常没有 /v1/tools，得改用" +
-                            "「SearXNG 自建」或「自定义 JSON 接口」（#读 抓正文只有 DeepSeek 官方" +
-                            "能抓）。关掉「人设化回答」= 回到原始列表贴法。" +
-                            "DeepSeek 官方计费：每 1000 次成功请求 5 元。",
+                        text = "不用打前缀：拿不准它就自己搜。" +
+                            "#搜 / #读 只有主人能用。" +
+                            "中转站一般没有 /v1/tools，改用 SearXNG 或自定义。" +
+                            "#读 只有 DeepSeek 官方能抓。" +
+                            "DeepSeek 官方计费：每 1000 次 5 元。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 6.dp),
@@ -587,8 +575,7 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
                         onClick = { save() },
                     )
                     Text(
-                        text = "点保存才会一起写入接口地址、API Key、主模型、识图/判定/摘要三个槽位、" +
-                            "上下文窗口、联网开关和思考强度。没点保存的改动不会落盘。",
+                        text = "这一页改完点保存才生效，没保存的不算。",
                         fontSize = 13.sp,
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(top = 8.dp),
@@ -646,11 +633,11 @@ private fun SlotCard(
         PanelEllipsisField(
             value = value,
             onValueChange = onValueChange,
-            hint = "留空就用主模型",
+            hint = "留空跟主模型",
             mono = false,
         )
         Text(
-            text = "当前：" + cur.ifBlank { "（留空）" } + " → 实际使用：" + actual,
+            text = "填的是 " + cur.ifBlank { "空着" } + " → 实际用 " + actual,
             fontSize = 13.sp,
             color = PanelColors.primary,
             modifier = Modifier.padding(top = 6.dp),
@@ -709,7 +696,7 @@ private fun ModelPickSheet(
             items(models, key = { it }) { name ->
                 BasicComponent(
                     title = name,
-                    summary = if (name == current) "当前已填" else null,
+                    summary = if (name == current) "现在填的就是它" else null,
                     onClick = { onPick(name) },
                 )
             }
@@ -771,7 +758,7 @@ private val WINDOW_ITEMS = WINDOW_PRESETS.map { it.first } + listOf("自定义�
 /** 搜索后端（与 Python 侧 _SEARCH_PROVIDERS 一致）。 */
 private val PROVIDERS = listOf("deepseek", "searxng", "custom", "off")
 private val PROVIDER_LABELS = listOf(
-    "DeepSeek 官方（默认）", "SearXNG 自建", "自定义 JSON 接口", "关闭（不联网）",
+    "DeepSeek 官方", "SearXNG 自建", "自定义 JSON 接口", "关闭，不联网",
 )
 
 private fun providerLabel(p: String): String {
@@ -781,7 +768,7 @@ private fun providerLabel(p: String): String {
 
 /** 鉴权：none / bearer（用主模型 Key）/ header:Name=Value。 */
 private val AUTH_MODES = listOf("none", "bearer", "header")
-private val AUTH_LABELS = listOf("无", "Bearer（用主模型 Key）", "自定义 Header…")
+private val AUTH_LABELS = listOf("无", "Bearer 用主模型 Key", "自定义 Header…")
 
 /** 空串 = 跟随后端默认：DeepSeek 官方用 bearer，其它用 none。 */
 private fun authModeCoerced(mode: String, provider: String): String = when {
@@ -812,7 +799,7 @@ private fun authWire(mode: String, name: String, value: String, provider: String
     val m = authModeCoerced(mode, provider)
     return if (m == "header") "header:" + name.trim() + "=" + value.trim() else m
 }
-private val EFFORT_ITEMS = listOf("不指定（用平台默认）") + EFFORT_DISPLAYS + listOf("自定义…")
+private val EFFORT_ITEMS = listOf("不指定，用平台默认") + EFFORT_DISPLAYS + listOf("自定义…")
 
 /** 显示项 → 发送值（小写）。 */
 private fun effortWire(display: String): String = display.lowercase()

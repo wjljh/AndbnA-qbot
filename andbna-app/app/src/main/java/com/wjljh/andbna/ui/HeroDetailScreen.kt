@@ -82,7 +82,7 @@ fun HeroDetailScreen(
     val askNotif = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
     ) { granted ->
-        if (!granted) msg = "没给通知权限：通知栏看不到运行状态，去系统设置里开"
+        if (!granted) msg = "没给通知权限：通知栏看不到状态。去系统设置开一下"
     }
 
     // 读文件 + 解析 JSON 放 IO：组合期一次，不在每次重组执行
@@ -93,7 +93,7 @@ fun HeroDetailScreen(
 
     fun pick(m: RunMode) {
         if (m.key == "root" && !RootHost.hasRoot()) {
-            errMsg = "没拿到 root：在 KernelSU / Magisk 里授权，再重启 App"
+            errMsg = "没拿到 root：去 KernelSU 或 Magisk 授权，再重启 App"
             return
         }
         errMsg = ""
@@ -103,16 +103,16 @@ fun HeroDetailScreen(
         if (m == RunMode.ADB) {
             if (busy) return
             busy = true
-            msg = "正在申请 Shizuku 授权…"
+            msg = "等 Shizuku 授权…"
             ShizukuShell.switchToAdb(ctx) { r ->
                 busy = false
                 if (r.ok) {
                     curMode = RunMode.ADB
                     onModeChange(RunMode.ADB)
-                    msg = "已切到「ADB 模式」；" + r.text
+                    msg = "已切到「ADB 模式」：" + r.text
                 } else {
                     msg = ""
-                    errMsg = "没切到 ADB 模式（模式仍是「" + curMode.label + "」）；" + r.text +
+                    errMsg = "没切到 ADB 模式，还是「" + curMode.label + "」：" + r.text +
                         "。下一步：" + r.hint
                 }
             }
@@ -129,7 +129,7 @@ fun HeroDetailScreen(
         topBar = {
             SecondaryTopBar(
                 title = "运行控制",
-                subtitle = "当前：" + curMode.label,
+                subtitle = "现在用 " + curMode.label,
                 onBack = onBack,
             )
         },
@@ -193,14 +193,14 @@ fun HeroDetailScreen(
                             text = "启动",
                             onClick = {
                                 if (botCount == 0) {
-                                    msg = "一个 bot 都没启用：去「Bot」页添加并启用"
+                                    msg = "一个 bot 都没启用：去「Bot」页加一个"
                                 } else {
                                     if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                                         askNotif.launch(Manifest.permission.POST_NOTIFICATIONS)
                                     }
                                     BotHost.init(ctx)
                                     BotService.startByUser(ctx)
-                                    msg = "已拉起服务（" + botCount + " 个 bot）"
+                                    msg = "服务起来了，" + botCount + " 个 bot"
                                 }
                             },
                         )
@@ -210,7 +210,7 @@ fun HeroDetailScreen(
                                 // 同状态页：先写停顿标记再停服务，看门狗才不会拉回
                                 BotService.stopByUser(ctx)
                                 BotHost.stopAll()
-                                msg = "已停止"
+                                msg = "停了"
                             },
                         )
                         PanelSecondaryButton(
@@ -224,7 +224,7 @@ fun HeroDetailScreen(
                                     delay(800)
                                     BotHost.init(ctx)
                                     BotService.startByUser(ctx)
-                                    msg = "已重启"
+                                    msg = "重启了"
                                 }
                             },
                         )

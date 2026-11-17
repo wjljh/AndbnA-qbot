@@ -193,7 +193,7 @@ private fun LocalStatusContent(
     ) { granted ->
         if (!granted) {
             msgOk = false
-            msg = "没给通知权限：bot 照跑，通知栏看不到，也更容易被系统清掉。去系统设置里开一下"
+            msg = "没给通知权限：bot 照跑，通知栏看不到。去系统设置开一下"
         }
     }
 
@@ -278,9 +278,9 @@ private fun LocalStatusContent(
         running && svcSince > 0L -> "已运行 " + uptimeText(svcSince)
         running && procSince > 0L -> "已运行 " + uptimeText(procSince)
         running && runSince > 0L -> "已运行 " + uptimeText(runSince)
-        pending == "启动中" -> "正在拉起 Python 与 " + botCount + " 个 bot…"
+        pending == "启动中" -> "在起 Python 和 " + botCount + " 个 bot…"
         running -> "已运行"
-        BotHost.isRunning() -> "正在连接…"
+        BotHost.isRunning() -> "在连…"
         else -> status.ifBlank { "点这里开始" }
         }
     }
@@ -307,7 +307,7 @@ private fun LocalStatusContent(
             Box(Modifier.fillMaxWidth().clickable { updateDialog = true }) {
                 Note(
                     text = "有新版 " + pendingUpdate.versionName +
-                        "（你现在是 " + BuildConfig.VERSION_NAME + "）· 点一下看",
+                        "，你现在是 " + BuildConfig.VERSION_NAME + " · 点一下看",
                     ok = true,
                 )
             }
@@ -383,7 +383,7 @@ private fun LocalStatusContent(
                         onClick = {
                             if (botCount == 0) {
                                 msgOk = false
-                                msg = "还没有启用中的 bot，去「Bot」页添加并启用"
+                                msg = "还没有启用中的 bot：去「Bot」页加一个"
                             } else {
                                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
                                     askNotif.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -392,7 +392,7 @@ private fun LocalStatusContent(
                                 // 用户想跑：清掉「停止全部」的停顿标记（看门狗重新上岗），再拉服务
                                 BotService.startByUser(ctx)
                                 msgOk = true
-                                msg = "已拉起前台服务（" + botCount + " 个 bot）"
+                                msg = "前台服务起来了，" + botCount + " 个 bot"
                                 pending = "启动中"
                                 scope.launch {
                                     listOf(400L, 1200L, 2500L).forEach { wait ->
@@ -413,7 +413,7 @@ private fun LocalStatusContent(
                             BotService.stopByUser(ctx)
                             BotHost.stopAll()
                             msgOk = true
-                            msg = "停止指令已发出"
+                            msg = "已让它停"
                         },
                         modifier = Modifier.weight(1f),
                         enabled = running && !busy,
@@ -470,8 +470,8 @@ private fun LocalStatusContent(
     PanelConfirmDialog(
         show = resumeAsk,
         title = "恢复自动拉回",
-        body = "自动拉回到了次数上限，暂停了。恢复会清掉这次的计数，看门狗重新上岗，" +
-            "被杀后照常把 App 拉回来。",
+        body = "自动拉回到上限了，所以停了。恢复会清掉计数，看门狗重新上岗，" +
+            "被杀后照样拉回。",
         confirmLabel = "恢复自动拉回",
         danger = false,
         onConfirm = {
@@ -479,7 +479,7 @@ private fun LocalStatusContent(
             scope.launch {
                 withContext(Dispatchers.IO) { PullBack.resumeFromLimit(ctx) }
                 msgOk = true
-                msg = "自动拉回：已恢复（看门狗重新上岗）"
+                msg = "自动拉回开了：看门狗重新上岗"
                 // 脚本被 spawn 后才写 pid/state/hb，上岗要一两秒：连读几次，别停在「未启用」上
                 listOf(600L, 1500L, 3000L, 5000L).forEach { wait ->
                     delay(wait)
@@ -727,7 +727,7 @@ internal fun costCandidates(c: CostSnapshot?): List<String> {
  */
 private fun probeSummary(raw: String): Pair<Boolean, String> {
     val lines = raw.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList()
-    if (lines.isEmpty()) return false to "自检没过：python 没有输出。先点「启动」，起来再自检一次"
+    if (lines.isEmpty()) return false to "自检没过：python 没输出。先点「启动」再自检"
 
     val bad = lines.firstOrNull { it.contains("✗") }
     if (bad != null) {
@@ -735,7 +735,7 @@ private fun probeSummary(raw: String): Pair<Boolean, String> {
         val why = bad.substringAfter("✗", "").trim()
         return false to "自检没过：" +
             (if (name.isBlank()) "依赖导入出错" else name + " 导入失败") +
-            (if (why.isBlank()) "" else "（" + why + "）") + "。多半是依赖没装上，去「日志」页看哪一步挂了"
+            (if (why.isBlank()) "" else "：" + why) + "。多半是依赖没装，去「日志」页看"
     }
     if (raw.startsWith("Python 没起来") || raw.startsWith("自检失败")) {
         return false to "自检没过：" + lines.first().removePrefix("自检失败：").take(40) + "。先点「启动」再来"
@@ -895,7 +895,7 @@ private fun AdbCard() {
                 onClick = {
                     // 一次走完「申请 → 绑定」：三种结果（未运行 / 已拒绝 / 已授权+bound）都以 ShizukuResult 为准
                     busy = true
-                    msg = "正在申请 Shizuku 授权…"
+                    msg = "等 Shizuku 授权…"
                     ShizukuShell.ensureAuthorized(ctx) { r ->
                         busy = false
                         shizukuOk = r.auth != ShizukuAuth.NOT_RUNNING
@@ -913,9 +913,9 @@ private fun AdbCard() {
                     scope.launch {
                         withContext(Dispatchers.IO) { ShizukuShell.bind(ctx.packageName) }
                         delay(1200)
-                        msg = if (ShizukuShell.bound) "UserService 已连上（bound=true）"
-                        else "UserService 没连上（bound=false）；" +
-                            ShizukuShell.lastError.ifBlank { "需 Shizuku v13+ 且已授权" }
+                        msg = if (ShizukuShell.bound) "UserService 连上了"
+                        else "UserService 没连上：" +
+                            ShizukuShell.lastError.ifBlank { "Shizuku 13 起且已授权" }
                         busy = false
                         tick++
                     }
@@ -950,14 +950,14 @@ private fun AdbCard() {
         // 版本建议一句话（原来的「先起 Shizuku 再开 App」那串说明已删），
         // 「换版本后要重启 App 才重新绑定」压成一行小字留着
         Text(
-            text = "建议使用 Shizuku 13.7 及以上版本（旧版在 Android 17 上服务会自行退出）",
+            text = "Shizuku 用 13.7 起的版本：旧版在 Android 17 上会自己退出",
             fontSize = PanelTokens.OnboardListNoteSize,
             lineHeight = PanelTokens.OnboardHeroBodyLineHeight,
             color = PanelColors.onSurfaceVariantSummary,
             modifier = Modifier.padding(top = PanelTokens.ButtonRowTopGap),
         )
         Text(
-            text = "换过 Shizuku 版本后要重启本 App 才会重新绑定（Shizuku 只在新进程里下发通道）",
+            text = "换过 Shizuku 版本，要重启 App 才重新绑定",
             fontSize = PanelTokens.OnboardListNoteSize,
             color = PanelColors.onSurfaceVariantSummary,
             modifier = Modifier.padding(top = PanelTokens.InfoValueGap),

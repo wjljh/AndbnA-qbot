@@ -147,7 +147,7 @@ fun BotsPage(
                 item(key = "loading") {
                     PanelGroupCard {
                         Text(
-                            text = "正在读取 bot 清单…",
+                            text = "在读清单…",
                             fontSize = PanelTokens.EntityTitleSize,
                             fontWeight = FontWeight(550),
                             color = PanelColors.onSurfaceVariantSummary,
@@ -160,8 +160,8 @@ fun BotsPage(
                         SegmentedGroup(modifier = Modifier.segmentedGroupInsets()) {
                             item {
                                 SegmentedArrowItem(
-                                    title = "还没有配置 bot",
-                                    summary = "填上 AppID 和 AppSecret 就能加一个",
+                                    title = "还没有 bot",
+                                    summary = "填 AppID 和 AppSecret 就能加",
                                     icon = Icons.Filled.Person,
                                     onClick = { onOpenBotAdd() },
                                 )
@@ -170,13 +170,13 @@ fun BotsPage(
                     } else {
                         PanelGroupCard {
                             Text(
-                                text = "还没有配置 bot",
+                                text = "还没有 bot",
                                 fontSize = PanelTokens.EntityTitleSize,
                                 fontWeight = FontWeight(550),
                                 color = PanelColors.onSurface,
                             )
                             Text(
-                                text = "填上 AppID 和 AppSecret 就能加一个",
+                                text = "填 AppID 和 AppSecret 就能加",
                                 fontSize = PanelTokens.EntitySubtitleSize,
                                 color = PanelColors.onSurfaceVariantSummary,
                                 modifier = Modifier.padding(top = PanelTokens.InfoValueGap),
@@ -188,7 +188,7 @@ fun BotsPage(
                             )
                             PanelPillRow {
                                 PanelPrimaryButton(
-                                    text = "添加一个",
+                                    text = "加一个",
                                     onClick = { onOpenBotAdd() },
                                     modifier = Modifier.weight(1f),
                                 )
@@ -204,7 +204,7 @@ fun BotsPage(
                     // 顺序很讲究：先写 localbots.json 的 enabled，再动进程。Python 侧按「启用中的
                     // bot 数」判断总模型要不要上岗，所以它必须在新状态落盘之后才收到 stop/start。
                     val onToggle: (Boolean) -> Unit = { on ->
-                        msg = if (on) "正在启动「" + b.title + "」…" else "正在停止「" + b.title + "」…"
+                        msg = if (on) "启动「" + b.title + "」" else "停「" + b.title + "」"
                         scope.launch {
                             val note = withContext(Dispatchers.IO) {
                                 BotStore.setEnabled(ctx, b.appid, on)
@@ -214,7 +214,7 @@ fun BotsPage(
                             bots = withContext(Dispatchers.IO) { BotStore.load(ctx) }
                             // 立刻拉一次快照：状态从「已上线」变「未启动」不用等 2 秒轮询
                             pullSnapshot()
-                            msg = "手动启停：" + b.title + " " + note
+                            msg = "手动启停 " + b.title + "：" + note
                         }
                     }
                     // 「编辑」= 进二级页做这个 bot 的详细配置（Route.BotEdit），不再复用添加弹层
@@ -348,7 +348,7 @@ fun BotsPage(
         ) {
             Icon(
                 imageVector = MiuixIcons.Add,
-                contentDescription = "添加 bot",
+                contentDescription = "加一个 bot",
                 modifier = Modifier.size(40.dp),
                 tint = PanelColors.onPrimary,
             )
@@ -534,7 +534,7 @@ private fun botSubtitle(bot: LocalBot, status: String): String {
         else -> "未启动"
     }
     return statusText + " · 人格：" + bot.persona.ifBlank { "未设置" } +
-        " · AppID " + bot.appid + if (bot.secret.isBlank()) "（缺 AppSecret）" else ""
+        " · AppID " + bot.appid + if (bot.secret.isBlank()) " · 缺 AppSecret" else ""
 }
 
 /**
