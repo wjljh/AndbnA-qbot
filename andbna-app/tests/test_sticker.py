@@ -378,8 +378,8 @@ def test_send():
     MODEL["out"] = "<sticker>s1</sticker>"
     ret = group_send()
     kinds = [k for k, _ in API.sent]
-    check("10a 不发文字、只发一条图", ret == "" and kinds == ["group"]
-          and API.sent[0][1].get("msg_type") == 7, kinds)
+    check("10a 不发文字、只发一条图（文本发送次数 = 0）", ret == "" and kinds == ["group"]
+          and API.sent[0][1].get("msg_type") == 7 and texts() == [], kinds)
     check("10b 记忆里留了句子占位（下一轮知道它说过话）",
           any("发了个表情" in str(r) for r in (br._memory(BOT).get("g" + GID) or [])),
           br._memory(BOT).get("g" + GID))
@@ -472,9 +472,10 @@ def test_cmd():
     lib10()
 
     ok = cmd("#表情")
-    check("命令9a 主人 #表情 无参数 → 上传 1 次 + 发 1 条图（不多发文字）",
+    check("命令9a 主人 #表情 无参数 → 上传 1 次 + 发 1 条图、文本发送次数 = 0",
           ok is True and len(API.http.calls) == 1 and len(API.sent) == 1
-          and API.sent[0][1].get("msg_type") == 7, (ok, len(API.http.calls), API.sent))
+          and API.sent[0][1].get("msg_type") == 7 and texts() == [],
+          (ok, len(API.http.calls), API.sent))
     check("命令9b 发出去的那张记进冷却、本会话窗口清零",
           list(br._sticker_state["sent"]) and br._sticker_state["replies"].get("g" + GID) == 0,
           br._sticker_state)
@@ -611,9 +612,9 @@ def test_nl():
     clear_http()
     m1 = FakeMsg("n1", "发个表情", oid=UOID)
     ok = asyncio.run(br.sticker_nl(APPID, BOT, m1, "p" + UOID, "发个表情", mid="n1"))
-    check("自然15a 私聊「发个表情」→ 发一张（一句固定配文 + 一条图，都走私聊）",
-          ok is True and len(imgs()) == 1 and texts() == ["这张给你"]
-          and API.sent[0][0] == "c2c" and API.sent[1][0] == "c2c", API.sent)
+    check("自然15a 私聊「发个表情」→ 只发一张图，一条文字都不发",
+          ok is True and len(imgs()) == 1 and texts() == []
+          and len(API.sent) == 1 and API.sent[0][0] == "c2c", API.sent)
     check("自然15b 日志：表情：自然语言触发（关键词=无）→ 已发",
           has("表情：自然语言触发（关键词=无）→ 已发"),
           [x for x in logs() if "自然语言触发" in x])
@@ -663,6 +664,81 @@ def test_nl():
 
     check("自然15i 「今天天气不错」不触发", br._sticker_nl_of("今天天气不错") == (False, ""))
 
+
+# ── 18 · 只发图（命令 / 自然语言）：文本发送次数 = 0 ─────────────────
+
+def test_only_image():
+    print("[18] 只发图：命令 / 自然语言都不回文字")
+    reset()
+    write_llm(sticker_every_n=10)
+    write_json(os.path.join(BOT, "owner.json"), {"user_openid": UOID})
+    lib10()
+
+    clear_http()
+    ok = cmd("#表情")
+    sid = [k[1] for k in br._sticker_state["sent"]] or [""]
+    check("只图18a #表情 → 只发图片 1 次、文本发送次数 = 0",
+          ok is True and len(API.sent) == 1 and len(imgs()) == 1 and texts() == [],
+          API.sent)
+    check("只图18b 日志：回复 · 表情：只发图（命令/自然语言）｜<id>",
+          has("回复 · 表情：只发图（命令/自然语言）｜%s" % sid[0]),
+          [x for x in logs() if "只发图" in x])
+    check("只图18c 记忆里留了「（发了个表情）」占位（下一轮能追问）",
+          any("发了个表情" in str(r) for r in (br._memory(BOT).get("g" + GID) or [])),
+          br._memory(BOT).get("g" + GID))
+
+    br._sticker_cmd_state["last"].clear()
+    br._sticker_state["sent"].clear()
+    clear_http()
+    ok = asyncio.run(br.sticker_nl(APPID, BOT, FakeMsg("n8", "发个表情", oid=UOID),
+                                   "p" + UOID, "发个表情", mid="n8"))
+    check("只图18d 私聊「发个表情」→ 只发图片 1 次、文本发送次数 = 0",
+          ok is True and len(API.sent) == 1 and len(imgs()) == 1 and texts() == []
+          and API.sent[0][0] == "c2c", API.sent)
+
+    print("[19] 只发图失败 → 回一句错误，不抛异常")
+    br._sticker_cmd_state["last"].clear()
+    br._sticker_state["sent"].clear()
+    clear_http()
+    API.http.err = RuntimeError("连接被重置")
+    ok = cmd("#表情")
+    check("只图19a #表情 上传失败 → 不发图、回一句「发不出去：<原因>」，不抛异常",
+          ok is True and imgs() == [] and len(texts()) == 1
+          and texts()[0].startswith("发不出去：") and "连接被重置" in texts()[0], API.sent)
+    check("只图19b 失败日志：错误 · 表情发送失败：<原因>｜未回文字",
+          has("错误 · 表情发送失败：连接被重置｜未回文字"),
+          [x for x in logs() if "表情发送失败" in x])
+    check("只图19c 失败也回滚冷却（一次抖动不白占 24 小时）",
+          br._sticker_state["sent"] == {}, br._sticker_state["sent"])
+    br._sticker_cmd_state["last"].clear()
+    br._sticker_state["sent"].clear()
+    clear_http()
+    ok = asyncio.run(br.sticker_nl(APPID, BOT, FakeMsg("n9", "发个表情", oid=UOID),
+                                   "p" + UOID, "发个表情", mid="n9"))
+    check("只图19d 自然语言上传失败 → 同样只回一句错误，不抛异常",
+          ok is True and imgs() == [] and texts() and texts()[0].startswith("发不出去："),
+          API.sent)
+    API.http.err = None
+
+    print("[20] 模型自发带标记：正文照发 + 补一张图（不变）")
+    reset()
+    write_llm(sticker_every_n=1)
+    MODEL["out"] = "好的<sticker>s1</sticker>"
+    group_send(mid="m_only_a")
+    check("只图20a 有正文 → 文本 1 次 + 图片 1 次（先文字后图）",
+          len(texts()) == 1 and texts() == ["好的"] and len(imgs()) == 1
+          and API.sent[0][1].get("msg_type") == 0, API.sent)
+    check("只图20b 这条日志仍是「表情：发送」（不是「只发图」）",
+          has("表情：发送 s1（本群 1 条内第 1 张）") and not has("只发图"),
+          [x for x in logs() if "表情" in x])
+    reset()
+    write_llm(sticker_every_n=1)
+    MODEL["out"] = "<sticker>s1</sticker>"
+    ret = group_send(mid="m_only_b")
+    check("只图20c 正文只有标记 → 文本 0 次、只发图",
+          ret == "" and texts() == [] and len(imgs()) == 1, API.sent)
+
+
 def main():
     os.makedirs(BOT, exist_ok=True)
     with open(os.path.join(BOT, "persona.txt"), "w", encoding="utf-8") as f:
@@ -679,6 +755,7 @@ def main():
     test_cmd()
     test_stick_line()
     test_nl()
+    test_only_image()
 
     shutil.rmtree(TMP, ignore_errors=True)
     bad = [r for r in RESULTS if not r[1]]

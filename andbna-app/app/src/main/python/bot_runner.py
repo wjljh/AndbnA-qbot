@@ -6689,6 +6689,7 @@ _STICKER_HINT_RULE = ("想发某张就在回复末尾单独写一行：<sticker>
                       "用户直接让你发表情时也照做。可用的表情（id｜描述｜标签）：")
 _STICKER_HINT_TAIL = "不想发就不要写。不要解释这个标记。"
 _STICKER_EMPTY = "库里还没有表情"
+_STICKER_FAIL_SAY = "发不出去：%s"     # 只发图失败时唯一会说的那句话
 _STICKER_CMD_GAP_S = 300            # 非主人：#表情 同一会话同一个人 5 分钟最多 1 次
 _STICKER_CMD_BUSY = "歇会儿，5 分钟后再来"
 _sticker_lib_cache = {}             # library.json 路径 -> ((mtime_ns, size), [item])
@@ -6697,6 +6698,7 @@ _sticker_lock = threading.Lock()
 _sticker_state = {"replies": {}, "sent": {}}   # 防刷屏状态：只在内存，重启清零
 _sticker_cmd_state = {"last": {}, "warned": {}}  # 命令限频：last=上次放行，warned=上次回过拒绝
 _sticker_pending = contextvars.ContextVar("sticker_pending", default=None)
+_sticker_last_err = contextvars.ContextVar("sticker_last_err", default="")  # 上一次发图失败的原因（只发图时要回一句）
 # botpy 的错误类型不带状态码，按类名反查（不 import botpy：单测环境里没有它）
 _STICKER_HTTP = {"AuthenticationFailedError": 401, "ForbiddenError": 403,
                  "NotFoundError": 404, "MethodNotAllowedError": 405,
@@ -6879,6 +6881,12 @@ def _sticker_unmark(botdir, item):
         _sticker_state["sent"].pop((str(botdir or ""), str((item or {}).get("id") or "")), None)
 
 
+def _sticker_remember(botdir, key):
+    """只发图也在记忆里留一条占位：下一轮「再发一张」它得知道自己刚发过。"""
+    _remember(botdir, key, "assistant", "（发了个表情）")
+    _arc_reply_by_key(botdir, key, "（发了个表情）")
+
+
 def _sticker_take():
     """取出并清空本轮待发表情（_reply 写好，发送方用完即弃）。"""
     item = _sticker_pending.get()
@@ -6928,17 +6936,24 @@ async def _sticker_upload(api, key, data):
     return await api._http.request(route, json=body)
 
 
-def _sticker_fail(appid, botdir, item, why):
-    """发图失败：回滚冷却 + 一行错误。文字那条早就发出去了，这里只影响表情。"""
+def _sticker_fail(appid, botdir, item, why, only_image=False):
+    """发图失败：回滚冷却 + 一行错误 + 记下原因（只发图时要拿它回一句）。
+
+    模型自发那条：正文早就发出去了，失败只影响表情，日志写「已回退纯文字」；
+    命令 / 自然语言那条：本来就只打算发图，日志写「未回文字」。
+    """
     _sticker_unmark(botdir, item)
-    log("表情发送失败：%s｜已回退纯文字" % why, appid, cat="错误")
+    _sticker_last_err.set(str(why or ""))
+    log("表情发送失败：%s｜%s" % (why, "未回文字" if only_image else "已回退纯文字"),
+        appid, cat="错误")
 
 
-async def _sticker_send(appid, api, botdir, key, item, mid=""):
+async def _sticker_send(appid, api, botdir, key, item, mid="", only_image=False):
     """即时上传 + 发 msg_type=7 的图；True 成功 / False 失败（失败只记日志）。
 
     key："g" + group_openid 或 "p" + user_openid，决定上传 / 发送走哪套接口。
     mid：触发这一轮的 msg_id（被动回复要用它 + 一个新的 msg_seq）。
+    only_image：这一轮只有图、没有正文（命令 / 自然语言）—— 日志与失败说明跟着变。
     """
     key = str(key or "")
     item = item or {}
@@ -6948,10 +6963,10 @@ async def _sticker_send(appid, api, botdir, key, item, mid=""):
         with open(path, "rb") as f:
             data = f.read()
     except Exception as e:
-        _sticker_fail(appid, botdir, item, "读文件失败 %r" % e)
+        _sticker_fail(appid, botdir, item, "读文件失败 %r" % e, only_image)
         return False
     if not data or len(data) > _STICKER_MAX:
-        _sticker_fail(appid, botdir, item, "文件不可用（%d 字节）" % len(data))
+        _sticker_fail(appid, botdir, item, "文件不可用（%d 字节）" % len(data), only_image)
         return False
     try:
         resp = await _sticker_upload(api, key, data)
@@ -6966,8 +6981,11 @@ async def _sticker_send(appid, api, botdir, key, item, mid=""):
             await api.post_c2c_message(openid=key[1:], msg_id=mid, msg_seq=seq,
                                        msg_type=7, content="", media={"file_info": info})
     except Exception as e:
-        _sticker_fail(appid, botdir, item, _sticker_err(e))
+        _sticker_fail(appid, botdir, item, _sticker_err(e), only_image)
         return False
+    if only_image:
+        log("表情：只发图（命令/自然语言）｜%s" % sid, appid, cat="回复")
+        return True
     where = "本群" if key[:1] == "g" else "本会话"
     log("表情：发送 %s（%s %d 条内第 1 张）" % (sid, where, _sticker_conf(_base_dir)["every_n"]),
         appid, cat="回复")
@@ -7104,7 +7122,12 @@ async def sticker_cmd(appid, botdir, message, key, text, gid="", mid=""):
     _sticker_note_sent(botdir, key, item["id"])     # 命令不受冷却限制，但这一张要记账
     log("表情命令：#表情 %s → 发 %s（不看 every_n / 冷却，仍记冷却与窗口）"
         % ("「%s」" % arg[:20] if arg else "随机", item["id"]), appid, cat="回复")
-    await _sticker_send(appid, api, botdir, key, item, mid)
+    # 只发图：成功一句话都不说，失败才回一句原因（不然用户不知道图没发出去）
+    if not await _sticker_send(appid, api, botdir, key, item, mid, only_image=True):
+        await _sticker_cmd_say(api, appid, message, key, gid, mid,
+                               _STICKER_FAIL_SAY % (_sticker_last_err.get() or "发送失败")[:60])
+        return True
+    _sticker_remember(botdir, key)
     return True
 
 
@@ -7115,7 +7138,6 @@ async def sticker_cmd(appid, botdir, message, key, text, gid="", mid=""):
 _STICKER_NL_RE = re.compile(
     r"(?:发|来|整|甩|给|换|要)(?:个|张|一|点)?\s*"
     r"(?P<mid>[^，。！？,.!?\s]{0,10}?)\s*(?:表情包|表情|图片|图)")
-_STICKER_NL_SAY = "这张给你"          # 极短固定配文：不再为一句配文多调一次模型
 _STICKER_NL_NOISE = ("的", "个", "张", "点", "一", "那", "这", "吧", "呗", "呀", "啊", "嘛", "哈")
 
 
@@ -7189,8 +7211,10 @@ async def sticker_nl(appid, botdir, message, key, text, gid="", mid=""):
         return True
     _sticker_note_sent(botdir, key, item["id"])
     log("表情：自然语言触发（关键词=%s）→ 已发 %s" % (kw or "无", item["id"]), appid, cat="判定")
-    await _sticker_cmd_say(api, appid, message, key, gid, mid, _STICKER_NL_SAY)
-    await _sticker_send(appid, api, botdir, key, item, mid)
+    # 只发图：不再补一句固定配文（用户要的是表情包，不是那句话）
+    if not await _sticker_send(appid, api, botdir, key, item, mid, only_image=True):
+        await _sticker_cmd_say(api, appid, message, key, gid, mid,
+                               _STICKER_FAIL_SAY % (_sticker_last_err.get() or "发送失败")[:60])
     return True
 
 
@@ -9333,8 +9357,7 @@ async def _reply(appid, botdir, key, who, incoming, images=None, extra_sys=""):
             if pick:
                 # 正文只剩标记：只发图。记忆里留一句占位，下一轮才知道它「说过话」。
                 _sticker_pending.set(pick)
-                _remember(botdir, key, "assistant", "（发了个表情）")
-                _arc_reply_by_key(botdir, key, "（发了个表情）")
+                _sticker_remember(botdir, key)
                 log("表情：正文只剩标记，只发图（%s）" % pick["id"], appid, cat="回复", lv="detail")
                 return ""
             log("出站清洗：内容为空，丢弃", appid, cat="回复")
