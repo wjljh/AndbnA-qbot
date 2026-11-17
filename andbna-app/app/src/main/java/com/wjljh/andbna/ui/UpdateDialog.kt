@@ -1,12 +1,14 @@
 package com.wjljh.andbna.ui
 
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
@@ -61,7 +63,12 @@ fun UpdateDialog(
                     modifier = Modifier
                         .align(Alignment.Start)
                         .padding(vertical = 4.dp)
-                        .clickable(onClick = onIgnore),
+                        // 文字按钮式的「跳过这版」：不加 ripple（只有主页 hero 卡才有按压反馈）
+                        .clickable(
+                            interactionSource = remember { MutableInteractionSource() },
+                            indication = null,
+                            onClick = onIgnore,
+                        ),
                 )
 
                 Row(

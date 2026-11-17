@@ -28,6 +28,7 @@ import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -445,7 +446,12 @@ private fun OnboardHeader(step: Int, onSkip: () -> Unit) {
                 color = PanelColors.onSurfaceVariantSummary,
                 modifier = Modifier
                     .clip(CircleShape)
-                    .clickable(onClick = onSkip)
+                    // 文字按钮式的「跳过」：不加 ripple（只有主页 hero 卡才有按压反馈）
+                    .clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        onClick = onSkip,
+                    )
                     .padding(
                         horizontal = PanelTokens.OnboardSkipPaddingH,
                         vertical = PanelTokens.OnboardSkipPaddingV,

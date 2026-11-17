@@ -79,6 +79,9 @@ import top.yukonga.miuix.kmp.utils.pressable
  *
  * miuix：kit 的 Card，insideMargin 0 + 内 padding 16dp，可点时 Tilt 按压、无水波。
  * material：material3 Card，surfaceContainer 底、圆角 16dp、默认 ripple。
+ *
+ * 注意：传了 [onClick] 这张卡就带按压反馈 —— 而按当前规则**只有主页 hero 卡能有按压反馈**，
+ * 所以列表里的卡不要传 onClick，把可点的行放进卡里用 [modeClickable] 的 feedback = false。
  */
 @Composable
 fun PanelGroupCard(
@@ -305,7 +308,8 @@ fun PanelChoiceRow(
             .fillMaxWidth()
             .clip(RoundedCornerShape(PanelTokens.ContentGap))
             .background(if (selected) PanelColors.secondaryContainer else Color.Transparent)
-            .modeClickable(if (enabled) onClick else null, enabled)
+            // 单选行是「列表项」，不加按压反馈（只有主页 hero 卡才有）
+            .modeClickable(if (enabled) onClick else null, enabled, feedback = false)
             .padding(horizontal = 12.dp, vertical = 12.dp),
     ) {
         Row(verticalAlignment = Alignment.CenterVertically) {

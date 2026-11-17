@@ -340,7 +340,8 @@ private fun StickerTile(
     Column(
         modifier = modifier
             .padding(4.dp)
-            .modeClickable(onClick),
+            // 网格里的图片格子：不加按压反馈（只有主页 hero 卡才有）
+            .modeClickable(onClick, feedback = false),
     ) {
         Box(
             modifier = Modifier

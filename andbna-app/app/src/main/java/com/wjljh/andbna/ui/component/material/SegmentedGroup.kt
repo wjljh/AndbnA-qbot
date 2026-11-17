@@ -2,6 +2,7 @@ package com.wjljh.andbna.ui.component.material
 
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -453,8 +454,16 @@ private fun SegmentedRow(
             .then(
                 when {
                     onClick == null && onLongClick == null -> Modifier
-                    onLongClick == null -> Modifier.clickable(enabled = enabled, onClick = { onClick?.invoke() })
+                    // 设置行不加按压反馈（只有主页 hero 卡才有）：两种写法都把 indication 摘掉
+                    onLongClick == null -> Modifier.clickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
+                        enabled = enabled,
+                        onClick = { onClick?.invoke() },
+                    )
                     else -> Modifier.combinedClickable(
+                        interactionSource = remember { MutableInteractionSource() },
+                        indication = null,
                         enabled = enabled,
                         onClick = { onClick?.invoke() },
                         onLongClick = onLongClick,

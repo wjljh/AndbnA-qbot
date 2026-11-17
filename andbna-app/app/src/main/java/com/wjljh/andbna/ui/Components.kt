@@ -2,6 +2,7 @@ package com.wjljh.andbna.ui
 
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -443,7 +444,12 @@ fun SuperRow(
         modifier = Modifier
             .fillMaxWidth()
             .then(
-                if (onClick != null) Modifier.clickable(onClick = onClick) else Modifier
+                // 行不加按压反馈（只有主页 hero 卡才有）：把 ripple 的 indication 摘掉
+                if (onClick != null) Modifier.clickable(
+                    interactionSource = remember { MutableInteractionSource() },
+                    indication = null,
+                    onClick = onClick,
+                ) else Modifier
             )
             .padding(vertical = 10.dp),
     ) {

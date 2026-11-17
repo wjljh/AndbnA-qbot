@@ -565,7 +565,8 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = PanelMetrics.RowMinHeight)
-                        .modeClickable(onClick = { sub = "stickers" }),
+                        // 列表入口：不加按压反馈（只有主页 hero 卡才有）
+                        .modeClickable(onClick = { sub = "stickers" }, feedback = false),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(Modifier.weight(1f)) {
@@ -837,7 +838,8 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                     modifier = Modifier
                         .fillMaxWidth()
                         .heightIn(min = PanelMetrics.RowMinHeight)
-                        .modeClickable(onClick = { sub = "admin" }),
+                        // 列表入口：不加按压反馈（只有主页 hero 卡才有）
+                        .modeClickable(onClick = { sub = "admin" }, feedback = false),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(Modifier.weight(1f)) {

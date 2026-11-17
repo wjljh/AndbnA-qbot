@@ -7157,7 +7157,7 @@ def _make_intents(flags, appid=""):
 # ── 群管理（2.1.0 · Python 侧）────────────────────────────────
 #
 # 违规检测 + 惩罚（撤回 / 阶梯禁言 / 踢出 / 警告）、管理命令（#撤回 / #禁言 / #解禁）、
-# 进群欢迎（GROUP_MEMBER_ADD 为主，「首次发言欢迎」兜底）。
+# 进群欢迎（GROUP_MEMBER_ADD 事件）。
 #
 # 跨 bot 的共享只能落在「群名 + 昵称」上：群 openid 与成员 openid 都是每 bot 一套
 # （见 _session_key 的注释）。所以计数文件按群名归并，键用昵称。
@@ -7173,8 +7173,12 @@ _GM_SHARED = "group_admin_shared"
 _GM_MEMBER_INTENT = 1 << 24       # Intents.GROUP_MEMBER_EVENT：GROUP_MEMBER_ADD 事件
 _GM_CTX = 6                       # 复核时喂给判定模型的上下文条数
 _GM_CLAIM_TTL = 8.0               # 跨 bot 认领记录的存活时间（与总模型共享记录一致）
+_GM_CLAIM_FILE_TTL = 600.0        # 进群欢迎的认领文件 >10 分钟视为无效（事件早已过时）
+_GM_CLAIM_JITTER = 1.2            # 认领前随机等待上限（秒）：错开几只 bot 的写入时刻
+_GM_SYS_FILE = "_sys_msgs.json"   # <filesDir>/group_admin_shared/_sys_msgs.json
+_GM_SYS_TTL = 120.0               # 我方主动消息指纹的存活时间（秒）
+_GM_SYS_KEEP = 400                # 指纹表最多留这么多条（跨 bot 刷屏时也涨不到天上去）
 _GM_WELCOME_TTL = 300.0           # 同一 (群, 成员) 5 分钟内只欢迎一次（事件会重复下发）
-_GM_WELCOME_MAX = 1000            # welcomed.json 只留最近这么多条
 _GM_WELCOME_GENERIC = "（抬眼）来了？随便坐，别拘束。"
 _GM_WARN_FALLBACK = "这条内容涉及外挂/脚本，请不要在本群发布。"
 _GM_NO_PERM = "没有群管理权限"
@@ -7530,6 +7534,186 @@ def _gm_claim(appid, name, text, now=None):
     return True, ""
 
 
+# ── 跨 bot 原子认领（文件级 O_EXCL：进群欢迎）──────────
+#
+# 「同一件事只让一只 bot 做」需要一个**跨 bot 同一个值**的键：
+#   · GROUP_MEMBER_ADD：事件体里的 timestamp 对所有 bot 相同 → join:<群名>:<timestamp>
+# 群 openid / 成员 openid 都是每 bot 一套，绝不能拿来对齐（见 _session_key 的注释）。
+
+def _gm_claim_dir(base):
+    return os.path.join(str(base or ""), _GM_SHARED, "_claims")
+
+
+def _gm_claim_file(base, key):
+    """<filesDir>/group_admin_shared/_claims/<key>.claim；同一个 key → 同一个文件名。
+
+    群名/昵称是用户数据，可能带路径分隔符：只保留字母数字与 -_.:，其余压成 _。
+    """
+    safe = "".join(ch if (ch.isalnum() or ch in "-_.:") else "_" for ch in str(key or ""))
+    safe = re.sub(r"_+", "_", safe).strip("._")
+    if not safe:
+        return ""
+    return os.path.join(_gm_claim_dir(base), safe[:120] + ".claim")
+
+
+def _gm_claim_read(path, ttl_default=_GM_CLAIM_FILE_TTL):
+    """认领文件 → (先到的 appid, ts, ttl)；空文件（对面还在写）→ ("", 0, ttl)。"""
+    for _try in range(3):
+        rec = _load_json(path, None)
+        if isinstance(rec, dict) and str(rec.get("appid") or "").strip():
+            return (str(rec.get("appid") or "").strip(),
+                    _gm_int(rec.get("ts"), 0, 10 ** 12, 0),
+                    _gm_int(rec.get("ttl"), 1, 10 ** 9, int(ttl_default)))
+        time.sleep(0.02)        # 对面刚 O_EXCL 成功还没落盘：等一小会儿再读一次
+    return "", 0, int(ttl_default)
+
+
+def _gm_claim_purge(base, now=None):
+    """认领目录 TTL 清理：过期（ts + ttl）的 .claim 删掉，避免长期堆积。→ 删了几个。"""
+    now = time.time() if now is None else now
+    d = _gm_claim_dir(base)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return 0
+    gone = 0
+    for name in names:
+        if not name.endswith(".claim"):
+            continue
+        path = os.path.join(d, name)
+        _owner, ts, ttl = _gm_claim_read(path)
+        if not ts:
+            try:
+                ts = int(os.path.getmtime(path))     # 半写的文件：按 mtime 算
+            except OSError:
+                continue
+        if now - ts > ttl:
+            try:
+                os.remove(path)
+                gone += 1
+            except OSError:
+                pass
+    return gone
+
+
+def _gm_claim_take(base, key, appid, name="", ttl=_GM_CLAIM_FILE_TTL, now=None):
+    """跨 bot 认领 → (抢到没有, 先到的那只 bot)。
+
+    O_CREAT|O_EXCL 是内核给的原子性：同一个 key 只可能有一个 bot 写成功，写成功的那只执行。
+    文件已存在但过期 → 视为无效（上次没人发成功 / 事件重放）：删掉重抢一次。
+    """
+    now = time.time() if now is None else now
+    path = _gm_claim_file(base, key)
+    if not path:
+        return True, ""
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+    except OSError as e:
+        log("群管理：认领目录建不出来 %r → 本次不跨 bot 去重" % e, appid, cat="错误")
+        return True, ""
+    _gm_claim_purge(base, now)
+    payload = json.dumps({"appid": str(appid or ""), "name": str(name or ""),
+                          "ts": int(now), "ttl": int(ttl)}, ensure_ascii=False)
+    for attempt in (0, 1):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
+        except FileExistsError:
+            owner, ts, ttl_0 = _gm_claim_read(path, ttl)
+            if ts and now - ts > ttl_0 and attempt == 0:
+                try:
+                    os.remove(path)
+                except OSError:
+                    return False, owner or "别的 bot"
+                continue
+            return False, owner or "别的 bot"
+        except OSError as e:
+            log("群管理：认领文件写不进去 %r → 本次不跨 bot 去重" % e, appid, cat="错误")
+            return True, ""
+        try:
+            os.write(fd, payload.encode("utf-8"))
+        except OSError as e:
+            log("群管理：认领内容写失败 %r" % e, appid, cat="错误")
+        finally:
+            os.close(fd)
+        return True, ""
+    return False, "别的 bot"
+
+
+def _gm_claim_release(base, key, appid):
+    """自己抢到了却没发出去 → 把认领文件删掉：别让这一次进群被永久占住（事件重放还能补）。"""
+    path = _gm_claim_file(base, key)
+    if not path:
+        return False
+    owner, _ts, _ttl = _gm_claim_read(path)
+    if owner and owner != str(appid or ""):
+        return False
+    try:
+        os.remove(path)
+        return True
+    except OSError:
+        return False
+
+
+async def _gm_claim_wait():
+    """认领前的随机等待（0~1.2 秒）：几只 bot 同时抢时把写入时刻错开。"""
+    await asyncio.sleep(random.uniform(0, _GM_CLAIM_JITTER))
+
+
+# ── 我方主动消息的共享指纹（别的 bot 收到 → 不进上下文、不接话）──────────
+
+def _gm_sys_path(base):
+    return os.path.join(str(base or ""), _GM_SHARED, _GM_SYS_FILE)
+
+
+def _gm_sys_prune(d, now):
+    """TTL 过滤：过期的键丢掉。写方顺手落盘清理，读方只在内存里过滤（每条消息都写盘太贵）。"""
+    out = {}
+    for k, v in (d if isinstance(d, dict) else {}).items():
+        ts = _gm_int(v, 0, 10 ** 12, 0)
+        if ts and now - ts <= _GM_SYS_TTL:
+            out[str(k)] = ts
+    return out
+
+
+def _gm_sys_note(base, text, now=None):
+    """发出去之后：把我方主动消息的正文指纹写进共享表（TTL 120 秒）。"""
+    h = _hash_text(text)
+    if not h or not str(base or ""):
+        return False
+    now = time.time() if now is None else now
+    path = _gm_sys_path(base)
+    with _gm_lock:
+        d = _gm_sys_prune(_load_json(path, {}), now)
+        d[h] = int(now)
+        if len(d) > _GM_SYS_KEEP:
+            for k in sorted(d, key=lambda x: d[x])[:len(d) - _GM_SYS_KEEP]:
+                d.pop(k, None)
+        try:
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+        except OSError:
+            pass
+        _save_json(path, d)
+    return True
+
+
+def _gm_sys_note_sent(base, content, at_oid=""):
+    """一条主动消息的指纹：正文一条；带 @ 的再把 markdown 版记一条（平台两侧渲染不同）。"""
+    _gm_sys_note(base, content)
+    if at_oid:
+        _gm_sys_note(base, _gm_at_prefix(at_oid) + content)
+
+
+def _gm_sys_hit(base, text, now=None):
+    """收到 bot 消息时先问这里：命中 = 我方主动消息（欢迎/警告），直接丢弃。"""
+    h = _hash_text(text)
+    if not h or not str(base or ""):
+        return False
+    now = time.time() if now is None else now
+    with _gm_lock:
+        d = _gm_sys_prune(_load_json(_gm_sys_path(base), {}), now)
+    return h in d
+
+
 # ── 阶梯时长 / 踢出阈值 ──────────────────────────
 
 def _gm_mute_minutes(n, steps):
@@ -7754,6 +7938,7 @@ async def _gm_say(api, appid, gid, mid, content, at_oid=""):
             return False
         log("群管理：主动消息已发（群=%s｜%d 字）" % (str(gid or "")[:8], len(content)),
             appid, cat="回复", lv="detail")
+        _gm_sys_note_sent(_base_dir, content, at_oid)
         return True
     try:
         if md:
@@ -7763,6 +7948,9 @@ async def _gm_say(api, appid, gid, mid, content, at_oid=""):
     except Exception as e:
         log("群管理：回话失败 %r" % e, appid, cat="错误")
         return False
+    if ok:
+        # 警告 / 禁言通知也可能是「回某条消息」（带 mid），一样进共享指纹表
+        _gm_sys_note_sent(_base_dir, content, at_oid)
     return ok
 
 
@@ -8002,41 +8190,6 @@ def _gm_welcome_text(conf, botdir="", appid=""):
     return str(((conf.get("welcome") or {}).get("text")) or "").strip() or _GM_WELCOME_GENERIC
 
 
-def _gm_welcome_path(botdir, gid):
-    gid = str(gid or "").strip()
-    if not gid or gid in (".", "..") or os.sep in gid or (os.altsep and os.altsep in gid):
-        return ""
-    return os.path.join(_bot_root(botdir), _GM_DIR, gid + ".welcomed.json")
-
-
-def _gm_welcome_claim(botdir, gid, keys, now=None):
-    """欢迎一次性：keys 里只要有一个已经记过 → 不再欢迎；否则全记下并返回 True。"""
-    keys = [str(k) for k in (keys or []) if str(k)]
-    if not keys:
-        return False
-    path = _gm_welcome_path(botdir, gid)
-    if not path:
-        return False
-    now = time.time() if now is None else now
-    with _gm_lock:
-        d = _load_json(path, {})
-        users = d.get("users") if isinstance(d, dict) and isinstance(d.get("users"), dict) else {}
-        if any(k in users for k in keys):
-            return False
-        users = dict(users)
-        for k in keys:
-            users[k] = int(now)
-        if len(users) > _GM_WELCOME_MAX:
-            for k in list(users)[:len(users) - _GM_WELCOME_MAX]:
-                users.pop(k, None)
-        try:
-            os.makedirs(os.path.dirname(path), exist_ok=True)
-        except Exception:
-            pass
-        _save_json(path, {"users": users})
-    return True
-
-
 def _gm_welcome_recent(appid, gid, oid, now=None):
     """内存去重：同一 (bot, 群, 成员) 5 分钟内只欢迎一次（事件会重复下发）。"""
     now = time.time() if now is None else now
@@ -8050,8 +8203,13 @@ def _gm_welcome_recent(appid, gid, oid, now=None):
     return False
 
 
-async def _gm_welcome_member_add(appid, botdir, api, gid, member_oid):
-    """GROUP_MEMBER_ADD：真正的成员进群欢迎（事件里的 group_openid 就是本 bot 视角的 gid）。"""
+async def _gm_welcome_member_add(appid, botdir, api, gid, member_oid, ts=None):
+    """GROUP_MEMBER_ADD：真正的成员进群欢迎（事件里的 group_openid 就是本 bot 视角的 gid）。
+
+    事件对**每只 bot 各下一次**（用户实测 5 只全发了），而事件体里的 timestamp 对所有 bot
+    是同一个值 —— 那才是唯一能跨 bot 对齐的东西。所以：
+      本 bot 5 分钟内存去重（第二道闸）→ 随机等 0~1.2 秒 → 共享目录原子认领 → 抢到的发。
+    """
     gid = str(gid or "")
     member_oid = str(member_oid or "")
     conf = group_admin_conf(botdir, gid)
@@ -8066,6 +8224,9 @@ async def _gm_welcome_member_add(appid, botdir, api, gid, member_oid):
         log("群管理：成员进群（群=%s｜成员=%s）5 分钟内已欢迎过 → 跳过（事件重复下发）"
             % (gid[:8], _oid8(member_oid)), appid, cat="判定", lv="detail")
         return False
+    mine, claim_key = await _gm_claim_join(appid, botdir, api, gid, member_oid, ts)
+    if not mine:
+        return False
     text = _gm_welcome_text(conf, botdir, appid)
     # welcome.at 照旧生效：关掉就只发文案，不 @ 这个成员
     at = bool((conf.get("welcome") or {}).get("at", True)) and bool(member_oid)
@@ -8074,31 +8235,40 @@ async def _gm_welcome_member_add(appid, botdir, api, gid, member_oid):
         ok = await _gm_say(api, appid, gid, "", "@新朋友 " + text)
         if ok:
             log("群管理：进群欢迎 markdown @ 失败 → 退回纯文本", appid, cat="系统")
+    if not ok and claim_key:
+        # 抢到了却没发出去：释放认领，事件重放时换一只 bot 补，别让这次进群没人欢迎
+        if _gm_claim_release(_gm_base(botdir), claim_key, appid):
+            log("群管理：进群欢迎没发出去 → 释放认领（键=%s）" % claim_key, appid, cat="系统")
     log("群管理：进群欢迎 → %s（群=%s｜成员=%s）"
         % ("已发" if ok else "失败", gid[:8], _oid8(member_oid)), appid, cat="系统")
     return ok
 
 
-async def _gm_welcome_first(appid, botdir, message, gid, conf, nick, oid, mid):
-    """「首次发言欢迎」：平台没开成员事件时的兜底（日志写明是哪种触发的）。"""
-    if not (conf.get("welcome") or {}).get("enabled"):
-        return False
-    if not nick:
-        log("群管理：首次发言欢迎跳过（昵称不可用，判不出是不是第一次）",
+async def _gm_claim_join(appid, botdir, api, gid, member_oid, ts):
+    """进群欢迎的跨 bot 认领 → True = 这一只 bot 发。
+
+    共享键 join:<群名>:<timestamp>：timestamp 是事件体里的秒级时间戳（对所有 bot 相同）。
+    群名取不到 → 退回 join:<本 bot gid 前 8 位>:<timestamp>（每 bot 一套 → 不跨 bot 去重，
+    日志写明），此时不必随机等待：这个键本来就抢不到别人。
+    """
+    ts = _gm_int(ts, 0, 10 ** 12, 0)
+    if not ts:
+        log("群管理：进群事件没有 timestamp → 本次不跨 bot 去重（只按本 bot 内规则）",
             appid, cat="系统", lv="detail")
-        return False
-    keys = ["n:" + nick]
-    if oid:
-        keys.insert(0, "m:" + oid)
-    if not _gm_welcome_claim(botdir, gid, keys):
-        return False
-    at = bool((conf.get("welcome") or {}).get("at", True)) and bool(oid)
-    ok = await _gm_say(getattr(message, "_api", None), appid, gid, mid,
-                       _gm_welcome_text(conf, botdir, appid), at_oid=oid if at else "")
-    log("群管理：首次发言欢迎 → %s（群=%s｜%s%s｜触发=首次发言，成员进群事件没到时的兜底）"
-        % ("已发" if ok else "失败", str(gid or "")[:8], nick,
-           "，@ 了对方" if at else ""), appid, cat="系统")
-    return ok
+        return True, ""
+    gname = await _gm_group_name(botdir, gid, api, appid)
+    if gname:
+        key = "join:%s:%s" % (gname, ts)
+        await _gm_claim_wait()
+    else:
+        key = "join:%s:%s" % (str(gid or "")[:8], ts)
+        log("群管理：群名不可用，本次不跨 bot 去重（键=%s）" % key, appid, cat="系统")
+    mine, owner = _gm_claim_take(_gm_base(botdir), key, appid, _my_name(appid))
+    if mine:
+        return True, key
+    log("群管理：进群欢迎由 %s 发，本 bot 不动（群=%s｜成员=%s）"
+        % (owner, str(gid or "")[:8], _oid8(member_oid)), appid, cat="判定")
+    return False, key
 
 
 class _GmMemberEvent(object):
@@ -8160,8 +8330,10 @@ async def group_admin_member_add(appid, botdir, event):
     """on_group_member_add 的实现（抽出来才能单测：_make_client 里的闭包没法直接调）。"""
     gid = str(getattr(event, "group_openid", "") or "")
     oid = str(getattr(event, "member_openid", "") or "")
+    # timestamp 是唯一跨 bot 相同的值（群 openid / 成员 openid 都是每 bot 一套）
     try:
-        return await _gm_welcome_member_add(appid, botdir, getattr(event, "_api", None), gid, oid)
+        return await _gm_welcome_member_add(appid, botdir, getattr(event, "_api", None), gid, oid,
+                                            getattr(event, "timestamp", None))
     except Exception as e:
         log("群管理：进群欢迎异常 %r" % e, appid, cat="错误")
         return False
@@ -8280,7 +8452,6 @@ async def _group_admin_tick(appid, botdir, message, gid, text, mid=""):
     """群管理总入口（_handle_group 里、回环判断之后调用）。
 
     → True = 这条已经处理完（命令 / 违规已处置），调用方直接 return。
-    首次发言欢迎不算「处理完」：欢迎完还要照常走回复闸。
     """
     gid = str(gid or "")
     conf = group_admin_conf(botdir, gid)
@@ -8288,8 +8459,6 @@ async def _group_admin_tick(appid, botdir, message, gid, text, mid=""):
     key, nick, oid, shared = _gm_user_key(message, appid)
     if await group_admin_cmd(appid, botdir, message, gid, text, mid):
         return True
-    if (conf.get("welcome") or {}).get("enabled") and (nick or oid):
-        await _gm_welcome_first(appid, botdir, message, gid, conf, nick, oid, mid)
     if not conf.get("enabled"):
         return False
     mode = str(conf.get("mode") or "keyword+model")
@@ -8358,6 +8527,14 @@ async def _handle_group(appid, botdir, message, tag):
             log("总模型不走：运行中的 bot 只有 %d 个（启用 %d 个）→ 退回各判各的"
                 % (len(cand), len(roster)), appid, cat="判定", lv="detail")
 
+    # ── 我方主动消息（进群欢迎 / 违规警告 / 禁言踢人通知）：同群每只 bot
+    # 都会收到这一条，别的 bot 会当成「[其他bot] 说了话」接话（用户实测互相刷屏）。
+    # 共享指纹命中 = 这就是我们自己刚发的那一句 → 直接丢弃：不进群上下文（放到 _ctx_note
+    # 之后才丢就白烧 token 了）、不接话、不进任何记忆。只认 bot 作者，真人发一样的话照常处理。
+    if from_bot and _gm_sys_hit(_gm_base(botdir), body):
+        log("跳过：我方主动消息（欢迎/警告），不参与互见｜%s" % brief, appid, cat="判定")
+        return
+
     # ── 群内互相可见：先把这一条记进群上下文（真人 [作者 名字]，bot [名字]）
     _ctx_note(appid, gid,
               ("[%s]" % from_name) if from_bot else ("[作者 %s]" % _author_label(botdir, author_oid)),
@@ -8421,7 +8598,7 @@ async def _handle_group(appid, botdir, message, tag):
         log("跳过：疑似复读本 bot 内容（%s）" % brief, appid, cat="判定")
         return
 
-    # ── 群管理（2.1.0）：命令 / 违规处置 / 首次发言欢迎。
+    # ── 群管理（2.1.0）：命令 / 违规处置 / 进群欢迎。
     # 放在这里是因为：作者是 bot 的已经返回、回环也已经返回；而群管理的动作（撤回/禁言）
     # 不该被后面那几道「回不回」的闸挡掉 —— 静音群、不 @ 本 bot 都要照样管。
     # 异常一律吞掉：群管理坏了不能连累正常回复。

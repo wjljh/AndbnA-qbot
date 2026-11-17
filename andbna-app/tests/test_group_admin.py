@@ -12,7 +12,7 @@
   F) 无昵称退化（<appid>:<openid>，只能 bot 内独立计）
   G) 无权限降级（403 / Forbidden / 权限 字样 → 优雅失败，不抛）
   H) 命令权限（主人 / 群管理员 / 都不是）
-  I) 欢迎一次性（welcomed.json + 5 分钟内存去重）
+  I) 新人第一次发言不再欢迎（兜底已删除）+ 5 分钟内存去重
   J) intents 的 1<<24 与 GROUP_MEMBER_ADD 的路由
   K) 未知群 / 没有 api 也不炸
 
@@ -592,13 +592,25 @@ def case_welcome():
     try:
         d = botdir(BOT_A)
         write_admin(d, GID_A, welcome={"enabled": True, "at": True, "text": "欢迎加入"})
-        # 1) 一次性：同一个 (群, 成员) 只欢迎一次
-        check("J1 welcomed.json 一次性：第一次 True，第二次 False",
-              br._gm_welcome_claim(d, GID_A, ["m:M1"]) is True
-              and br._gm_welcome_claim(d, GID_A, ["m:M1"]) is False, "claim")
-        br._gm_welcome_claim(d, GID_A, ["n:苏"])
-        check("J2 昵称键与成员键互不干扰，但任一条命中就不再欢迎",
-              br._gm_welcome_claim(d, GID_A, ["m:M2", "n:苏"]) is False, "cross key")
+        # 1) 首次发言不再欢迎（兜底路径已整块删除）：不发消息、不写指纹、不落盘
+        m = FakeMsg("f1", "大家好", FakeAuthor("OID_FIRST", "第一次"), GID_A)
+        got1 = tick(m, GID_A, m.content)
+        m2 = FakeMsg("f2", "我再说一句", FakeAuthor("OID_FIRST", "第一次"), GID_A)
+        got2 = tick(m2, GID_A, m2.content)
+        claims_dir = os.path.join(BASE, "group_admin_shared", "_claims")
+        check("J1 新人第一次发言不再触发任何欢迎（不发消息、不写指纹）",
+              got1 is False and got2 is False and not API.sent
+              and not os.path.isfile(br._gm_sys_path(BASE))
+              and not has("触发=首次发言"),
+              "got=%s/%s sent=%d" % (got1, got2, len(API.sent)))
+        check("J2 首次发言的落盘与认领也不再写（*.welcomed.json / welcome1st 键都没有）",
+              not [n for n in os.listdir(os.path.join(d, "group_admin"))
+                   if n.endswith(".welcomed.json")]
+              and not [n for n in (os.listdir(claims_dir) if os.path.isdir(claims_dir) else [])
+                       if n.startswith("welcome1st")], "")
+        check("J2b 首次发言欢迎的函数已经删掉（真删，不是关掉）",
+              not hasattr(br, "_gm_welcome_first") and not hasattr(br, "_gm_claim_first")
+              and not hasattr(br, "_gm_welcome_claim"), "")
 
         # 2) 5 分钟内存去重
         t0 = 1000000.0
@@ -636,17 +648,15 @@ def case_welcome():
         check("J8 welcome.enabled=false → 一个字节都不发", len(API.sent) == 0,
               "posts=%d" % len(API.sent))
 
-        # 5) 首次发言欢迎（兜底）：每人只一次
+        # 5) 群文件没写 welcome → 也不会凭空欢迎（新人发言与事件都不发）
         reset()
-        write_admin(d, GID_A, welcome={"enabled": True, "at": True, "text": "欢迎新人"})
-        m = FakeMsg("w1", "大家好", FakeAuthor("OID_FIRST", "第一次"), GID_A)
+        write_admin(d, GID_A, welcome=None)
+        m = FakeMsg("w1", "大家好", FakeAuthor("OID_NOCONF", "新人"), GID_A)
         tick(m, GID_A, m.content)
-        first_posts = len(API.sent)
-        m2 = FakeMsg("w2", "我再说一句", FakeAuthor("OID_FIRST", "第一次"), GID_A)
-        tick(m2, GID_A, m2.content)
-        check("J9 首次发言欢迎发一次，第二次同一人不再发",
-              first_posts == 1 and len(API.sent) == 1
-              and has("触发=首次发言"), "posts=%d" % first_posts)
+        ev2 = br._GmMemberEvent(API, {"d": {"group_openid": GID_A, "member_openid": "M_NOCONF"}})
+        asyncio.run(br.group_admin_member_add(BOT_A, d, ev2))
+        check("J9 群文件没写 welcome → 新人发言与进群事件都一个字节不发",
+              not API.sent, "posts=%d" % len(API.sent))
     finally:
         pass
 
@@ -794,14 +804,12 @@ def case_welcome_locked():
     check("M4 自定义人格 + text 为空 → 通用兜底（at=false 时不 @）",
           GENERIC_FALLBACK in text and "qqbot-at-user" not in text, "text=%s" % text)
 
-    # 4) 「首次发言欢迎」兜底也走同一套（内置人格同样锁死）
+    # 4) 文案来源规则本身（首次发言兜底已删，直接验 _gm_welcome_text）
     reset()
     write_persona(d, True, "猫娘")
     write_admin(d, GID_A, welcome={"enabled": True, "at": True, "text": "随便改的"})
-    m = FakeMsg("w9", "大家好", FakeAuthor("OID_CAT", "新人"), GID_A)
-    tick(m, GID_A, m.content)
-    text = sent_texts()[-1] if API.sent else ""
-    check("M5 首次发言欢迎兜底同样锁死内置文案（猫娘）",
+    text = br._gm_welcome_text(br.group_admin_conf(d, GID_A), d, BOT_A)
+    check("M5 内置人格（猫娘）→ 欢迎语锁死内置文案、忽略文件 text",
           "（耳朵抖了抖，凑近嗅了一下）嗯？新来的。坐吧喵，我不咬人的。" in text and "随便改的" not in text,
           "text=%s" % text)
     try:
