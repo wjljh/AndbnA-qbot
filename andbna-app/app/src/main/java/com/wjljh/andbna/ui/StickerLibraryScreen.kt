@@ -50,7 +50,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wjljh.andbna.local.BotStore
-import com.wjljh.andbna.local.BotStore.stickerCooldownH
+import com.wjljh.andbna.local.BotStore.stickerCooldownMin
 import com.wjljh.andbna.local.BotStore.stickerEnabled
 import com.wjljh.andbna.local.BotStore.stickerEveryN
 import com.wjljh.andbna.local.StickerStore
@@ -61,12 +61,13 @@ import com.wjljh.andbna.ui.component.PanelConfirmDialog
 import com.wjljh.andbna.ui.component.PanelEmptyState
 import com.wjljh.andbna.ui.component.PanelGroupCard
 import com.wjljh.andbna.ui.component.PanelMetrics
-import com.wjljh.andbna.ui.component.PanelNotice
+import com.wjljh.andbna.ui.component.AppToast
 import com.wjljh.andbna.ui.component.PanelPillRow
 import com.wjljh.andbna.ui.component.PanelPrimaryButton
 import com.wjljh.andbna.ui.component.PanelSecondaryButton
 import com.wjljh.andbna.ui.component.PanelTokens
 import com.wjljh.andbna.ui.component.SecondaryTopBar
+import com.wjljh.andbna.ui.component.StickerCoolDialog
 import com.wjljh.andbna.ui.component.material.SegmentedDropdownItem
 import com.wjljh.andbna.ui.component.modeClickable
 import kotlinx.coroutines.Dispatchers
@@ -81,8 +82,10 @@ import top.yukonga.miuix.kmp.window.WindowDialog
 /**
  * 「表情 / 图片库」二级页（Bot 编辑页「称呼」下面那张卡片进来）。
  *
- * 落盘全在 [StickerStore]（<botdir>/stickers/ + library.json），本页只负责：
- * 顶部开关（llm.json 的 sticker_enabled，默认开）→ 容量小字 → 每行 3 个的网格 → 导入 / 编辑 / 删除。
+ * 落盘：图片库在 [StickerStore]（<botdir>/stickers/ + library.json），表情节奏两行在
+ * <botdir>/sticker_conf.json（null = 跟随全局）。本页只负责：
+ * 顶部开关（llm.json 的 sticker_enabled，默认开）→ 节奏两行 → 容量小字 → 每行 3 个的网格
+ * → 导入 / 编辑 / 删除。
  *
  * 导入走 SAF 的 OpenMultipleDocuments（image/ 通配），不申请存储权限：选中的 Uri 逐个校验格式与
  * ≤5 MB / 整库 ≤200 MB，复制进 stickers/<id>.<ext>，然后**立刻弹编辑框要求写描述** —— 描述为空的
@@ -99,10 +102,14 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
 
     var items by remember(appid) { mutableStateOf<List<StickerStore.Item>>(emptyList()) }
     var enabled by remember(appid) { mutableStateOf(true) }
-    // 发图节奏两行下拉的当前值（缺键 / 脏值由 BotStore 回落 10 / 24）
-    var everyN by remember(appid) { mutableStateOf(10) }
-    var cooldownH by remember(appid) { mutableStateOf(24) }
-    var msg by remember(appid) { mutableStateOf("") }
+    // 全局那两档（只读）：写在「跟随全局（现在：…）」那段里，不用跳回设置页看
+    var globalEvery by remember(appid) { mutableStateOf(10) }
+    var globalCool by remember(appid) { mutableStateOf(10) }
+    // 本 bot 的覆盖：null = 跟随全局（sticker_conf.json 里是显式 null）
+    var overEvery by remember(appid) { mutableStateOf<Int?>(null) }
+    var overCool by remember(appid) { mutableStateOf<Int?>(null) }
+    // 冷却「自定义…」：就地弹一格分钟数
+    var showCoolCustom by remember(appid) { mutableStateOf(false) }
     // 编辑框：showEdit 单独一个状态，关的时候先把 show 收起来、条目还留着，才有退出动画
     var editing by remember(appid) { mutableStateOf<StickerStore.Item?>(null) }
     var showEdit by remember(appid) { mutableStateOf(false) }
@@ -115,12 +122,16 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
         // 一次 IO 里把库和三个配置值都读出来（prefs 已缓存在内存里，这里只是别切线程）
         val (list, conf) = withContext(Dispatchers.IO) {
             StickerStore.load(ctx, appid) to
-                Triple(ctx.stickerEnabled, ctx.stickerEveryN, ctx.stickerCooldownH)
+                Triple(ctx.stickerEnabled, ctx.stickerEveryN, ctx.stickerCooldownMin)
         }
+        // 覆盖读不出来（文件不在 / 半截 JSON）就是全跟随全局
+        val over = withContext(Dispatchers.IO) { BotStore.stickerOverride(ctx, appid) }
         items = list
         enabled = conf.first
-        everyN = conf.second
-        cooldownH = conf.third
+        globalEvery = conf.second
+        globalCool = conf.third
+        overEvery = over.everyN
+        overCool = over.cooldownMin
     }
 
     // 只给「还没有缓存」的条目补缩略图（在 IO 里解码，一次补齐）
@@ -145,21 +156,24 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
                 ctx.stickerEnabled = on
                 BotStore.writeLlmJson(ctx)
             }
-            msg = if (on) "已允许 bot 自己发表情" else "已关闭：一条都不发，库还留着"
+            AppToast.show(if (on) "已允许 bot 自己发表情" else "已关闭：一条都不发，库还留着")
         }
     }
 
-    /** 两个下拉：prefs + llm.json 各一份，Python 侧按 mtime 现读 —— 下一次回复就按新节奏走。 */
-    fun switchRhythm(nextEveryN: Int, nextCooldownH: Int) {
-        everyN = nextEveryN
-        cooldownH = nextCooldownH
+    /**
+     * 两个下拉：只写本 bot 的 <botdir>/sticker_conf.json（null = 跟随全局），
+     * Python 侧每次现读这份文件 —— 改完下一次回复就按新节奏走。
+     */
+    fun saveRhythm(nextEvery: Int?, nextCool: Int?) {
+        overEvery = nextEvery
+        overCool = nextCool
         scope.launch {
             withContext(Dispatchers.IO) {
-                ctx.stickerEveryN = nextEveryN
-                ctx.stickerCooldownH = nextCooldownH
-                BotStore.writeLlmJson(ctx)
+                BotStore.setStickerOverride(
+                    ctx, appid, BotStore.StickerOverride(nextEvery, nextCool),
+                )
             }
-            msg = "已保存，下一次回复就按新节奏"
+            AppToast.show("已保存，下一次回复就按新节奏")
         }
     }
 
@@ -171,13 +185,15 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
                 o to StickerStore.load(ctx, appid)
             }
             items = list
-            msg = when {
-                out.added.isNotEmpty() && out.errors.isEmpty() ->
-                    "已导入 " + out.added.size + " 张：给每张写个描述，空着不进候选"
-                out.added.isNotEmpty() ->
-                    "导入 " + out.added.size + " 张，" + out.errors.size + " 张没成：" + out.errors.first()
-                else -> "没导入：" + (out.errors.firstOrNull() ?: "没有可用的图片")
-            }
+            AppToast.show(
+                when {
+                    out.added.isNotEmpty() && out.errors.isEmpty() ->
+                        "已导入 " + out.added.size + " 张：给每张写个描述，空着不进候选"
+                    out.added.isNotEmpty() ->
+                        "导入 " + out.added.size + " 张，" + out.errors.size + " 张没成：" + out.errors.first()
+                    else -> "没导入：" + (out.errors.firstOrNull() ?: "没有可用的图片")
+                }
+            )
             // 导入后立刻要求写描述（多张就先填第一张，其余的网格里点开补）
             val first = out.added.firstOrNull()
             if (first != null) {
@@ -185,6 +201,31 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
                 showEdit = true
             }
         }
+    }
+
+    // 频率那行：跟随全局 + 6 档（-1 就是模型判断），首项把全局值写出来
+    val curEvery = overEvery
+    val everyItems: List<String> =
+        listOf(followEveryLabel(globalEvery)) + BotStore.stickerEveryOptions.map { BotStore.stickerEveryLabel(it) }
+    val everyIndex: Int = if (curEvery == null) 0 else {
+        val p = BotStore.stickerEveryOptions.indexOf(curEvery)
+        if (p >= 0) p + 1 else 0
+    }
+
+    // 冷却那行：跟随全局 + 5 档 + 自定义（正用自定义就把真实分钟数写进最后一项）
+    val curCool = overCool
+    val coolCustomIndex: Int = BotStore.stickerCooldownOptions.size + 1
+    val coolItems: List<String> =
+        listOf(followCoolLabel(globalCool)) +
+            BotStore.stickerCooldownOptions.map { BotStore.stickerCooldownLabel(it) } +
+            if (curCool != null && BotStore.stickerCooldownOptions.indexOf(curCool) < 0) {
+                "自定义 " + BotStore.stickerCooldownLabel(curCool)
+            } else {
+                "自定义…"
+            }
+    val coolIndex: Int = if (curCool == null) 0 else {
+        val p = BotStore.stickerCooldownOptions.indexOf(curCool)
+        if (p >= 0) p + 1 else coolCustomIndex
     }
 
     val used = StickerStore.usedBytes(items)
@@ -208,20 +249,33 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
                     Spacer(Modifier.height(PanelTokens.ContentGap))
                     StickerRhythmRow(
                         title = "自己发图的频率",
-                        summary = "同一个会话里，隔几条回复才让它自己发一张",
-                        items = BotStore.stickerEveryOptions.map { everyLabel(it) },
-                        selectedIndex = BotStore.stickerEveryOptions.indexOf(everyN),
+                        summary = "隔几条回一张，模型也能自己挑",
+                        items = everyItems,
+                        selectedIndex = everyIndex,
                         onSelectedIndexChange = { i ->
-                            switchRhythm(BotStore.stickerEveryOptions.getOrElse(i) { everyN }, cooldownH)
+                            if (i == 0) {
+                                saveRhythm(null, overCool)
+                            } else {
+                                BotStore.stickerEveryOptions.getOrNull(i - 1)?.let { v ->
+                                    saveRhythm(v, overCool)
+                                }
+                            }
                         },
                     )
                     StickerRhythmRow(
                         title = "同一张图的冷却",
                         summary = "同一张图多久内不重复发",
-                        items = BotStore.stickerCooldownOptions.map { cooldownLabel(it) },
-                        selectedIndex = BotStore.stickerCooldownOptions.indexOf(cooldownH),
+                        items = coolItems,
+                        selectedIndex = coolIndex,
                         onSelectedIndexChange = { i ->
-                            switchRhythm(everyN, BotStore.stickerCooldownOptions.getOrElse(i) { cooldownH })
+                            when {
+                                // 首项「跟随全局」：把这个键写成 null
+                                i == 0 -> saveRhythm(overEvery, null)
+                                i == coolCustomIndex -> showCoolCustom = true
+                                else -> BotStore.stickerCooldownOptions.getOrNull(i - 1)?.let { v ->
+                                    saveRhythm(overEvery, v)
+                                }
+                            }
                         },
                     )
                     Spacer(Modifier.height(PanelTokens.ContentGap))
@@ -238,11 +292,6 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
                         color = PanelColors.onSurfaceVariantSummary,
                         modifier = Modifier.padding(start = 4.dp, top = 4.dp),
                     )
-                }
-
-                if (msg.isNotBlank()) {
-                    PanelNotice(msg)
-                    Spacer(Modifier.height(PanelTokens.CardSpacing))
                 }
 
                 // ② 网格（每行 3 个）或空态
@@ -323,6 +372,17 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
         }
     }
 
+    // 冷却「自定义…」：填分钟数，只改本 bot 的 cooldown_min（1~10080）
+    StickerCoolDialog(
+        show = showCoolCustom,
+        initial = curCool ?: globalCool,
+        onConfirm = { m ->
+            showCoolCustom = false
+            saveRhythm(overEvery, m.coerceIn(1, BotStore.STICKER_COOLDOWN_MAX))
+        },
+        onDismiss = { showCoolCustom = false },
+    )
+
     // 编辑描述 / 标签（+ 删除入口）
     val editItem = editing
     if (editItem != null) {
@@ -337,7 +397,7 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
                         StickerStore.update(ctx, appid, editItem.id, desc, tags)
                     }
                     items = withContext(Dispatchers.IO) { StickerStore.load(ctx, appid) }
-                    msg = "已保存描述：" + desc.trim()
+                    AppToast.show("已保存描述：" + desc.trim())
                 }
             },
             onDelete = {
@@ -362,7 +422,7 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
                     withContext(Dispatchers.IO) { StickerStore.delete(ctx, appid, target.id) }
                     thumbs.remove(target.id)
                     items = withContext(Dispatchers.IO) { StickerStore.load(ctx, appid) }
-                    msg = "已删除：" + target.desc.ifBlank { target.id }
+                    AppToast.show("已删除：" + target.desc.ifBlank { target.id })
                 }
             }
         },
@@ -373,11 +433,13 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
 /** 右下角导入按钮占掉的高度：正文最后留这么多，免得末行被按钮压住。 */
 private val ImportClearance: Dp = 72.dp
 
-/** 频率下拉文案：值就是落盘值（sticker_every_n），默认档标一下。 */
-private fun everyLabel(n: Int): String = "每 " + n + " 条" + if (n == 10) "（默认）" else ""
+/** 首项文案：跟随全局，顺手把全局那档写出来（-1 = 模型判断）。 */
+private fun followEveryLabel(globalEvery: Int): String =
+    "跟随全局（现在：" + (if (globalEvery < 0) "模型判断" else "每 " + globalEvery + " 条") + "）"
 
-/** 冷却下拉文案：值就是落盘值（sticker_cooldown_h）。 */
-private fun cooldownLabel(h: Int): String = h.toString() + " 小时" + if (h == 24) "（默认）" else ""
+/** 首项文案：跟随全局，顺手把全局的冷却分钟数写出来。 */
+private fun followCoolLabel(globalCool: Int): String =
+    "跟随全局（现在：" + BotStore.stickerCooldownLabel(globalCool) + "）"
 
 /**
  * 一行下拉：两个模式共用同一份内容 —— miuix 走 kit 原生 [OverlayDropdownPreference]，

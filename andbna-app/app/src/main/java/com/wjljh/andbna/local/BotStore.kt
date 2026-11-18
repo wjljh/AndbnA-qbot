@@ -436,14 +436,35 @@ object BotStore {
             sp(this).edit().putString("sticker_enabled", if (v) "1" else "0").apply()
         }
 
-    /** 自己发图频率的候选值：落盘就是这几个数（llm.json 的 sticker_every_n）。 */
-    val stickerEveryOptions: IntArray = intArrayOf(3, 5, 10, 20, 50)
+    /**
+     * 自己发图频率的候选值：落盘就是这几个数（llm.json 的 sticker_every_n）。
+     * -1 = 模型判断（发不发、发几张让它自己定），正的 = 每 N 条回复最多 1 张。
+     */
+    val stickerEveryOptions: IntArray = intArrayOf(-1, 3, 5, 10, 20, 50)
 
-    /** 同一张图冷却小时的候选值（llm.json 的 sticker_cooldown_h）。 */
-    val stickerCooldownOptions: IntArray = intArrayOf(1, 6, 12, 24, 48)
+    /** 同一张图冷却分钟的候选值（llm.json 的 sticker_cooldown_min）：最小单位是分钟，1~10080 都能填。 */
+    val stickerCooldownOptions: IntArray = intArrayOf(10, 30, 60, 120, 360)
+
+    /** 冷却分钟上限（10080 分钟 = 7 天）。 */
+    const val STICKER_COOLDOWN_MAX = 10080
+
+    /** 每 bot 覆盖文件名（与 Python 侧同名）：null / 缺键 = 跟随全局。 */
+    const val STICKER_CONF = "sticker_conf.json"
+
+    /** 频率下拉文案：-1 写「模型判断」，10 是默认档。 */
+    fun stickerEveryLabel(n: Int): String =
+        if (n < 0) "模型判断" else "每 " + n + " 条" + if (n == 10) "（默认）" else ""
+
+    /** 冷却下拉文案：分钟 → 人话（120 / 360 写小时，其余照分钟写，60 还是「60 分钟」）。 */
+    fun stickerCooldownLabel(min: Int): String = when {
+        min == 120 -> "2 小时"
+        min == 360 -> "6 小时"
+        min > 60 && min % 60 == 0 -> (min / 60).toString() + " 小时"
+        else -> min.toString() + " 分钟"
+    }
 
     /**
-     * 隔几条回复才允许 bot 自己发一张（默认 10）。
+     * 隔几条回复才允许 bot 自己发一张（默认 10，-1 = 模型判断）。
      *
      * 缺键 / 脏值 / 不在候选里一律回落 10：界面下拉按候选表定位当前值，认不出的值会让行尾显示错位。
      * prefs 存一份给界面读，llm.json 里再写一份 int（Python 侧 _sticker_conf 按 mtime 现读，改完下一次回复就生效）。
@@ -456,16 +477,83 @@ object BotStore {
         }
 
     /**
-     * 同一张图多少小时内不重复发（默认 24）。
+     * 同一张图多少分钟内不重复发（默认 10，1~10080）。
      *
-     * 与 [stickerEveryN] 同一套写法：缺键 / 脏值 / 不在候选里一律回落 24。
+     * 老版本只存小时（sticker_cooldown_h）：读到就按它 ×60 顶上，写的时候只写
+     * sticker_cooldown_min —— 老键 Python 还兼容读，这边不再写它。
      */
-    var Context.stickerCooldownH: Int
-        get() = sp(this).getString("sticker_cooldown_h", "").orEmpty().trim().toIntOrNull()
-            ?.takeIf { it in stickerCooldownOptions } ?: 24
-        set(v) {
-            sp(this).edit().putString("sticker_cooldown_h", v.toString()).apply()
+    var Context.stickerCooldownMin: Int
+        get() {
+            val prefs = sp(this)
+            prefs.getString("sticker_cooldown_min", "").orEmpty().trim().toIntOrNull()
+                ?.takeIf { it in 1..STICKER_COOLDOWN_MAX }
+                ?.let { return it }
+            prefs.getString("sticker_cooldown_h", "").orEmpty().trim().toIntOrNull()
+                ?.takeIf { it in 1..(STICKER_COOLDOWN_MAX / 60) }
+                ?.let { return it * 60 }
+            return 10
         }
+        set(v) {
+            sp(this).edit()
+                .putString("sticker_cooldown_min", v.coerceIn(1, STICKER_COOLDOWN_MAX).toString()).apply()
+        }
+
+    // ── 每 bot 的表情节奏覆盖（<botdir>/sticker_conf.json）──
+    //
+    // {"every_n": -1|3|5|10|20|50|null, "cooldown_min": 10|30|60|120|360|自定义|null}
+    // null / 键缺失 = 跟随全局（全局那档在 llm.json 的 sticker_every_n / sticker_cooldown_min）。
+    // Python 侧每次现读这份文件，认不出的值整份当跟随全局 —— 所以这边读也一律当 null。
+
+    /** 一个 bot 的覆盖：两个 null 就是全跟随全局。 */
+    data class StickerOverride(val everyN: Int? = null, val cooldownMin: Int? = null)
+
+    fun stickerConfFile(ctx: Context, appid: String): File =
+        File(WordsStore.botDir(ctx, appid), STICKER_CONF)
+
+    /** 读覆盖：文件不在 / 读不出来 / 值不认识，都当跟随全局。 */
+    fun stickerOverride(ctx: Context, appid: String): StickerOverride {
+        val f = stickerConfFile(ctx, appid)
+        if (!f.isFile) return StickerOverride()
+        val o = try {
+            JSONObject(f.readText())
+        } catch (_: Exception) {
+            return StickerOverride()
+        }
+        val every = if (o.isNull("every_n")) null
+        else o.optInt("every_n", 0).takeIf { it in stickerEveryOptions }
+        val cool = if (o.isNull("cooldown_min")) null
+        else o.optInt("cooldown_min", 0).takeIf { it in 1..STICKER_COOLDOWN_MAX }
+        return StickerOverride(every, cool)
+    }
+
+    /** 写覆盖：null 写成显式 null（不是删键），Python 读到的就是「跟随全局」。 */
+    fun setStickerOverride(ctx: Context, appid: String, value: StickerOverride) {
+        val o = JSONObject()
+        putIntOrNull(o, "every_n", value.everyN)
+        putIntOrNull(o, "cooldown_min", value.cooldownMin)
+        writeAtomic(stickerConfFile(ctx, appid), o.toString(2))
+    }
+
+    /** JSONObject 没有「写 null」的重载：显式写 JSONObject.NULL，别让键消失。 */
+    private fun putIntOrNull(o: JSONObject, key: String, v: Int?) {
+        if (v == null) o.put(key, JSONObject.NULL) else o.put(key, v)
+    }
+
+    /** 同目录 .tmp → rename：进程被杀不会留下半截 JSON。 */
+    private fun writeAtomic(f: File, text: String): Boolean = try {
+        val dir = f.parentFile
+        if (dir != null && !dir.exists()) dir.mkdirs()
+        val tmp = File(dir, f.name + ".tmp")
+        tmp.writeText(text, Charsets.UTF_8)
+        if (tmp.renameTo(f)) {
+            true
+        } else {
+            f.delete()
+            tmp.renameTo(f)
+        }
+    } catch (_: Exception) {
+        false
+    }
 
     /**
      * 日志详细程度：simple（简洁，默认）/ detail（详细）。
@@ -572,18 +660,13 @@ object BotStore {
             .put("master_word_guard", ctx.masterWordGuard)
             // 允许 bot 自己发表情（默认 true）：图片库本身在 <botdir>/stickers/
             .put("sticker_enabled", ctx.stickerEnabled)
-            // 发图节奏（int）：隔几条回复发一张 / 同一张图冷却多少小时
+            // 发图节奏：隔几条回复发一张（-1 = 模型判断）/ 同一张图冷却多少分钟
             .put("sticker_every_n", ctx.stickerEveryN)
-            .put("sticker_cooldown_h", ctx.stickerCooldownH)
+            .put("sticker_cooldown_min", ctx.stickerCooldownMin)
             // 全局每日上限：群配置「跟随全局」时 Python 侧读这一档（0 = 无上限）
             .put("daily_limit", ctx.dailyLimit)
             // 日志详细程度（simple / detail）：Python 写日志时按它决定是否带细节
             .put("log_level", ctx.logLevel)
-        try {
-            val f = File(ctx.filesDir, "localbot/llm.json")
-            f.parentFile?.mkdirs()
-            f.writeText(o.toString(2))
-        } catch (_: Exception) {
-        }
+        writeAtomic(File(ctx.filesDir, "localbot/llm.json"), o.toString(2))
     }
 }

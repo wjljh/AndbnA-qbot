@@ -80,6 +80,7 @@ import com.wjljh.andbna.local.ShizukuState
 import com.wjljh.andbna.ui.component.PanelChoiceRow
 import com.wjljh.andbna.ui.component.PanelEllipsisField
 import com.wjljh.andbna.ui.component.PanelGroupCard
+import com.wjljh.andbna.ui.component.AppToast
 import com.wjljh.andbna.ui.component.PanelNotice
 import com.wjljh.andbna.ui.component.PanelPillRow
 import com.wjljh.andbna.ui.component.PanelPrimaryButton
@@ -1032,7 +1033,9 @@ private class ModelStepVm(ctx: Context) {
     fun save(ctx: Context) {
         if (api.isBlank() && key.isBlank() && model.isBlank()) return
         OnboardModelPrefs.save(ctx, api, key, model)
-        msg = "已保存：接口地址 / API Key / 主模型"
+        // 结果是「操作结果」，走全局提示条；页内的 msg 只留给「读模型」的即时反馈
+        msg = ""
+        AppToast.show("已保存：接口地址 / API Key / 主模型")
     }
 }
 

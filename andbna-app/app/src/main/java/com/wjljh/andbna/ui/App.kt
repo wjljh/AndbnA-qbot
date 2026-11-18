@@ -55,6 +55,7 @@ import com.wjljh.andbna.data.SettingsRepositoryImpl
 import com.wjljh.andbna.local.ModeStore
 import com.wjljh.andbna.local.PullBack
 import com.wjljh.andbna.local.RunMode
+import com.wjljh.andbna.ui.component.AppToastHost
 import com.wjljh.andbna.ui.component.PanelTokens
 import com.wjljh.andbna.ui.component.SecondaryTopBar
 import com.wjljh.andbna.ui.component.bottombar.BottomBarDestination
@@ -65,6 +66,7 @@ import com.wjljh.andbna.ui.screen.colorpalette.LocalPaletteBack
 import com.wjljh.andbna.ui.theme.LocalEnableBlur
 import com.wjljh.andbna.ui.theme.LocalEnableFloatingBottomBar
 import com.wjljh.andbna.ui.theme.LocalEnableFloatingBottomBarBlur
+import com.wjljh.andbna.ui.util.PredictiveBackGate
 import com.wjljh.andbna.ui.design.Size as DesignSize
 import android.os.Build
 import kotlinx.coroutines.Dispatchers
@@ -126,6 +128,23 @@ sealed interface Route : NavKey {
 val LocalBottomBarVisible: ProvidableCompositionLocal<MutableState<Boolean>> =
     compositionLocalOf { mutableStateOf(true) }
 
+/**
+ * 全局提示条的位置锚点：当前页 key（一级 tab + 二级路由）与底栏实测高度（px）。
+ *
+ * 提示条宿主挂在 [PanelApp] 的最外层 Box 里（浮在所有页面之上，含引导页），
+ * 但它要「站在底栏上方 12dp」、还要「切页就消失」——这两件事只有壳知道，
+ * 所以由壳（[PanelAppContent] / [MainTabs]）把值写进这两个状态，宿主只管读。
+ */
+private class ToastAnchors {
+    val pageKey = mutableStateOf(initialPageKey)
+    val dockHeightPx = androidx.compose.runtime.mutableIntStateOf(0)
+
+    companion object {
+        /** 首帧的 key：任何一次真实的 key 变化都能把它顶掉 */
+        const val initialPageKey = "boot"
+    }
+}
+
 @Composable
 fun PanelApp() {
     // 这三个 CompositionLocal 决定底栏形态与玻璃效果，值来自「主题设置」页的三个开关：
@@ -138,18 +157,29 @@ fun PanelApp() {
     val repo = remember { SettingsRepositoryImpl() }
     PrefsWatch.observed()
     val bottomBarVisible = remember { mutableStateOf(true) }
+    val anchors = remember { ToastAnchors() }
+    val density = LocalDensity.current
     CompositionLocalProvider(
         LocalEnableFloatingBottomBar provides repo.enableFloatingBottomBar,
         LocalEnableFloatingBottomBarBlur provides repo.enableFloatingBottomBarBlur,
         LocalEnableBlur provides repo.enableBlur,
         LocalBottomBarVisible provides bottomBarVisible,
     ) {
-        PanelAppContent()
+        // 宿主必须在最外层：NavDisplay 的二级页会把主页面整个盖住，提示条挂在
+        // MainTabs 里就只剩主页面能看见了；放这里则引导页 / 二级页 / 四个 tab 全都盖得住。
+        Box(Modifier.fillMaxSize()) {
+            PanelAppContent(anchors = anchors)
+            AppToastHost(
+                pageKey = anchors.pageKey.value,
+                dockHeight = with(density) { anchors.dockHeightPx.intValue.toDp() },
+                modifier = Modifier.align(Alignment.BottomCenter),
+            )
+        }
     }
 }
 
 @Composable
-private fun PanelAppContent() {
+private fun PanelAppContent(anchors: ToastAnchors) {
     val ctx = LocalContext.current
     val metrics = rememberMetrics()
     var mode by remember { mutableStateOf(ModeStore.initial(ctx)) }
@@ -167,6 +197,7 @@ private fun PanelAppContent() {
     // 会按位置沿用上一次的值（重看引导会直接落在上次停的那一步）
     var onboardSession by remember { mutableIntStateOf(0) }
     if (onboarding) {
+        LaunchedEffect(onboardSession) { anchors.pageKey.value = "onboarding/" + onboardSession }
         key(onboardSession) {
             OnboardingScreen(onFinish = {
                 OnboardStore.markDone(ctx)
@@ -181,6 +212,7 @@ private fun PanelAppContent() {
 
     // 老用户升级：单页更新说明（不阻塞配置，点「知道了」才落盘 seen_vc）
     if (whatsNew) {
+        LaunchedEffect(Unit) { anchors.pageKey.value = "whatsnew" }
         WhatsNewScreen(onDismiss = {
             OnboardStore.markDone(ctx)
             whatsNew = false
@@ -206,6 +238,12 @@ private fun PanelAppContent() {
     val mainPagerState = rememberMainPagerState(pagerState)
     LaunchedEffect(pagerState.currentPage) { mainPagerState.syncPage() }
 
+    // 提示条要「切页立即消失」：一级 tab 与二级路由共同组成 key，任一变化都清空
+    val routeKey = backStack.last()
+    LaunchedEffect(routeKey, pagerState.currentPage) {
+        anchors.pageKey.value = routeKey.toString() + "#" + pagerState.currentPage
+    }
+
     CompositionLocalProvider(LocalMainPagerState provides mainPagerState) {
         NavDisplay(
             backStack = backStack,
@@ -218,6 +256,7 @@ private fun PanelAppContent() {
                     metrics = metrics,
                     mode = mode,
                     pagerState = pagerState,
+                    anchors = anchors,
                     onOpenDetail = { push(Route.HeroDetail) },
                     onOpenTasks = { push(Route.Tasks(it)) },
                     onOpenMemDetail = { push(Route.MemDetail(it)) },
@@ -239,6 +278,7 @@ private fun PanelAppContent() {
                 )
             }
             entry<Route.HeroDetail>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+                PredictiveBackGate(canPop = backStack.size > 1) { pop() }
                 HeroDetailScreen(
                     metrics = metrics,
                     onBack = { pop() },
@@ -250,15 +290,18 @@ private fun PanelAppContent() {
                 )
             }
             entry<Route.Log>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+                PredictiveBackGate(canPop = backStack.size > 1) { pop() }
                 LogScreen(metrics) { pop() }
             }
             // 主题设置：kit 的 ColorPaletteScreen（它不是自带 Scaffold 的二级页，只是把 pop 灌进 composition local）
             entry<Route.ThemePalette>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+                PredictiveBackGate(canPop = backStack.size > 1) { pop() }
                 CompositionLocalProvider(LocalPaletteBack provides { pop() }) {
                     ColorPaletteScreen()
                 }
             }
             entry<Route.ModePick>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+                PredictiveBackGate(canPop = backStack.size > 1) { pop() }
                 ModePickScreen(
                     metrics = metrics,
                     current = mode,
@@ -275,21 +318,28 @@ private fun PanelAppContent() {
                 )
             }
             entry<Route.About>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+                PredictiveBackGate(canPop = backStack.size > 1) { pop() }
                 AboutScreen(metrics) { pop() }
             }
             // 模型配置：外壳由 ModelConfigScreen 自己给（顶栏 = 细线 Back + 标题，与关于页同款）
             entry<Route.ModelConfig>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+                PredictiveBackGate(canPop = backStack.size > 1) { pop() }
                 ModelConfigScreen(metrics) { pop() }
             }
             entry<Route.Texts>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+                PredictiveBackGate(canPop = backStack.size > 1) { pop() }
                 // 顶栏由 TextsPage 自己给（细线 MiuixIcons.Back + 标题，与关于页同款）
                 TextsPage(bottomInset = 0.dp) { pop() }
             }
-            entry<Route.Tasks>(swipeDismiss = NavSwipeDirection.LeftToRight) { route ->
+            entry<Route.Tasks>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+                route ->
+                PredictiveBackGate(canPop = backStack.size > 1) { pop() }
                 TasksScreen(metrics, route.appid) { pop() }
             }
             // Bot 详细配置：外壳由 BotEditScreen 自己给（顶栏 = 细线 Back + bot 名，与主题页同款）
-            entry<Route.BotEdit>(swipeDismiss = NavSwipeDirection.LeftToRight) { route ->
+            entry<Route.BotEdit>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+                route ->
+                PredictiveBackGate(canPop = backStack.size > 1) { pop() }
                 // 返回时 +1：编辑页可能改了人格 / 名字，Bot 页那张卡要跟着重读
                 BotEditScreen(metrics = metrics, appid = route.appid) {
                     pop()
@@ -298,13 +348,16 @@ private fun PanelAppContent() {
             }
             // 新建 bot：独立页面（不再弹老对话框），结构与编辑页同款
             entry<Route.BotAdd>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+                PredictiveBackGate(canPop = backStack.size > 1) { pop() }
                 BotAddScreen(
                     metrics = metrics,
                     onBack = { pop() },
                     onCreated = { botsRev++ },
                 )
             }
-            entry<Route.MemDetail>(swipeDismiss = NavSwipeDirection.LeftToRight) { route ->
+            entry<Route.MemDetail>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+                route ->
+                PredictiveBackGate(canPop = backStack.size > 1) { pop() }
                 var botTitle by remember(route.appid) { mutableStateOf("记忆") }
                 LaunchedEffect(route.appid) {
                     botTitle = withContext(Dispatchers.IO) {
@@ -376,6 +429,7 @@ private fun MainTabs(
     metrics: Metrics,
     mode: RunMode,
     pagerState: androidx.compose.foundation.pager.PagerState,
+    anchors: ToastAnchors,
     onOpenDetail: () -> Unit,
     onOpenTasks: (String) -> Unit,
     onOpenMemDetail: (String) -> Unit,
@@ -437,6 +491,8 @@ private fun MainTabs(
     // 悬浮底栏：量一次它的真实占位（含导航条 inset），再 +12dp 安全距，
     // 作为「底部 content padding」交给每个页面的 LazyColumn（PanelScreen）。
     var barHeightPx by remember { mutableIntStateOf(0) }
+    // material 那一支的底栏高度（NavigationBar 自己量，同样含导航条 inset）
+    var navBarHeightPx by remember { mutableIntStateOf(0) }
     val density = LocalDensity.current
     val bottomInset = (if (barHeightPx > 0) with(density) { barHeightPx.toDp() }
     else DesignSize.Bar + PanelTokens.BottomBarSafetyGap) + PanelTokens.BottomBarSafetyGap
@@ -445,6 +501,14 @@ private fun MainTabs(
     val miuixPageInset = if (barVisible) bottomInset else PanelTokens.BottomBarSafetyGap
 
     val materialMode = LocalUiMode.current == UiMode.Material
+
+    // 提示条的锚点：底栏可见时抬到它上面 12dp，收起来（记忆页多选）就贴底
+    val dockPx = when {
+        !barVisible -> 0
+        materialMode -> navBarHeightPx
+        else -> barHeightPx
+    }
+    LaunchedEffect(dockPx) { anchors.dockHeightPx.intValue = dockPx }
 
     // 页面内容只有一份：两套外壳共用这同一个 pager（页面文件里没有任何模式分支）。
     // pageInset = 本模式外壳给「底栏占位」算出来的额外底部留白，由外壳分别传入：
@@ -551,6 +615,7 @@ private fun MainTabs(
                 if (barVisible) {
                     NavigationBar(
                         containerColor = MaterialTheme.colorScheme.surfaceContainer,
+                        modifier = Modifier.onSizeChanged { navBarHeightPx = it.height },
                     ) {
                         BottomBarDestination.entries.forEachIndexed { index, destination ->
                             NavigationBarItem(

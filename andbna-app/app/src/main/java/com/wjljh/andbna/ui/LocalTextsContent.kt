@@ -40,6 +40,7 @@ import com.wjljh.andbna.local.GroupNames
 import com.wjljh.andbna.local.LocalBot
 import com.wjljh.andbna.local.MemoryRepo
 import com.wjljh.andbna.local.BotStore
+import com.wjljh.andbna.ui.component.AppToast
 import com.wjljh.andbna.ui.component.PanelAnimatedNotice
 import com.wjljh.andbna.ui.component.PanelCheckCircle
 import com.wjljh.andbna.ui.component.PanelChip
@@ -103,7 +104,6 @@ fun LocalTextsContent(
     var sessions by remember { mutableStateOf<Map<String, List<org.json.JSONObject>>>(emptyMap()) }
     // 每个 bot 一份群名缓存（group_names.json）：key = appid，取不到名字就显示「群 + openid 前 8 位」
     var names by remember { mutableStateOf<Map<String, Map<String, GroupNames.Entry>>>(emptyMap()) }
-    var msg by remember { mutableStateOf("") }
     var tick by remember { mutableIntStateOf(0) }
     var expandedBot by remember { mutableStateOf("") }
     // 多选（相册式）：sel 存「哪个 bot 的哪个会话」—— 同一个 key 在不同 bot 那里是两份记忆，
@@ -113,16 +113,8 @@ fun LocalTextsContent(
     val selecting = sel.isNotEmpty()
     var confirmDel by remember { mutableStateOf(false) }
     var refreshing by remember { mutableStateOf(false) }
-    // 撤销：undoable 只活 10 秒；undoAppids 记住这次删过哪些 bot（跨 bot 时逐个 bot 撤）
-    var undoable by remember { mutableStateOf(false) }
-    var undoAppids by remember { mutableStateOf<List<String>>(emptyList()) }
-    var undoSeq by remember { mutableIntStateOf(0) }
-    LaunchedEffect(undoSeq) {
-        if (undoSeq > 0) {
-            delay(10_000)
-            undoable = false
-        }
-    }
+    // 撤销窗口现在交给全局提示条（8 秒，与条同寿）：
+    // 删除成功后 AppToast.show(..., action = "撤销") —— 条一消失，按钮跟着没了
     // 本机记忆页也要两套外壳：miuix 走 PanelGroupCard，material 走 SegmentedGroup
     // （以前这里只有 PanelGroupCard，material 模式下就是一页 miuix 卡片，跟别处不一致）
     val material = LocalUiMode.current == UiMode.Material
@@ -168,10 +160,13 @@ fun LocalTextsContent(
         if (appid.isBlank() || keys.isEmpty()) return
         scope.launch {
             val r = withContext(Dispatchers.IO) { MemoryRepo.deleteMany(ctx, appid, keys) }
-            msg = r.text
-            undoable = r.undo
-            undoAppids = if (r.undo) listOf(appid) else emptyList()
-            undoSeq++
+            AppToast.show(r.text, action = if (r.undo) "撤销" else null) {
+                scope.launch {
+                    val rs = withContext(Dispatchers.IO) { listOf(appid).map { MemoryRepo.undo(ctx, it) } }
+                    AppToast.show(rs.joinToString("；") { it.text })
+                    tick++
+                }
+            }
             exitSelect()
             tick++
         }
@@ -189,16 +184,24 @@ fun LocalTextsContent(
             val rs = withContext(Dispatchers.IO) {
                 groups.map { (appid, keys) -> appid to MemoryRepo.deleteMany(ctx, appid, keys) }
             }
-            msg = if (rs.size == 1) {
+            val text = if (rs.size == 1) {
                 rs.first().second.text
             } else {
                 rs.joinToString("；") { (appid, r) ->
                     (bots.firstOrNull { it.appid == appid }?.title ?: appid) + "：" + r.text
                 }
             }
-            undoable = rs.all { it.second.undo }
-            undoAppids = if (undoable) rs.map { it.first } else emptyList()
-            undoSeq++
+            val canUndo = rs.all { it.second.undo }
+            val undoAppids = if (canUndo) rs.map { it.first } else emptyList()
+            AppToast.show(text, action = if (canUndo) "撤销" else null) {
+                scope.launch {
+                    val undone = withContext(Dispatchers.IO) {
+                        undoAppids.map { MemoryRepo.undo(ctx, it) }
+                    }
+                    AppToast.show(undone.joinToString("；") { it.text })
+                    tick++
+                }
+            }
             Log.i(TAG, "多选删除：$total 段 / ${groups.size} 个 bot")
             exitSelect()
             tick++
@@ -214,10 +217,9 @@ fun LocalTextsContent(
                 sessions = m
                 val n = m.values.sumOf { it.size }
                 Log.i(TAG, "记忆刷新：$n 段")
-                if (!undoable) msg = "刷新完：$n 段"
+                if (!AppToast.hasAction()) AppToast.show("刷新完：$n 段")
             } catch (e: Throwable) {
-                undoable = false
-                msg = "刷新失败：" + (e.message ?: "未知错误")
+                AppToast.show("刷新失败：" + (e.message ?: "未知错误"))
                 Log.e(TAG, "记忆刷新失败：" + e.message, e)
             } finally {
                 refreshing = false
@@ -259,21 +261,6 @@ fun LocalTextsContent(
             )
         }) else null,
     ) {
-        item(key = "notice") {
-            PanelAnimatedNotice(visible = msg.isNotBlank()) {
-                MemoryNotice(msg, undoable) {
-                    scope.launch {
-                        val appids = undoAppids
-                        val rs = withContext(Dispatchers.IO) { appids.map { MemoryRepo.undo(ctx, it) } }
-                        msg = rs.joinToString("；") { it.text }
-                        undoable = false
-                        undoAppids = emptyList()
-                        tick++
-                    }
-                }
-            }
-        }
-
         item(key = "overview") {
             if (material) {
                 SegmentedGroup(modifier = Modifier.segmentedGroupInsets()) {
@@ -514,11 +501,11 @@ fun LocalTextsContent(
         }
     }
 
-    // 二次确认：多选删除一定先弹这个；文案写明段数与「10 秒内可撤销」
+    // 二次确认：多选删除一定先弹这个；文案写明段数与「8 秒内可撤销」（= 提示条寿命）
     PanelConfirmDialog(
         show = confirmDel,
         title = "删除所选记忆",
-        body = "要删 " + sel.size + " 段记忆，10 秒内能撤销",
+        body = "要删 " + sel.size + " 段记忆，8 秒内能撤销",
         confirmLabel = "删除 " + sel.size + " 段",
         onConfirm = {
             confirmDel = false
@@ -612,22 +599,6 @@ private fun LocalBotSegmentedGroup(
     }
 }
 
-/**
- * 提示条 +（可选）撤销按钮。
- * 删除成功后 10 秒内可点「撤销」，过期按钮消失（undo 文件本身留到下一次删除）。
- */
-@Composable
-private fun MemoryNotice(text: String, undoVisible: Boolean, onUndo: () -> Unit) {
-    if (!undoVisible) {
-        PanelNotice(text)
-        return
-    }
-    Row(verticalAlignment = Alignment.CenterVertically) {
-        Box(Modifier.weight(1f)) { PanelNotice(text) }
-        PanelTertiaryButton(text = "撤销", onClick = onUndo)
-    }
-}
-
 /** 记忆详情（二级页）：群 openid / 主人 openid / 全部会话，规则与旧版一致。 */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
@@ -640,16 +611,7 @@ fun MemoryDetailContent(
     val scope = rememberCoroutineScope()
     var chats by remember { mutableStateOf<List<org.json.JSONObject>>(emptyList()) }
     var names by remember { mutableStateOf<Map<String, GroupNames.Entry>>(emptyMap()) }
-    var msg by remember { mutableStateOf("") }
     var tick by remember { mutableStateOf(0) }
-    var undoable by remember { mutableStateOf(false) }
-    var undoSeq by remember { mutableIntStateOf(0) }
-    LaunchedEffect(undoSeq) {
-        if (undoSeq > 0) {
-            delay(10_000)
-            undoable = false
-        }
-    }
 
     LaunchedEffect(appid, tick) {
         val list = withContext(Dispatchers.IO) {
@@ -676,19 +638,6 @@ fun MemoryDetailContent(
     val privates = chats.filter { it.optString("key").startsWith("p") }
 
     PanelScreen(bottomInset) {
-        item(key = "notice") {
-            PanelAnimatedNotice(visible = msg.isNotBlank()) {
-                MemoryNotice(msg, undoable) {
-                    scope.launch {
-                        val r = withContext(Dispatchers.IO) { MemoryRepo.undo(ctx, appid) }
-                        msg = r.text
-                        undoable = false
-                        tick++
-                    }
-                }
-            }
-        }
-
         item(key = "groups") {
             PanelGroupCard {
                 Text(
@@ -756,9 +705,13 @@ fun MemoryDetailContent(
                                 onClick = {
                                     scope.launch {
                                         val r = withContext(Dispatchers.IO) { MemoryRepo.delete(ctx, appid, key) }
-                                        msg = r.text
-                                        undoable = r.undo
-                                        undoSeq++
+                                        AppToast.show(r.text, action = if (r.undo) "撤销" else null) {
+                                            scope.launch {
+                                                val u = withContext(Dispatchers.IO) { MemoryRepo.undo(ctx, appid) }
+                                                AppToast.show(u.text)
+                                                tick++
+                                            }
+                                        }
                                         tick++
                                     }
                                 },
@@ -776,8 +729,8 @@ fun MemoryDetailContent(
                         text = "清空这个 bot",
                         onClick = {
                             scope.launch {
-                                msg = withContext(Dispatchers.IO) { MemoryRepo.clear(ctx, appid).text }
-                                undoable = false
+                                val cleared = withContext(Dispatchers.IO) { MemoryRepo.clear(ctx, appid) }
+                                AppToast.show(cleared.text)
                                 tick++
                             }
                         },

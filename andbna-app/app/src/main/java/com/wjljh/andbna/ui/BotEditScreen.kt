@@ -1,6 +1,5 @@
 package com.wjljh.andbna.ui
 
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Box
@@ -71,6 +70,7 @@ import com.wjljh.andbna.ui.component.BotFormPersonaSection
 import com.wjljh.andbna.ui.component.BotFormSecretSection
 import com.wjljh.andbna.ui.component.BotFormSection
 import com.wjljh.andbna.ui.component.BotFormSwitchRow
+import com.wjljh.andbna.ui.component.AppToast
 import com.wjljh.andbna.ui.component.rememberPersonaImporter
 import com.wjljh.andbna.ui.component.PanelArrowRow
 import com.wjljh.andbna.ui.component.PanelGroupCard
@@ -84,7 +84,7 @@ import com.wjljh.andbna.ui.component.PanelSecondaryButton
 import com.wjljh.andbna.ui.component.SecretEyeButton
 import com.wjljh.andbna.ui.component.PanelTokens
 import com.wjljh.andbna.ui.component.modeClickable
-import com.wjljh.andbna.ui.component.panelStepTransition
+import com.wjljh.andbna.ui.util.PredictiveBackGate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -106,6 +106,25 @@ import top.yukonga.miuix.kmp.icon.extended.Add
 import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.icon.extended.Delete
 import top.yukonga.miuix.kmp.theme.MiuixTheme
+import top.yukonga.miuix.kmp.nav.core.NavDisplay
+import top.yukonga.miuix.kmp.nav.core.NavDisplayEffects
+import top.yukonga.miuix.kmp.nav.core.NavKey
+import top.yukonga.miuix.kmp.nav.core.navBackStackOf
+import top.yukonga.miuix.kmp.nav.core.rememberNavSystemCornerRadius
+import top.yukonga.miuix.kmp.nav.transition.NavSwipeDirection
+
+/**
+ * Bot 编辑页内部的二级页（群配置 / 群管理 / 表情图片库）。
+ *
+ * 与 App 层其它页面一样是 [NavKey] 且走同一个库 [NavDisplay]，转场因此完全同源
+ * （库默认 NavTransitions.MiuixDefault），不是另写一份参数。
+ */
+private sealed interface BotSub : NavKey {
+    data object Edit : BotSub
+    data object Groups : BotSub
+    data object Admin : BotSub
+    data object Stickers : BotSub
+}
 
 /**
  * Bot 详细配置二级页（Route.BotEdit）。
@@ -126,9 +145,12 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
 fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
-    // 「群配置」「表情 / 图片库」两个二级页就地接管整屏（不新增 App 路由）：返回就回到本页，
-    // 编辑页状态全在 remember 里。进出这一层也用 panelStepTransition（与列表↔单群编辑、引导页同一份）。
-    var sub by remember(appid) { mutableStateOf("") }   // "" = 本页 / "groups" / "stickers"
+    // 「群配置 / 群管理 / 表情图片库」是这一层自己的 NavDisplay 栈（不新增 App 路由，编辑页状态
+    // 全在 remember 里、不被别的 entry 盖掉）。它们与 App 层其它二级页共用库默认转场
+    // （NavTransitions.MiuixDefault），不再就地套一层 AnimatedContent。
+    val subStack = remember(appid) { navBackStackOf(BotSub.Edit) }
+    fun openSub(route: BotSub) { if (route !in subStack) subStack.add(route) }
+    fun popSub() { if (subStack.size > 1) subStack.removeLastOrNull() }
     /** 表情库张数（右侧「N 张 / 未添加」）：只在 IO 里读 library.json */
     var stickerCount by remember(appid) { mutableStateOf(0) }
     /** 已经配过群管理规则的群数量（「群管理」卡右侧「N 个群已配置」） */
@@ -207,9 +229,9 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
         onImported = { n ->
             personas = PersonaAssets.listAll(ctx)
             persona = PersonaAssets.CUSTOM_PREFIX + n
-            msg = "人格导进来了：" + n
+            AppToast.show("人格导进来了：" + n)
         },
-        onMessage = { msg = it },
+        onMessage = { AppToast.show(it) },
     )
 
     /** 从运行记录采集本 bot 的 owner + 群列表（跨 Chaquopy 调用，只在 IO 线程跑）。 */
@@ -409,11 +431,13 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
             }
             // 存过就是新基线：下次保存没再动时段，就不会又断一次线
             if (saved.slotChanged) slotsBaseline = slots
-            msg = when {
-                saved.wordsErr.isNotBlank() -> "已保存，但" + saved.wordsErr
-                saved.note.isNotBlank() -> "已保存 · " + saved.note
-                else -> "已保存"
-            }
+            AppToast.show(
+                when {
+                    saved.wordsErr.isNotBlank() -> "已保存，但" + saved.wordsErr
+                    saved.note.isNotBlank() -> "已保存 · " + saved.note
+                    else -> "已保存"
+                }
+            )
         }
     }
 
@@ -533,7 +557,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                     PersonaAssets.deleteCustom(ctx, full)
                     personas = PersonaAssets.listAll(ctx)
                     if (persona == full) persona = ""
-                    msg = "人格删了：" + full.removePrefix(PersonaAssets.CUSTOM_PREFIX)
+                    AppToast.show("人格删了：" + full.removePrefix(PersonaAssets.CUSTOM_PREFIX))
                 },
             )
 
@@ -566,7 +590,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                         .fillMaxWidth()
                         .heightIn(min = PanelMetrics.RowMinHeight)
                         // 列表入口：不加按压反馈（只有主页 hero 卡才有）
-                        .modeClickable(onClick = { sub = "stickers" }, feedback = false),
+                        .modeClickable(onClick = { openSub(BotSub.Stickers) }, feedback = false),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(Modifier.weight(1f)) {
@@ -827,7 +851,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                     title = "按群单独设置",
                     summary = "单独拧开关，没配过的群跟上面的走",
                     feedback = false,
-                    onClick = { sub = "groups" },
+                    onClick = { openSub(BotSub.Groups) },
                 )
             }
 
@@ -839,7 +863,7 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                         .fillMaxWidth()
                         .heightIn(min = PanelMetrics.RowMinHeight)
                         // 列表入口：不加按压反馈（只有主页 hero 卡才有）
-                        .modeClickable(onClick = { sub = "admin" }, feedback = false),
+                        .modeClickable(onClick = { openSub(BotSub.Admin) }, feedback = false),
                     verticalAlignment = Alignment.CenterVertically,
                 ) {
                     Column(Modifier.weight(1f)) {
@@ -895,84 +919,82 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
         }
     }
 
-    // 本页 ↔ 群配置 / 表情图片库：同一份 panelStepTransition
-    //   进入（"" → 某页）：forward = true，二级页从右进、本页往左出；
-    //   返回（某页 → ""）：forward = false，本页从右进、二级页往左出 —— 与列表↔单群编辑完全一致。
-    AnimatedContent(
-        targetState = sub,
-        transitionSpec = { panelStepTransition(forward = targetState.isNotEmpty()) },
-        label = "bot-edit-sub",
-    ) { route ->
-        if (route == "groups") {
-            GroupConfigScreen(metrics = metrics, appid = appid, onBack = { sub = "" })
-        } else if (route == "admin") {
-            GroupAdminScreen(
-                metrics = metrics,
-                appid = appid,
-                onBack = {
-                    sub = ""
-                    // 回来时重算「N 个群已配置」：刚配过的群现在算数了
-                    scope.launch {
-                        adminCount = withContext(Dispatchers.IO) {
-                            GroupAdmin.configured(ctx, appid).size
-                        }
-                    }
-                },
-            )
-        } else if (route == "stickers") {
-            StickerLibraryScreen(
-                metrics = metrics,
-                appid = appid,
-                botName = title,
-                onBack = {
-                    sub = ""
-                    // 回来时刷新「N 张」：导入 / 删除都可能刚刚发生过
-                    scope.launch {
-                        stickerCount = withContext(Dispatchers.IO) { StickerStore.load(ctx, appid).size }
-                    }
-                },
-            )
-        } else if (LocalUiMode.current == UiMode.Material) {
-            M3Scaffold(
-                containerColor = MaterialTheme.colorScheme.background,
-                topBar = {
-                    M3TopAppBar(
-                        title = { M3Text(text = title, style = MaterialTheme.typography.titleLarge) },
-                        navigationIcon = {
-                            IconButton(onClick = onBack) {
-                                androidx.compose.material3.Icon(
-                                    Icons.AutoMirrored.Filled.ArrowBack,
-                                    contentDescription = "返回",
-                                )
-                            }
-                        },
-                    )
-                },
-            ) { pad ->
-                Box(Modifier.fillMaxSize().padding(pad)) { body() }
+    // 本页 / 群配置 / 群管理 / 表情图片库：同一条 NavDisplay 通道 —— 转场就是 App 层其它二级页
+    // 那份库里默认的 NavTransitions.MiuixDefault（整屏滑入 + 下层视差 + 暗幕，程序化 500ms），
+    // 这里不传 transition 参数，避免出现第二种口径。
+    // 用本层自己的栈而不是往 App 的栈上 push：编辑页状态全在 remember 里，被新 entry 盖掉会丢。
+    NavDisplay(
+        backStack = subStack,
+        effects = NavDisplayEffects(cornerClipRadius = rememberNavSystemCornerRadius()),
+        onBack = onBack,
+    ) {
+        // 本页：根 entry，自己不带侧滑（与 App 层 Route.Main 同规矩）
+        entry<BotSub.Edit>(swipeDismiss = NavSwipeDirection.None) {
+            if (LocalUiMode.current == UiMode.Material) {
+                M3Scaffold(
+                    containerColor = MaterialTheme.colorScheme.background,
+                    topBar = {
+                        M3TopAppBar(
+                            title = { M3Text(text = title, style = MaterialTheme.typography.titleLarge) },
+                            navigationIcon = {
+                                IconButton(onClick = onBack) {
+                                    androidx.compose.material3.Icon(
+                                        Icons.AutoMirrored.Filled.ArrowBack,
+                                        contentDescription = "返回",
+                                    )
+                                }
+                            },
+                        )
+                    },
+                ) { pad ->
+                    Box(Modifier.fillMaxSize().padding(pad)) { body() }
+                }
+            } else {
+                Scaffold(
+                    containerColor = MiuixTheme.colorScheme.surface,
+                    topBar = {
+                        TopAppBar(
+                            title = title,
+                            largeTitle = title,
+                            subtitle = "AppID " + appid,
+                            navigationIcon = {
+                                IconButton(onClick = onBack) {
+                                    Icon(
+                                        imageVector = MiuixIcons.Back,
+                                        contentDescription = "返回",
+                                        tint = MiuixTheme.colorScheme.onBackground,
+                                    )
+                                }
+                            },
+                        )
+                    },
+                ) { pad ->
+                    Box(Modifier.fillMaxSize().padding(pad)) { body() }
+                }
             }
-        } else {
-            Scaffold(
-                containerColor = MiuixTheme.colorScheme.surface,
-                topBar = {
-                    TopAppBar(
-                        title = title,
-                        largeTitle = title,
-                        subtitle = "AppID " + appid,
-                        navigationIcon = {
-                            IconButton(onClick = onBack) {
-                                Icon(
-                                    imageVector = MiuixIcons.Back,
-                                    contentDescription = "返回",
-                                    tint = MiuixTheme.colorScheme.onBackground,
-                                )
-                            }
-                        },
-                    )
-                },
-            ) { pad ->
-                Box(Modifier.fillMaxSize().padding(pad)) { body() }
-            }
+        }
+
+        // 三个子页：onBack 只回本层，进退都交给 NavDisplay（转场与 App 层二级页同源）
+        entry<BotSub.Groups>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+            PredictiveBackGate(canPop = subStack.size > 1) { popSub() }
+            GroupConfigScreen(metrics = metrics, appid = appid) { popSub() }
+        }
+        entry<BotSub.Admin>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+            PredictiveBackGate(canPop = subStack.size > 1) { popSub() }
+            GroupAdminScreen(metrics = metrics, appid = appid) { popSub() }
+        }
+        entry<BotSub.Stickers>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+            PredictiveBackGate(canPop = subStack.size > 1) { popSub() }
+            StickerLibraryScreen(metrics = metrics, appid = appid, botName = title) { popSub() }
+        }
+    }
+
+    // 从二级页回到本页时重算右侧计数。顶栏返回 / 侧滑 / 预测性返回三条路都落在这里，
+    // 所以按「栈回到只剩本页」判定，而不是挂在各个 onBack 上（手势返回不经它们）。
+    LaunchedEffect(subStack.size) {
+        if (subStack.size == 1) {
+            stickerCount = withContext(Dispatchers.IO) { StickerStore.load(ctx, appid).size }
+            adminCount = withContext(Dispatchers.IO) { GroupAdmin.configured(ctx, appid).size }
         }
     }
 

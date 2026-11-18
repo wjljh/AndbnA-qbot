@@ -27,6 +27,7 @@ import com.wjljh.andbna.local.GroupConfig
 import com.wjljh.andbna.local.GroupNames
 import com.wjljh.andbna.ui.component.PanelArrowRow
 import com.wjljh.andbna.ui.component.PanelEmptyState
+import com.wjljh.andbna.ui.component.AppToast
 import com.wjljh.andbna.ui.component.PanelNotice
 import com.wjljh.andbna.ui.component.PanelPillRow
 import com.wjljh.andbna.ui.component.PanelPrimaryButton
@@ -70,7 +71,6 @@ fun GroupConfigScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     var loaded by remember(appid) { mutableStateOf(false) }
     // 点开的是哪个群（null = 列表页）。两个状态切走同一套过渡动画，返回即回列表。
     var editing by remember(appid) { mutableStateOf<String?>(null) }
-    var msg by remember(appid) { mutableStateOf("") }
     var tick by remember(appid) { mutableStateOf(0) }
 
     // 组合期不读盘：群列表要过 Chaquopy，一律放 IO
@@ -99,11 +99,7 @@ fun GroupConfigScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 rows = rows,
                 names = names,
                 loaded = loaded,
-                msg = msg,
-                onPick = { id ->
-                    msg = ""
-                    editing = id
-                },
+                onPick = { id -> editing = id },
                 onBack = onBack,
             )
         } else {
@@ -114,7 +110,7 @@ fun GroupConfigScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 name = names[gid]?.name.orEmpty(),
                 onBack = { editing = null },
                 onSaved = { note ->
-                    msg = note
+                    AppToast.show(note)
                     editing = null
                     tick++          // 覆盖状态变了，列表重新算一遍
                 },
@@ -131,7 +127,6 @@ private fun GroupListPage(
     rows: List<GroupConfig.Row>,
     names: Map<String, GroupNames.Entry>,
     loaded: Boolean,
-    msg: String,
     onPick: (String) -> Unit,
     onBack: () -> Unit,
 ) {
@@ -146,8 +141,6 @@ private fun GroupListPage(
                 .verticalScroll(rememberScrollState()),
         ) {
             PageColumn(metrics) {
-                if (msg.isNotBlank()) PanelNotice(msg)
-
                 if (loaded && rows.isEmpty()) {
                     SectionCard(metrics) {
                         PanelEmptyState(

@@ -38,6 +38,7 @@ import androidx.compose.ui.unit.sp
 import com.wjljh.andbna.local.BotHost
 import com.wjljh.andbna.local.BotStore
 import com.wjljh.andbna.local.BotStore.logLevel
+import com.wjljh.andbna.ui.component.AppToast
 import com.wjljh.andbna.ui.component.material.SegmentedArrowItem
 import com.wjljh.andbna.ui.component.material.SegmentedContentItem
 import com.wjljh.andbna.ui.component.material.SegmentedDropdownItem
@@ -126,7 +127,7 @@ fun LogScreen(metrics: Metrics, onBack: () -> Unit) {
     ) { uri: Uri? ->
         if (uri == null) return@rememberLauncherForActivityResult
         scope.launch {
-            msg = try {
+            AppToast.show(try {
                 withContext(Dispatchers.IO) {
                     ctx.contentResolver.openOutputStream(uri)?.use { os ->
                         os.write(shown.toByteArray(Charsets.UTF_8))
@@ -135,7 +136,7 @@ fun LogScreen(metrics: Metrics, onBack: () -> Unit) {
                 "已导出：${shown.length} 字"
             } catch (e: Exception) {
                 "导出没成：${e.message}，换个位置再存一次"
-            }
+            })
         }
     }
 

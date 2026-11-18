@@ -38,6 +38,7 @@ import com.wjljh.andbna.local.BotService
 import com.wjljh.andbna.local.BotStore
 import com.wjljh.andbna.local.LocalBot
 import com.wjljh.andbna.local.PullBack
+import com.wjljh.andbna.ui.component.AppToast
 import com.wjljh.andbna.ui.component.PanelAnimatedNotice
 import com.wjljh.andbna.ui.component.PanelDangerSolidButton
 import com.wjljh.andbna.ui.component.PanelGroupCard
@@ -105,7 +106,6 @@ fun BotsPage(
     // 运行状态：Python 快照原文进 state，解析结果按原文缓存（原文没变就不解析、不重组）
     val snapshotRaw = remember { mutableStateOf("[]") }
     val runtime by remember { derivedStateOf { parseRuntime(snapshotRaw.value) } }
-    var msg by remember { mutableStateOf("") }
     // 两步确认：同一时刻只允许一张卡处于待确认态（点别的卡的「删除」会切过去）
     var confirmingId by remember { mutableStateOf("") }
     val material = LocalUiMode.current == UiMode.Material
@@ -138,10 +138,6 @@ fun BotsPage(
     Box(Modifier.fillMaxSize()) {
         // 底部再加 72dp：给右下角 56dp FAB + 16dp 边距留净空，否则最后一张卡会被 FAB 压住
         PanelScreen(bottomInset + 72.dp) {
-            item(key = "notice") {
-                PanelAnimatedNotice(visible = msg.isNotBlank()) { PanelNotice(msg) }
-            }
-
             if (loading && bots.isEmpty()) {
                 // 还没读完盘：先给一行骨架，别闪一下「还没有配置 bot」
                 item(key = "loading") {
@@ -204,7 +200,7 @@ fun BotsPage(
                     // 顺序很讲究：先写 localbots.json 的 enabled，再动进程。Python 侧按「启用中的
                     // bot 数」判断总模型要不要上岗，所以它必须在新状态落盘之后才收到 stop/start。
                     val onToggle: (Boolean) -> Unit = { on ->
-                        msg = if (on) "启动「" + b.title + "」" else "停「" + b.title + "」"
+                        AppToast.show(if (on) "启动「" + b.title + "」" else "停「" + b.title + "」")
                         scope.launch {
                             val note = withContext(Dispatchers.IO) {
                                 BotStore.setEnabled(ctx, b.appid, on)
@@ -214,7 +210,7 @@ fun BotsPage(
                             bots = withContext(Dispatchers.IO) { BotStore.load(ctx) }
                             // 立刻拉一次快照：状态从「已上线」变「未启动」不用等 2 秒轮询
                             pullSnapshot()
-                            msg = "手动启停 " + b.title + "：" + note
+                            AppToast.show("手动启停 " + b.title + "：" + note)
                         }
                     }
                     // 「编辑」= 进二级页做这个 bot 的详细配置（Route.BotEdit），不再复用添加弹层
@@ -224,7 +220,7 @@ fun BotsPage(
                     val onCancelDelete: () -> Unit = { confirmingId = "" }
                     val onConfirmDelete: () -> Unit = {
                         confirmingId = ""
-                        msg = "已删除 " + b.appid
+                        AppToast.show("已删除 " + b.appid)
                         scope.launch {
                             bots = withContext(Dispatchers.IO) {
                                 BotStore.remove(ctx, b.appid)
@@ -273,8 +269,10 @@ fun BotsPage(
                                                 // 用户想跑：清「停止全部」的停顿标记，自动拉回重新上岗
                                                 BotService.clearUserStopped(ctx)
                                                 scope.launch {
-                                                    msg = withContext(Dispatchers.Default) { BotHost.startAll(ctx) }
-                                                        .ifBlank { "没有启用的 bot" }
+                                                    AppToast.show(
+                                                        withContext(Dispatchers.Default) { BotHost.startAll(ctx) }
+                                                            .ifBlank { "没有启用的 bot" }
+                                                    )
                                                     pullSnapshot()
                                                 }
                                             },
@@ -287,7 +285,7 @@ fun BotsPage(
                                                 BotService.stopByUser(ctx)
                                                 BotHost.stopAll()
                                                 scope.launch { pullSnapshot() }
-                                                msg = "已停止"
+                                                AppToast.show("已停止")
                                             },
                                         )
                                     }
@@ -304,8 +302,10 @@ fun BotsPage(
                                         // 用户想跑：清「停止全部」的停顿标记，自动拉回重新上岗
                                         BotService.clearUserStopped(ctx)
                                         scope.launch {
-                                            msg = withContext(Dispatchers.Default) { BotHost.startAll(ctx) }
-                                                .ifBlank { "没有启用的 bot" }
+                                            AppToast.show(
+                                                withContext(Dispatchers.Default) { BotHost.startAll(ctx) }
+                                                    .ifBlank { "没有启用的 bot" }
+                                            )
                                             pullSnapshot()
                                         }
                                     },
@@ -318,7 +318,7 @@ fun BotsPage(
                                         BotService.stopByUser(ctx)
                                         BotHost.stopAll()
                                         scope.launch { pullSnapshot() }
-                                        msg = "已停止"
+                                        AppToast.show("已停止")
                                     },
                                 )
                             }

@@ -39,6 +39,7 @@ import com.wjljh.andbna.local.BotHost
 import com.wjljh.andbna.local.BotRestarts
 import com.wjljh.andbna.local.BotStore
 import com.wjljh.andbna.local.SecureStore
+import com.wjljh.andbna.ui.component.AppToast
 import com.wjljh.andbna.ui.component.PanelAnimatedNotice
 import com.wjljh.andbna.ui.component.PanelChip
 import com.wjljh.andbna.ui.component.PanelEllipsisField
@@ -194,11 +195,15 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
             0
         }
         error = ""
+        // 保存成功是一条「操作结果」，走全局提示条；页内 notice 只留给「还差一步」这类提示
+        notice = ""
         // 思考强度空串也存：等于「请求体不带该字段」，不是「没保存」
-        notice = "已保存 · 主模型 " + mainModel.trim().ifBlank { "deepseek-chat" } +
-            " · 窗口 " + contextWindow.trim().ifBlank { "131072" } +
-            (if (webOn) " · 联网开" else " · 联网关") +
-            if (restarted > 0) "，在重启 " + restarted + " 个 bot…" else ""
+        AppToast.show(
+            "已保存 · 主模型 " + mainModel.trim().ifBlank { "deepseek-chat" } +
+                " · 窗口 " + contextWindow.trim().ifBlank { "131072" } +
+                (if (webOn) " · 联网开" else " · 联网关") +
+                if (restarted > 0) "，在重启 " + restarted + " 个 bot…" else ""
+        )
     }
 
     /** 验证思考强度：用当前配置发一次最小请求（留空也照发，那就是平台默认行为）。 */

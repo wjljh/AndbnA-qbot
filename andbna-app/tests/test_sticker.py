@@ -27,6 +27,12 @@
  18) 被窗口 / 冷却拦下一律记「判定」级（简洁模式可见），不再静默
  19) 写了 <sticker> 却没发出去（id 不在候选 / 上传发送失败）→ 补一句「图上不去了」，
      并在下一轮 system 里留一句「上一轮表情没发出去」
+ 20) 频率语义：-1 = 模型判断（不做条数门槛，id 与冷却照旧）、0 = 不设门槛（日志区分二者）、
+     脏值回落 10；生效值每次写 detail 一行
+ 21) 冷却按分钟：cooldown_min=10 → 9 分钟仍拦、11 分钟放行；只有旧键 sticker_cooldown_h=2
+     → 120 分钟（两个都有以 cooldown_min 为准）
+ 22) 每 bot 覆盖 <botdir>/sticker_conf.json：优先全局；null / 缺键 / 非法值 / 非对象 → 跟随全局；
+     改完下一次回复就生效（mtime 缓存，不清缓存、不重启）
 """
 import asyncio
 import json
@@ -158,6 +164,10 @@ def reset():
     br._sticker_cmd_state["warned"].clear()
     br._sticker_lib_cache.clear()
     br._sticker_conf_cache.clear()
+    try:
+        os.remove(os.path.join(BOT, "sticker_conf.json"))
+    except OSError:
+        pass
     br._sticker_pending.set(None)
     br._send_seq.clear()
     br._dedup.clear()
@@ -811,6 +821,176 @@ def test_direct():
           "上一轮表情没发出去" not in MODEL["systems"][-1], MODEL["systems"][-1][-80:])
 
 
+# ── 22 · 频率 -1 / 0、分钟冷却、旧键兼容、每 bot 覆盖 ──────────────
+
+def write_bot_conf(obj):
+    return write_json(os.path.join(BOT, "sticker_conf.json"), obj)
+
+
+def rm_bot_conf():
+    try:
+        os.remove(os.path.join(BOT, "sticker_conf.json"))
+    except OSError:
+        pass
+
+
+def test_pace():
+    print("[22] 频率 -1 = 模型判断（不做条数门槛，id 与冷却照旧）")
+    reset()
+    write_llm(sticker_every_n=-1, sticker_cooldown_min=60)
+    lib10()
+    MODEL["out"] = "喏<sticker>s1</sticker>"
+    out, pend = reply("在吗")
+    check("22a 会话回复数才 1 条（旧的 10 条窗口没到）也照样放行",
+          out == "喏" and pend and pend["id"] == "s1", (out, pend))
+    check("22b detail 生效行：every_n=-1(模型判断) + 来源",
+          has("表情：生效 every_n=-1(模型判断) cooldown=60 分钟（来源：全局）"),
+          [x for x in logs() if "生效" in x])
+    MODEL["out"] = "再<sticker>s1</sticker>"
+    _out, pend2 = reply("在吗")
+    check("22c 冷却仍然生效：同一张图 60 分钟内再写也不发",
+          pend2 is None and has("表情：跳过 s1（同一张图冷却中，还要"),
+          [x for x in logs() if "冷却" in x])
+    MODEL["out"] = "哈<sticker>zzz</sticker>"
+    reply("在吗")
+    check("22d id 不在候选照样拦（-1 不等于关掉全部检查）",
+          has("错误 · 表情：id 不在候选里（zzz）"),
+          [x for x in logs() if "不在候选" in x])
+    reset()
+    write_llm(sticker_every_n=-1, sticker_cooldown_min=0)
+    lib10()
+    MODEL["out"] = "喏<sticker>s1</sticker>"
+    group_send(mid="mp1")
+    check("22e 发送行写「模型判断」，不再报条数",
+          len(imgs()) == 1 and has("表情：发送 s1（本群 模型判断）"),
+          [x for x in logs() if "表情：发送" in x])
+
+    print("[23] 频率 0 = 不设门槛（效果同 -1，日志要区分）+ 脏值回落")
+    reset()
+    write_llm(sticker_every_n=0, sticker_cooldown_min=0)
+    MODEL["out"] = "嗯<sticker>s1</sticker>"
+    _out, pend = reply("在吗")
+    check("23a 0 → 每轮都能发", bool(pend and pend["id"] == "s1"), pend)
+    check("23b 生效行写「0(不设门槛)」", has("表情：生效 every_n=0(不设门槛)"),
+          [x for x in logs() if "生效" in x])
+    reset()
+    write_llm(sticker_every_n=0, sticker_cooldown_min=0)
+    lib10()
+    MODEL["out"] = "嗯<sticker>s1</sticker>"
+    group_send(mid="mp2")
+    check("23c 发送行写「不设门槛」，不写「模型判断」",
+          len(imgs()) == 1 and has("表情：发送 s1（本群 不设门槛）") and not has("模型判断"),
+          [x for x in logs() if "表情：发送" in x])
+    reset()
+    write_llm(sticker_every_n="abc", sticker_cooldown_min=-5)
+    c = br._sticker_conf(BASE)
+    check("23d 脏值回落：every_n 认不出 → 10、cooldown_min 负数 → 1440",
+          (c["every_n"], c["cooldown_min"]) == (10, 1440), c)
+    reset()
+    write_llm()
+    c = br._sticker_conf(BASE)
+    check("23e 两个节奏键都缺 → 10 / 1440（旧的 24h 默认不变）",
+          (c["every_n"], c["cooldown_min"]) == (10, 1440), c)
+
+    print("[24] cooldown_min=10：窗口按分钟算（9 分钟仍拦、11 分钟才放行）")
+    reset()
+    write_llm(sticker_every_n=1, sticker_cooldown_min=10)
+    br._sticker_conf(BASE, BOT)
+    check("24a 生效行：cooldown=10 分钟",
+          has("表情：生效 every_n=1 cooldown=10 分钟（来源：全局）"),
+          [x for x in logs() if "生效" in x])
+    br._sticker_state["sent"][(BOT, "s1")] = br.time.time() - 9 * 60
+    left9 = br._sticker_cooldown_left(BOT, "s1")
+    check("24b 距上次 9 分钟 → 还剩约 1 分钟（10 分钟窗口没到）", 0.9 < left9 <= 1.05, left9)
+    br._sticker_state["sent"][(BOT, "s1")] = br.time.time() - 11 * 60
+    check("24c 距上次 11 分钟 → 窗口已过（剩 0）",
+          br._sticker_cooldown_left(BOT, "s1") == 0.0)
+    reset()
+    write_llm(sticker_every_n=1, sticker_cooldown_min=10)
+    br._sticker_state["sent"][(BOT, "s1")] = br.time.time() - 9 * 60
+    MODEL["out"] = "一<sticker>s1</sticker>"
+    _out, pend = reply("在吗")
+    check("24d 9 分钟前发过 → 这次拦住，日志按分钟写",
+          pend is None and has("表情：跳过 s1（同一张图冷却中，还要 1.0 分钟）"),
+          [x for x in logs() if "冷却" in x])
+    reset()
+    write_llm(sticker_every_n=1, sticker_cooldown_min=10)
+    br._sticker_state["sent"][(BOT, "s1")] = br.time.time() - 11 * 60
+    MODEL["out"] = "二<sticker>s1</sticker>"
+    _out2, pend2 = reply("在吗")
+    check("24e 11 分钟前发过 → 这次放行", bool(pend2 and pend2["id"] == "s1"), pend2)
+
+    print("[25] 旧键兼容：只有 sticker_cooldown_h → ×60 折成分钟")
+    reset()
+    write_llm(sticker_every_n=1, sticker_cooldown_h=2)
+    c = br._sticker_conf(BASE)
+    check("25a sticker_cooldown_h=2 → 120 分钟", c["cooldown_min"] == 120, c)
+    check("25b detail 日志：表情：冷却沿用旧键 2h → 120 分钟",
+          has("表情：冷却沿用旧键 2h → 120 分钟"), [x for x in logs() if "沿用" in x])
+    reset()
+    write_llm(sticker_cooldown_h=2, sticker_cooldown_min=30)
+    c = br._sticker_conf(BASE)
+    check("25c 两个键都有 → 以 cooldown_min 为准", c["cooldown_min"] == 30, c)
+    check("25d 这时不记旧键兼容行", not has("沿用旧键"),
+          [x for x in logs() if "沿用" in x])
+    reset()
+    write_llm(sticker_cooldown_h=24)
+    c = br._sticker_conf(BASE)
+    check("25e 缺 every_n → 10；旧键 24h → 1440 分钟",
+          (c["every_n"], c["cooldown_min"]) == (10, 1440), c)
+
+    print("[26] 每 bot 覆盖：<botdir>/sticker_conf.json（跟随全局 / 自定义）")
+    reset()
+    write_llm(sticker_every_n=10, sticker_cooldown_min=120)
+    c = br._sticker_conf(BASE, BOT)
+    check("26a 没有覆盖文件 → 用全局（来源：全局）",
+          (c["every_n"], c["cooldown_min"], c["src"]) == (10, 120, "全局"), c)
+    write_bot_conf({"every_n": -1, "cooldown_min": 30})
+    c = br._sticker_conf(BASE, BOT)          # 不清缓存：靠 mtime 失效
+    check("26b 覆盖优先于全局（-1 / 30 分钟，来源：bot 覆盖）",
+          (c["every_n"], c["cooldown_min"], c["src"]) == (-1, 30, "bot 覆盖"), c)
+    check("26c 生效行写「来源：bot 覆盖」",
+          has("表情：生效 every_n=-1(模型判断) cooldown=30 分钟（来源：bot 覆盖）"),
+          [x for x in logs() if "生效" in x])
+    write_bot_conf({"every_n": None, "cooldown_min": None})
+    c = br._sticker_conf(BASE, BOT)
+    check("26d 覆盖里 null → 跟随全局",
+          (c["every_n"], c["cooldown_min"], c["src"]) == (10, 120, "全局"), c)
+    write_bot_conf({"every_n": "many", "cooldown_min": []})
+    c = br._sticker_conf(BASE, BOT)
+    check("26e 覆盖里非法值 → 忽略并回落全局，不抛异常",
+          (c["every_n"], c["cooldown_min"], c["src"]) == (10, 120, "全局"), c)
+    write_bot_conf(["不是对象"])
+    c = br._sticker_conf(BASE, BOT)
+    check("26f 覆盖文件不是 JSON 对象 → 全程按全局",
+          (c["every_n"], c["cooldown_min"]) == (10, 120), c)
+    rm_bot_conf()
+    c = br._sticker_conf(BASE, BOT)
+    check("26g 删掉覆盖文件 → 立刻回到全局",
+          (c["every_n"], c["cooldown_min"], c["src"]) == (10, 120, "全局"), c)
+
+    reset()
+    write_llm(sticker_every_n=10, sticker_cooldown_min=0)
+    lib10()
+    write_bot_conf({"every_n": -1})
+    MODEL["out"] = "一<sticker>s1</sticker>"
+    _o1, p1 = reply("在吗")
+    check("26h 全局 10 条窗口被覆盖成 -1 → 第 1 条就发",
+          bool(p1 and p1["id"] == "s1"), p1)
+    reset()
+    write_llm(sticker_every_n=10, sticker_cooldown_min=0)
+    lib10()
+    MODEL["out"] = "二<sticker>s1</sticker>"
+    _o2, p2 = reply("在吗")
+    check("26i 没有覆盖时同一条被全局窗口拦住（对照组）", p2 is None, p2)
+    write_bot_conf({"every_n": 1})
+    MODEL["out"] = "三<sticker>s1</sticker>"
+    _o3, p3 = reply("在吗")
+    check("26j 改覆盖文件 → 下一次回复立刻按新值判定（mtime 缓存，不清缓存）",
+          bool(p3 and p3["id"] == "s1"), p3)
+    rm_bot_conf()
+
+
 def main():
     os.makedirs(BOT, exist_ok=True)
     with open(os.path.join(BOT, "persona.txt"), "w", encoding="utf-8") as f:
@@ -829,6 +1009,7 @@ def main():
     test_nl()
     test_only_image()
     test_direct()
+    test_pace()
 
     shutil.rmtree(TMP, ignore_errors=True)
     bad = [r for r in RESULTS if not r[1]]

@@ -1,10 +1,8 @@
 package com.wjljh.andbna.ui.screen.colorpalette
 
-import androidx.activity.compose.LocalActivity
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.staticCompositionLocalOf
 import androidx.compose.runtime.getValue
-import androidx.compose.ui.platform.LocalContext
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.compose.dropUnlessResumed
 import androidx.lifecycle.viewmodel.compose.viewModel
@@ -13,14 +11,11 @@ import com.materialkolor.dynamiccolor.ColorSpec
 import com.wjljh.andbna.ui.LocalUiMode
 import com.wjljh.andbna.ui.UiMode
 import com.wjljh.andbna.ui.theme.ColorMode
-import com.wjljh.andbna.ui.util.setEnableOnBackInvokedCallback
 import com.wjljh.andbna.ui.viewmodel.SettingsViewModel
 
 @Composable
 fun ColorPaletteScreen() {
     val pop = LocalPaletteBack.current
-    val context = LocalContext.current
-    val activity = LocalActivity.current
     val viewModel = viewModel<SettingsViewModel>()
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val currentPaletteStyle = try {
@@ -50,11 +45,9 @@ fun ColorPaletteScreen() {
         onSetEnableBlur = viewModel::setEnableBlur,
         onSetEnableFloatingBottomBar = viewModel::setEnableFloatingBottomBar,
         onSetEnableFloatingBottomBarBlur = viewModel::setEnableFloatingBottomBarBlur,
-        onSetEnablePredictiveBack = {
-            viewModel.setEnablePredictiveBack(it)
-            setEnableOnBackInvokedCallback(context.applicationInfo, it)
-            activity?.recreate()
-        },
+        // 只落盘：真正的开关效果由 App.kt / BotEditScreen.kt 里的 PredictiveBackGate 在运行时读
+        // 这个 pref 决定（改 ApplicationInfo 那条路在 targetSdk 36+ 被系统忽略，已删）
+        onSetEnablePredictiveBack = viewModel::setEnablePredictiveBack,
         onSetPageScale = viewModel::setPageScale,
     )
 

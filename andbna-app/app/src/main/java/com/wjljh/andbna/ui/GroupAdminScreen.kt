@@ -46,6 +46,7 @@ import com.wjljh.andbna.ui.component.PanelArrowRow
 import com.wjljh.andbna.ui.component.PanelEmptyState
 import com.wjljh.andbna.ui.component.PanelIconPillButton
 import com.wjljh.andbna.ui.component.PanelListRow
+import com.wjljh.andbna.ui.component.AppToast
 import com.wjljh.andbna.ui.component.PanelNotice
 import com.wjljh.andbna.ui.component.PanelPillRow
 import com.wjljh.andbna.ui.component.PanelPrimaryButton
@@ -255,7 +256,6 @@ private fun AdminRuleScreen(
     var baseline by remember(gid) { mutableStateOf<GroupAdmin.Rule?>(null) }
     var stats by remember(gid) { mutableStateOf<GroupAdmin.Stats?>(null) }
     var error by remember(gid) { mutableStateOf("") }
-    var saved by remember(gid) { mutableStateOf("") }
     // 「自定义禁言…」摊开输入框的是第几级（-1 = 没有）
     var customStep by remember(gid) { mutableStateOf(-1) }
 
@@ -279,7 +279,6 @@ private fun AdminRuleScreen(
 
     fun edit(next: GroupAdmin.Rule) {
         rule = next
-        saved = ""
         error = ""
     }
 
@@ -289,12 +288,11 @@ private fun AdminRuleScreen(
             val err = withContext(Dispatchers.IO) { GroupAdmin.save(ctx, appid, gid, conf) }
             if (err == null) {
                 baseline = conf
-                saved = "已保存"
                 error = ""
+                AppToast.show("已保存：group_admin/" + gid + ".json")
                 stats = withContext(Dispatchers.IO) { GroupAdmin.stats(ctx, appid, gid) }
             } else {
                 error = err
-                saved = ""
             }
         }
     }
@@ -494,9 +492,6 @@ private fun AdminRuleScreen(
 
         // 保存结果放最底下：点完「保存」人就在页面底部，提示必须在眼前
         if (error.isNotBlank()) PanelNotice(error, isError = true)
-        if (saved.isNotBlank()) {
-            PanelNotice(saved + "：group_admin/" + gid + ".json")
-        }
 
         Text(
             text = "权限不够时我会降级成「撤回 + 警告」，不是坏了",

@@ -25,6 +25,7 @@ import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material.icons.rounded.Backup
+import androidx.compose.material.icons.rounded.Image
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -53,16 +54,20 @@ import com.wjljh.andbna.local.BotStore.masterWordGuard
 import com.wjljh.andbna.local.BotStore.nameHitAsCall
 import com.wjljh.andbna.local.BotStore.replyDelayMaxMs
 import com.wjljh.andbna.local.BotStore.replyDelayMinMs
+import com.wjljh.andbna.local.BotStore.stickerCooldownMin
+import com.wjljh.andbna.local.BotStore.stickerEveryN
 import com.wjljh.andbna.local.ModeStore
 import com.wjljh.andbna.local.PullBack
 import com.wjljh.andbna.local.RunMode
 import com.wjljh.andbna.local.RunNotification
 import com.wjljh.andbna.local.SecureStore
+import com.wjljh.andbna.ui.component.AppToast
 import com.wjljh.andbna.ui.component.PanelAnimatedNotice
 import com.wjljh.andbna.ui.component.PanelConfirmDialog
 import com.wjljh.andbna.ui.component.PanelNotice
 import com.wjljh.andbna.ui.component.PanelSectionTitle
 import com.wjljh.andbna.ui.component.PanelTokens
+import com.wjljh.andbna.ui.component.StickerCoolDialog
 import com.wjljh.andbna.ui.component.material.SegmentedArrowItem
 import com.wjljh.andbna.ui.component.material.SegmentedContentItem
 import com.wjljh.andbna.ui.component.material.SegmentedDropdownItem
@@ -126,10 +131,13 @@ fun SettingsPage(
     // 这里留着不动 App 的调用点。
     // 「回复延迟 → 自定义…」：就地弹一格两行秒数的小面板（与「消息存档」同一个 WindowDialog 宿主）
     var showCustomDelay by remember { mutableStateOf(false) }
+    // 「同一张图的冷却 → 自定义…」：就地弹一格分钟数的小面板
+    var showCustomCool by remember { mutableStateOf(false) }
     val actions = SettingsActions(
         onReselectMode, onOpenLog, onOpenTheme, onOpenTexts, onOpenAbout, onOpenModelConfig,
         onReplayOnboarding,
         onCustomDelay = { showCustomDelay = true },
+        onCustomCool = { showCustomCool = true },
     )
 
     // 「备份与恢复」小面板：就地弹，不新开二级页（导出 / 导入都在面板里完成）
@@ -160,7 +168,7 @@ fun SettingsPage(
                     "导出没成：" + (e.message ?: e.javaClass.simpleName) + "。换个位置再存一次"
                 }
             }
-            vm.msg = line
+            AppToast.show(line)
         }
     }
 
@@ -197,6 +205,17 @@ fun SettingsPage(
             vm.applyCustomDelay(lo, hi)
         },
         onDismiss = { showCustomDelay = false },
+    )
+
+    // 冷却「自定义…」：填分钟数，落盘还是同一个 sticker_cooldown_min
+    StickerCoolDialog(
+        show = showCustomCool,
+        initial = vm.stickerCool,
+        onConfirm = { min ->
+            showCustomCool = false
+            vm.putStickerCool(min)
+        },
+        onDismiss = { showCustomCool = false },
     )
 
     ArchiveDialog(
@@ -236,11 +255,12 @@ private class SettingsActions(
     val onReplayOnboarding: () -> Unit,
     /** 「回复延迟」里选「自定义…」：由页面弹输入面板（数值回写走 SettingsVm.applyCustomDelay） */
     val onCustomDelay: () -> Unit = {},
+    /** 「同一张图的冷却」里选「自定义…」：由页面弹分钟数面板（数值回写走 SettingsVm.putStickerCool） */
+    val onCustomCool: () -> Unit = {},
 )
 
 /** 设置项的可变状态 + 落盘动作（两种结构共用同一份，切模式不会丢已填内容）。 */
 private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
-    var msg by mutableStateOf("")
     var judge by mutableStateOf(if (ReplyJudgeMode.read(ctx) == ReplyJudgeMode.RANDOM) 1 else 0)
     // 群里自动接话：默认关（群里只有 @ 才回）。与 BotStore.groupAutochat 同一个落盘键
     var autochat by mutableStateOf(SettingsPrefs.ui(ctx, "group_autochat").trim() == "1")
@@ -278,7 +298,7 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
         SettingsPrefs.put(ctx, "group_autochat", if (on) "1" else "0")
         scope.launch {
             withContext(Dispatchers.IO) { BotHost.setGroupAutochat(on) }
-            msg = if (on) "群里自动接话开了：它会自己判断要不要插话" else "群里自动接话关了：只有 @ 才回"
+            AppToast.show(if (on) "群里自动接话开了：它会自己判断要不要插话" else "群里自动接话关了：只有 @ 才回")
         }
     }
 
@@ -294,8 +314,10 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
         // 落盘同一个 reply_judge 键，并通知「模型配置 / Bot 编辑」两页立刻重组（不用重启）
         ReplyJudgeMode.set(ctx, if (index == 1) ReplyJudgeMode.RANDOM else ReplyJudgeMode.LLM)
         val n = if (changed) BotRestarts.requestAllEnabled(ctx, "设置保存") else 0
-        msg = "已切到「" + judgeOptions.getOrElse(index) { "" } + "」" +
-            if (n > 0) "，重启 " + n + " 个 bot 中…" else ""
+        AppToast.show(
+            "已切到「" + judgeOptions.getOrElse(index) { "" } + "」" +
+                if (n > 0) "，重启 " + n + " 个 bot 中…" else ""
+        )
     }
 
     // ── 回复判定-模型判断配置（1.0.8 从模型配置页最底下搬进「回复节奏」组）──
@@ -312,14 +334,65 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
         judgeLevel = wire
         ctx.llmJudgeLevel = wire
         BotStore.writeLlmJson(ctx)
-        msg = "主动程度改成「" + JudgeLabels.labelOf(wire) + "」了"
+        AppToast.show("主动程度改成「" + JudgeLabels.labelOf(wire) + "」了")
     }
 
     fun switchNameHit(on: Boolean) {
         nameHit = on
         ctx.nameHitAsCall = on
         BotStore.writeLlmJson(ctx)
-        msg = "名字命中就当被叫：" + if (on) "开了" else "关了"
+        AppToast.show("名字命中就当被叫：" + if (on) "开了" else "关了")
+    }
+
+    // ── 表情 / 图片库节奏（全局一档，所有 bot 共用 prefs 一份 + llm.json 一份）──
+    // 两个键与 Python 侧同名：sticker_every_n（-1 = 模型判断）/ sticker_cooldown_min（分钟）。
+    // Python 侧 _sticker_conf 按 mtime 现读，所以改完写文件即可，不用重启 bot。
+    var stickerEvery by mutableStateOf(ctx.stickerEveryN)
+    var stickerCool by mutableStateOf(ctx.stickerCooldownMin)
+
+    val stickerEveryLabels: List<String>
+        get() = BotStore.stickerEveryOptions.map { BotStore.stickerEveryLabel(it) }
+
+    /** 落盘值不在候选里（老配置）就落到默认那档 10，别让下拉显示错位。 */
+    val stickerEveryIndex: Int
+        get() = BotStore.stickerEveryOptions.indexOf(stickerEvery).takeIf { it >= 0 }
+            ?: BotStore.stickerEveryOptions.indexOf(10)
+
+    /** 「自定义…」在冷却列表里的下标：5 个预设之后。 */
+    val stickerCoolCustomIndex: Int get() = BotStore.stickerCooldownOptions.size
+
+    /** 冷却列表：5 个预设 + 「自定义…」（正在用自定义就把真实分钟数写进那一项）。 */
+    val stickerCoolLabels: List<String>
+        get() = BotStore.stickerCooldownOptions.map { BotStore.stickerCooldownLabel(it) } +
+            if (stickerCool in BotStore.stickerCooldownOptions) {
+                "自定义…"
+            } else {
+                "自定义 " + BotStore.stickerCooldownLabel(stickerCool)
+            }
+
+    val stickerCoolIndex: Int
+        get() = BotStore.stickerCooldownOptions.indexOf(stickerCool).takeIf { it >= 0 }
+            ?: stickerCoolCustomIndex
+
+    fun pickStickerEvery(index: Int) {
+        val v = BotStore.stickerEveryOptions.getOrNull(index) ?: return
+        stickerEvery = v
+        ctx.stickerEveryN = v
+        BotStore.writeLlmJson(ctx)
+        AppToast.show("发图频率：" + BotStore.stickerEveryLabel(v))
+    }
+
+    fun pickStickerCool(index: Int) {
+        BotStore.stickerCooldownOptions.getOrNull(index)?.let { putStickerCool(it) }
+    }
+
+    /** 自定义分钟数落地（夹到 1~10080）：prefs + llm.json，下一次回复就按新节奏。 */
+    fun putStickerCool(minutes: Int) {
+        val v = minutes.coerceIn(1, BotStore.STICKER_COOLDOWN_MAX)
+        stickerCool = v
+        ctx.stickerCooldownMin = v
+        BotStore.writeLlmJson(ctx)
+        AppToast.show("同一张图冷却：" + BotStore.stickerCooldownLabel(v))
     }
 
     // ── 每日上限：5 个预设 +「无上限」+「自定义…」（选自定义就地输入数字）──
@@ -401,14 +474,14 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
             val st = withContext(Dispatchers.IO) { BotHost.archiveStats(ctx) }
             archiveBytes = st.first
             archiveRows = st.second
-            msg = if (res.first <= 0) "存档本来就是空的" else "已清空 " + res.first + " 条"
+            AppToast.show(if (res.first <= 0) "存档本来就是空的" else "已清空 " + res.first + " 条")
         }
     }
 
     fun switchAutoStart(on: Boolean) {
         autoStart = on
         SettingsPrefs.put(ctx, "auto_start", if (on) "1" else "0")
-        msg = if (on) "开机自启开了" else "开机自启关了"
+        AppToast.show(if (on) "开机自启开了" else "开机自启关了")
     }
 
     /**
@@ -419,7 +492,7 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
         autoPull = on
         scope.launch {
             withContext(Dispatchers.IO) { PullBack.setAutoEnabled(ctx, on) }
-            msg = if (on) "自动拉回开了：看门狗上岗" else "自动拉回关了：看门狗退出"
+            AppToast.show(if (on) "自动拉回开了：看门狗上岗" else "自动拉回关了：看门狗退出")
         }
     }
 
@@ -474,7 +547,7 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
         block()
         scope.launch {
             withContext(Dispatchers.IO) { BotStore.writeLlmJson(ctx) }
-            msg = note
+            AppToast.show(note)
         }
     }
 
@@ -550,7 +623,7 @@ private class SettingsVm(val ctx: Context, val scope: CoroutineScope) {
     fun switchRunNotif(on: Boolean) {
         runNotif = on
         RunNotification.set(ctx, on)
-        msg = if (on) "运行通知：开" else "运行通知：关"
+        AppToast.show(if (on) "运行通知：开" else "运行通知：关")
     }
 
 }
@@ -572,10 +645,6 @@ private fun MiuixSettingsBody(
             .padding(horizontal = 12.dp),
         contentPadding = PaddingValues(top = 12.dp, bottom = bottomInset),
     ) {
-        item(key = "notice") {
-            PanelAnimatedNotice(visible = vm.msg.isNotBlank()) { PanelNotice(vm.msg) }
-        }
-
         // ① 外观：只剩「主题设置」（外观/语种两行已按需求删掉，不提供切换）
         item(key = "look") {
             SettingsMiuixGroup {
@@ -697,6 +766,29 @@ private fun MiuixSettingsBody(
                 }
             }
             JudgeConfigCardMiuix(vm)
+            // 表情 / 图片库的全局节奏：频率（含「模型判断」）+ 同一张图冷却（分钟制，可自定义）
+            SettingsGroupTitle(STICKER_CARD_TITLE)
+            SettingsMiuixGroup(topPadding = 0.dp) {
+                OverlayDropdownPreference(
+                    title = "自己发图的频率",
+                    summary = "隔几条回一张，模型也能自己挑",
+                    startAction = { SettingsRowIcon(Icons.Rounded.Image) },
+                    items = vm.stickerEveryLabels,
+                    selectedIndex = vm.stickerEveryIndex,
+                    onSelectedIndexChange = { vm.pickStickerEvery(it) },
+                )
+                OverlayDropdownPreference(
+                    title = "同一张图的冷却",
+                    summary = "同一张图多久内不重复发",
+                    startAction = { SettingsRowIcon(Icons.Filled.Speed) },
+                    items = vm.stickerCoolLabels,
+                    selectedIndex = vm.stickerCoolIndex,
+                    onSelectedIndexChange = { i ->
+                        // 最后一项是「自定义…」：不落盘，先弹分钟数面板
+                        if (i == vm.stickerCoolCustomIndex) actions.onCustomCool() else vm.pickStickerCool(i)
+                    },
+                )
+            }
             SettingsMiuixGroup {
                 SwitchPreference(
                     title = "非主人不称呼主人",
@@ -826,6 +918,9 @@ private const val JUDGE_CARD_TITLE = "回复判定-模型判断配置"
 
 /** 随机模式下卡里唯一的一行灰字。 */
 private const val JUDGE_CARD_RANDOM = "随机模式：模型判定配置不生效"
+
+/** 表情 / 图片库节奏那张卡的标题（两套结构共用一份文案，属于全局设置）。 */
+private const val STICKER_CARD_TITLE = "回复节奏 - 表情 / 图片库管理"
 
 /** 卡片底部的说明（原模型配置页那段，只把档位名换成 [JudgeLabels] 的叫法）。 */
 private const val JUDGE_CARD_NOTE =
@@ -959,14 +1054,6 @@ private fun MaterialSettingsBody(
         modifier = Modifier.fillMaxSize(),
         contentPadding = PaddingValues(top = 8.dp, bottom = bottomInset),
     ) {
-        item(key = "notice") {
-            PanelAnimatedNotice(visible = vm.msg.isNotBlank()) {
-                Column(Modifier.padding(horizontal = SegmentedMetrics.GroupHorizontal)) {
-                    PanelNotice(vm.msg)
-                }
-            }
-        }
-
         // ① 外观：只剩「主题设置」（外观/语种两行已按需求删掉，不提供切换）
         item(key = "look") {
             SegmentedGroup(modifier = settingsGroupPadding()) {
@@ -1105,6 +1192,32 @@ private fun MaterialSettingsBody(
                 }
             }
             JudgeConfigCardMaterial(vm)
+            // 表情 / 图片库的全局节奏：与 miuix 同一批文案，行换成 Segmented*Item
+            SettingsGroupTitle(STICKER_CARD_TITLE)
+            SegmentedGroup(modifier = settingsGroupPadding()) {
+                item {
+                    SegmentedDropdownItem(
+                        title = "自己发图的频率",
+                        summary = "隔几条回一张，模型也能自己挑",
+                        icon = Icons.Rounded.Image,
+                        items = vm.stickerEveryLabels,
+                        selectedIndex = vm.stickerEveryIndex,
+                        onSelectedIndexChange = { vm.pickStickerEvery(it) },
+                    )
+                }
+                item {
+                    SegmentedDropdownItem(
+                        title = "同一张图的冷却",
+                        summary = "同一张图多久内不重复发",
+                        icon = Icons.Filled.Speed,
+                        items = vm.stickerCoolLabels,
+                        selectedIndex = vm.stickerCoolIndex,
+                        onSelectedIndexChange = { i ->
+                            if (i == vm.stickerCoolCustomIndex) actions.onCustomCool() else vm.pickStickerCool(i)
+                        },
+                    )
+                }
+            }
             SegmentedGroup(modifier = settingsGroupPadding()) {
                 item {
                     SegmentedSwitchItem(

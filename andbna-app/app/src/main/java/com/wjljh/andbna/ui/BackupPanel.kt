@@ -16,6 +16,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.LocalContext
 import com.wjljh.andbna.local.BackupIO
+import com.wjljh.andbna.ui.component.AppToast
 import com.wjljh.andbna.ui.component.PanelMetrics
 import com.wjljh.andbna.ui.component.PanelTokens
 import kotlinx.coroutines.Dispatchers
@@ -56,7 +57,10 @@ fun BackupPanel(show: Boolean, onDismiss: () -> Unit) {
             plan = null
             summary = ""
             askReplace = false
-            msg = r.text
+            // 结果交给全局提示条：面板先关，条浮在底栏上方，看得见
+            msg = ""
+            onDismiss()
+            AppToast.show(r.text)
         }
     }
 
@@ -72,7 +76,9 @@ fun BackupPanel(show: Boolean, onDismiss: () -> Unit) {
             busy = true
             val r = withContext(Dispatchers.IO) { BackupIO.exportTo(ctx, uri) }
             busy = false
-            msg = r.text
+            msg = ""
+            onDismiss()
+            AppToast.show(r.text)
         }
     }
 
@@ -94,7 +100,9 @@ fun BackupPanel(show: Boolean, onDismiss: () -> Unit) {
                 askReplace = false
                 msg = ""
             } else {
-                msg = "没导进来：" + c.error + "，现有数据没动"
+                msg = ""
+                onDismiss()
+                AppToast.show("没导进来：" + c.error + "，现有数据没动")
             }
         }
     }

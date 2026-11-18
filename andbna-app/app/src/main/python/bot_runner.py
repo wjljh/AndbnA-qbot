@@ -6673,8 +6673,8 @@ def _is_msgseq_dup(err):
 # 发送是两跳：先上传拿 file_info（每次发送前即时上传，file_info 有时效，绝不缓存复用），
 # 再发 msg_type=7 的富媒体消息。两跳都走 botpy 的 http 客户端，token 由它维护，这里不自己取。
 _STICKER_MAX = 5 * 1024 * 1024      # 单张上限 5MB（与 Kotlin 侧导入校验同一口径）
-_STICKER_EVERY_N = 10               # 每个会话每 N 条回复最多 1 张
-_STICKER_COOLDOWN_H = 24            # 同一张图冷却小时数（防刷屏）
+_STICKER_EVERY_N = 10               # 每个会话每 N 条回复最多 1 张（-1 = 模型判断，0 = 不设门槛）
+_STICKER_COOLDOWN_MIN = 24 * 60     # 同一张图冷却分钟数（防刷屏）
 _STICKER_SHOW_MAX = 60              # 候选条目上限（库再大也别把提示词撑爆）
 _STICKER_DESC_MAX = 40              # 单条描述进候选时的字数上限
 _STICKER_LINE_SHOW = 6              # 常驻行里列几张（前 6 张 id + 描述）
@@ -6697,7 +6697,7 @@ _STICKER_LOST_FACT = "上一轮表情没发出去（%s）。这一轮不要说�
 _STICKER_CMD_GAP_S = 300            # 非主人：#表情 同一会话同一个人 5 分钟最多 1 次
 _STICKER_CMD_BUSY = "歇会儿，5 分钟后再来"
 _sticker_lib_cache = {}             # library.json 路径 -> ((mtime_ns, size), [item])
-_sticker_conf_cache = {}            # llm.json 路径 -> ((mtime_ns, size), conf)
+_sticker_conf_cache = {}            # (llm.json, sticker_conf.json) -> (两文件的 stamp, conf)
 _sticker_lock = threading.Lock()
 _sticker_state = {"replies": {}, "sent": {}, "fail": {}}
 # replies=本窗口回复条数；sent=冷却打点；fail=上一轮写了标记却没发出去的会话（只留一轮）
@@ -6756,40 +6756,102 @@ def _sticker_library(botdir):
     return items
 
 
-def _sticker_conf(base):
-    """llm.json 里的三个表情键：enabled（缺省开）/ every_n（10）/ cooldown_h（24）。
+def _sticker_stamp(path):
+    """文件的 (mtime_ns, size)；读不到（没这个文件 / 空路径）→ None。"""
+    try:
+        st = os.stat(path)
+    except OSError:
+        return None
+    return (st.st_mtime_ns, st.st_size)
 
-    和 _log_level 同款吃 mtime 缓存：改配置下一次回复就生效，不用重启。
+
+def _sticker_int(v):
+    """键值 → int；缺键 / null / 脏值 / 布尔 → None（由调用方各自回落默认档）。"""
+    if v is None or isinstance(v, bool):
+        return None
+    try:
+        return int(v)
+    except (TypeError, ValueError):
+        return None
+
+
+def _sticker_every_of(v):
+    """every_n 的合法值：-1 模型判断 / 0 不设门槛 / N≥1 每 N 条一张；其余 → None。"""
+    n = _sticker_int(v)
+    return n if n is not None and n >= -1 else None
+
+
+def _sticker_cool_of(v):
+    """cooldown_min 的合法值：≥0 的整数分钟；其余 → None。"""
+    n = _sticker_int(v)
+    return n if n is not None and n >= 0 else None
+
+
+def _sticker_every_say(every):
+    """日志里怎么写这个频率：光看「-1」认不出是模型判断。"""
+    every = int(every)
+    if every < 0:
+        return "%d(模型判断)" % every
+    if every == 0:
+        return "0(不设门槛)"
+    return str(every)
+
+
+def _sticker_conf(base, botdir=None):
+    """表情节奏：全局 llm.json 打底，<botdir>/sticker_conf.json 覆盖（缺键 / null = 跟随全局）。
+
+    键：enabled（只管全局，缺省开）/ every_n（缺省 10；-1 模型判断，0 不设门槛）
+        / cooldown_min（缺省 1440；只有旧键 sticker_cooldown_h 时按 ×60 折成分钟）。
+    两个文件都吃 mtime + size 缓存：改完下一次回复就生效，不用重启。
+    → {enabled, every_n, cooldown_min, src}，src ∈ ("全局", "bot 覆盖")。
     """
     base = str(base if base is not None else (_base_dir or ""))
     path = os.path.join(base, "llm.json") if base else ""
-    try:
-        st = os.stat(path)
-        stamp = (st.st_mtime_ns, st.st_size)
-    except OSError:
-        stamp = None
+    ov = os.path.join(str(botdir or ""), "sticker_conf.json") if botdir else ""
+    key = (path, ov)
+    stamp = (_sticker_stamp(path), _sticker_stamp(ov))
     with _sticker_lock:
-        hit = _sticker_conf_cache.get(path)
+        hit = _sticker_conf_cache.get(key)
         if hit and hit[0] == stamp:
             return hit[1]
-    raw = _load_json(path, {}) if stamp is not None else {}
+    raw = _load_json(path, {}) if stamp[0] is not None else {}
     if not isinstance(raw, dict):
         raw = {}
     on = raw.get("sticker_enabled")
     on = True if on is None else bool(on)      # 没这个键 = 默认允许
-    try:
-        every = int(_STICKER_EVERY_N if raw.get("sticker_every_n") is None
-                    else raw.get("sticker_every_n"))
-    except (TypeError, ValueError):
+    every = _sticker_every_of(raw.get("sticker_every_n"))
+    if every is None:                          # 缺键 / 脏值 → 10
         every = _STICKER_EVERY_N
-    try:
-        cool = float(_STICKER_COOLDOWN_H if raw.get("sticker_cooldown_h") is None
-                     else raw.get("sticker_cooldown_h"))
-    except (TypeError, ValueError):
-        cool = _STICKER_COOLDOWN_H
-    conf = {"enabled": on, "every_n": max(1, every), "cooldown_h": max(0.0, cool)}
+    cool = _sticker_cool_of(raw.get("sticker_cooldown_min"))
+    note = ""
+    if cool is None:                           # 没有（或读不懂）新键 → 看旧键
+        old = raw.get("sticker_cooldown_h")
+        try:
+            hours = None if old is None else float(old)
+        except (TypeError, ValueError):
+            hours = None
+        if hours is None:
+            cool = _STICKER_COOLDOWN_MIN
+        else:
+            cool = max(0, int(round(hours * 60)))
+            note = "表情：冷却沿用旧键 %sh → %s 分钟" % ("%g" % max(0.0, hours), cool)
+    src = "全局"
+    if stamp[1] is not None:                   # bot 覆盖：只认 every_n / cooldown_min
+        oraw = _load_json(ov, {})
+        if isinstance(oraw, dict):
+            o_every = _sticker_every_of(oraw.get("every_n"))
+            o_cool = _sticker_cool_of(oraw.get("cooldown_min"))
+            if o_every is not None:            # 缺键 / null / 脏值 → 跟随全局
+                every, src = o_every, "bot 覆盖"
+            if o_cool is not None:
+                cool, src = o_cool, "bot 覆盖"
+    conf = {"enabled": on, "every_n": every, "cooldown_min": cool, "src": src}
     with _sticker_lock:
-        _sticker_conf_cache[path] = (stamp, conf)
+        _sticker_conf_cache[key] = (stamp, conf)
+    if note:                                   # 只在重读配置时记一次，不跟着每条回复刷
+        log(note, cat="系统", lv="detail")
+    log("表情：生效 every_n=%s cooldown=%s 分钟（来源：%s）"
+        % (_sticker_every_say(every), cool, src), cat="系统", lv="detail")
     return conf
 
 
@@ -6836,12 +6898,12 @@ def _sticker_bump(key):
 
 
 def _sticker_cooldown_left(botdir, sid):
-    """同一张图还要等多少小时（0 = 现在就能发）。按 bot 算，不分群/私聊。"""
+    """同一张图还要等多少分钟（0 = 现在就能发）。按 bot 算，不分群/私聊。"""
     hit = _sticker_state["sent"].get((str(botdir or ""), str(sid or "")))
     if not hit:
         return 0.0
-    window = float(_sticker_conf(_base_dir)["cooldown_h"]) * 3600.0
-    return max(0.0, window - (time.time() - hit)) / 3600.0
+    window = float(_sticker_conf(_base_dir, botdir)["cooldown_min"]) * 60.0
+    return max(0.0, window - (time.time() - hit)) / 60.0
 
 
 def _sticker_pick(appid, botdir, key, sid, direct=False):
@@ -6849,38 +6911,39 @@ def _sticker_pick(appid, botdir, key, sid, direct=False):
 
     direct=True（用户点名要图：私聊 / 群里 @ 了本 bot / 叫了名字）时**跳过窗口与冷却**，
     只要求 id 在候选 —— 用户开口了还按「每 N 条一张」拦，就变成「它答应了却没发」。
-    其它情形（总模型自动接话、bot 之间续聊）照旧受限。
+    其它情形（总模型自动接话、bot 之间续聊）照旧受限；every_n ≤ 0（模型判断 / 不设门槛）
+    时没有窗口这一关，id 与冷却照旧。
     放行时当场记账（窗口清零 + 冷却打点），发送失败由 _sticker_unmark 回滚冷却。
     → (条目, 没发的理由)；理由："" 放行 / off 开关关或空 id / id 不在候选 / window / cool。
     """
     sid = str(sid or "").strip()
-    conf = _sticker_conf(_base_dir)
+    conf = _sticker_conf(_base_dir, botdir)
     if not conf["enabled"] or not sid:
         return None, "off"
     item = next((x for x in _sticker_library(botdir) if x["id"] == sid), None)
     if item is None:
         log("表情：id 不在候选里（%s）" % sid, appid, cat="错误")
         return None, "id"
-    every = int(conf["every_n"])
+    every = int(conf["every_n"])               # ≤0 = 不做条数门槛
     n = int(_sticker_state["replies"].get(str(key or ""), 0))
     left = _sticker_cooldown_left(botdir, sid)
     if direct:
         blocked = []
-        if n < every:
+        if every > 0 and n < every:
             blocked.append("窗口 %d/%d" % (n, every))
         if left > 0:
-            blocked.append("冷却 %.1f 小时" % left)
+            blocked.append("冷却 %.1f 分钟" % left)
         _sticker_note_sent(botdir, key, sid)
         if blocked:
             log("表情：用户点名 → 直接放行 %s（跳过%s）" % (sid, "、".join(blocked)),
                 appid, cat="判定")
         return item, ""
-    if n < every:
+    if every > 0 and n < every:
         # 判定级：简洁模式下也得看得见「它这次为什么没发图」，否则就是无声地食言
         log("表情：跳过 %s（窗口 %d/%d 未到）" % (sid, n, every), appid, cat="判定")
         return None, "window"
     if left > 0:
-        log("表情：跳过 %s（同一张图冷却中，还要 %.1f 小时）" % (sid, left),
+        log("表情：跳过 %s（同一张图冷却中，还要 %.1f 分钟）" % (sid, left),
             appid, cat="判定")
         return None, "cool"
     _sticker_note_sent(botdir, key, sid)
@@ -7046,8 +7109,10 @@ async def _sticker_send(appid, api, botdir, key, item, mid="", only_image=False)
         log("表情：只发图（命令/自然语言）｜%s" % sid, appid, cat="回复")
         return True
     where = "本群" if key[:1] == "g" else "本会话"
-    log("表情：发送 %s（%s %d 条内第 1 张）" % (sid, where, _sticker_conf(_base_dir)["every_n"]),
-        appid, cat="回复")
+    every = int(_sticker_conf(_base_dir, botdir)["every_n"])
+    pace = ("%d 条内第 1 张" % every if every > 0
+            else ("模型判断" if every < 0 else "不设门槛"))
+    log("表情：发送 %s（%s %s）" % (sid, where, pace), appid, cat="回复")
     return True
 
 
@@ -7055,7 +7120,7 @@ async def _sticker_send(appid, api, botdir, key, item, mid="", only_image=False)
 #
 # 开关 sticker_enabled 管的是「模型自己发」，不管「用户让它发」：
 # 关掉开关命令照样能用（库是空的时候才没法发）。命令也不受
-# sticker_every_n / sticker_cooldown_h 限制 —— 可是发出去的那一张照样记账，
+# sticker_every_n / sticker_cooldown_min 限制 —— 可是发出去的那一张照样记账，
 # 免得紧接着模型又自动补一张重复的。
 _STICKER_CMD_RE = re.compile(r"^#\s*(表情列表|表情库|发表情|表情)\s*(.*)$")
 
