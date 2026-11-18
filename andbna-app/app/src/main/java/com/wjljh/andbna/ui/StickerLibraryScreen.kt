@@ -50,7 +50,9 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.wjljh.andbna.local.BotStore
+import com.wjljh.andbna.local.BotStore.stickerCooldownH
 import com.wjljh.andbna.local.BotStore.stickerEnabled
+import com.wjljh.andbna.local.BotStore.stickerEveryN
 import com.wjljh.andbna.local.StickerStore
 import com.wjljh.andbna.ui.component.BotFormField
 import com.wjljh.andbna.ui.component.BotFormSection
@@ -65,12 +67,14 @@ import com.wjljh.andbna.ui.component.PanelPrimaryButton
 import com.wjljh.andbna.ui.component.PanelSecondaryButton
 import com.wjljh.andbna.ui.component.PanelTokens
 import com.wjljh.andbna.ui.component.SecondaryTopBar
+import com.wjljh.andbna.ui.component.material.SegmentedDropdownItem
 import com.wjljh.andbna.ui.component.modeClickable
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 import top.yukonga.miuix.kmp.window.WindowDialog
 
@@ -95,6 +99,9 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
 
     var items by remember(appid) { mutableStateOf<List<StickerStore.Item>>(emptyList()) }
     var enabled by remember(appid) { mutableStateOf(true) }
+    // 发图节奏两行下拉的当前值（缺键 / 脏值由 BotStore 回落 10 / 24）
+    var everyN by remember(appid) { mutableStateOf(10) }
+    var cooldownH by remember(appid) { mutableStateOf(24) }
     var msg by remember(appid) { mutableStateOf("") }
     // 编辑框：showEdit 单独一个状态，关的时候先把 show 收起来、条目还留着，才有退出动画
     var editing by remember(appid) { mutableStateOf<StickerStore.Item?>(null) }
@@ -105,11 +112,15 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
     val thumbs = remember(appid) { mutableStateMapOf<String, ImageBitmap>() }
 
     LaunchedEffect(appid) {
-        val (list, on) = withContext(Dispatchers.IO) {
-            StickerStore.load(ctx, appid) to ctx.stickerEnabled
+        // 一次 IO 里把库和三个配置值都读出来（prefs 已缓存在内存里，这里只是别切线程）
+        val (list, conf) = withContext(Dispatchers.IO) {
+            StickerStore.load(ctx, appid) to
+                Triple(ctx.stickerEnabled, ctx.stickerEveryN, ctx.stickerCooldownH)
         }
         items = list
-        enabled = on
+        enabled = conf.first
+        everyN = conf.second
+        cooldownH = conf.third
     }
 
     // 只给「还没有缓存」的条目补缩略图（在 IO 里解码，一次补齐）
@@ -135,6 +146,20 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
                 BotStore.writeLlmJson(ctx)
             }
             msg = if (on) "已允许 bot 自己发表情" else "已关闭：一条都不发，库还留着"
+        }
+    }
+
+    /** 两个下拉：prefs + llm.json 各一份，Python 侧按 mtime 现读 —— 下一次回复就按新节奏走。 */
+    fun switchRhythm(nextEveryN: Int, nextCooldownH: Int) {
+        everyN = nextEveryN
+        cooldownH = nextCooldownH
+        scope.launch {
+            withContext(Dispatchers.IO) {
+                ctx.stickerEveryN = nextEveryN
+                ctx.stickerCooldownH = nextCooldownH
+                BotStore.writeLlmJson(ctx)
+            }
+            msg = "已保存，下一次回复就按新节奏"
         }
     }
 
@@ -179,6 +204,25 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
                         summary = if (enabled) "开着 · 它会偶尔挑一张发" else "关着 · 一条都不发，图还留着",
                         checked = enabled,
                         onCheckedChange = { switchEnabled(it) },
+                    )
+                    Spacer(Modifier.height(PanelTokens.ContentGap))
+                    StickerRhythmRow(
+                        title = "自己发图的频率",
+                        summary = "同一个会话里，隔几条回复才让它自己发一张",
+                        items = BotStore.stickerEveryOptions.map { everyLabel(it) },
+                        selectedIndex = BotStore.stickerEveryOptions.indexOf(everyN),
+                        onSelectedIndexChange = { i ->
+                            switchRhythm(BotStore.stickerEveryOptions.getOrElse(i) { everyN }, cooldownH)
+                        },
+                    )
+                    StickerRhythmRow(
+                        title = "同一张图的冷却",
+                        summary = "同一张图多久内不重复发",
+                        items = BotStore.stickerCooldownOptions.map { cooldownLabel(it) },
+                        selectedIndex = BotStore.stickerCooldownOptions.indexOf(cooldownH),
+                        onSelectedIndexChange = { i ->
+                            switchRhythm(everyN, BotStore.stickerCooldownOptions.getOrElse(i) { cooldownH })
+                        },
                     )
                     Spacer(Modifier.height(PanelTokens.ContentGap))
                     Text(
@@ -328,6 +372,44 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
 
 /** 右下角导入按钮占掉的高度：正文最后留这么多，免得末行被按钮压住。 */
 private val ImportClearance: Dp = 72.dp
+
+/** 频率下拉文案：值就是落盘值（sticker_every_n），默认档标一下。 */
+private fun everyLabel(n: Int): String = "每 " + n + " 条" + if (n == 10) "（默认）" else ""
+
+/** 冷却下拉文案：值就是落盘值（sticker_cooldown_h）。 */
+private fun cooldownLabel(h: Int): String = h.toString() + " 小时" + if (h == 24) "（默认）" else ""
+
+/**
+ * 一行下拉：两个模式共用同一份内容 —— miuix 走 kit 原生 [OverlayDropdownPreference]，
+ * material 走 [SegmentedDropdownItem]（点开 DropdownMenu）。不要换成一行按钮。
+ */
+@Composable
+private fun StickerRhythmRow(
+    title: String,
+    summary: String,
+    items: List<String>,
+    selectedIndex: Int,
+    onSelectedIndexChange: (Int) -> Unit,
+) {
+    if (LocalUiMode.current == UiMode.Material) {
+        SegmentedDropdownItem(
+            title = title,
+            summary = summary,
+            items = items,
+            selectedIndex = selectedIndex.coerceAtLeast(0),
+            onSelectedIndexChange = onSelectedIndexChange,
+        )
+    } else {
+        OverlayDropdownPreference(
+            insideMargin = PanelTokens.PrefInside,
+            title = title,
+            summary = summary,
+            items = items,
+            selectedIndex = selectedIndex.coerceAtLeast(0),
+            onSelectedIndexChange = onSelectedIndexChange,
+        )
+    }
+}
 
 /** 网格里的一格：缩略图（方图）+ 描述首行 + 标签；描述空着就盖一条「待补充描述」角标。 */
 @Composable

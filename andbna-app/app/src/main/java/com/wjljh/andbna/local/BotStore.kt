@@ -436,6 +436,37 @@ object BotStore {
             sp(this).edit().putString("sticker_enabled", if (v) "1" else "0").apply()
         }
 
+    /** 自己发图频率的候选值：落盘就是这几个数（llm.json 的 sticker_every_n）。 */
+    val stickerEveryOptions: IntArray = intArrayOf(3, 5, 10, 20, 50)
+
+    /** 同一张图冷却小时的候选值（llm.json 的 sticker_cooldown_h）。 */
+    val stickerCooldownOptions: IntArray = intArrayOf(1, 6, 12, 24, 48)
+
+    /**
+     * 隔几条回复才允许 bot 自己发一张（默认 10）。
+     *
+     * 缺键 / 脏值 / 不在候选里一律回落 10：界面下拉按候选表定位当前值，认不出的值会让行尾显示错位。
+     * prefs 存一份给界面读，llm.json 里再写一份 int（Python 侧 _sticker_conf 按 mtime 现读，改完下一次回复就生效）。
+     */
+    var Context.stickerEveryN: Int
+        get() = sp(this).getString("sticker_every_n", "").orEmpty().trim().toIntOrNull()
+            ?.takeIf { it in stickerEveryOptions } ?: 10
+        set(v) {
+            sp(this).edit().putString("sticker_every_n", v.toString()).apply()
+        }
+
+    /**
+     * 同一张图多少小时内不重复发（默认 24）。
+     *
+     * 与 [stickerEveryN] 同一套写法：缺键 / 脏值 / 不在候选里一律回落 24。
+     */
+    var Context.stickerCooldownH: Int
+        get() = sp(this).getString("sticker_cooldown_h", "").orEmpty().trim().toIntOrNull()
+            ?.takeIf { it in stickerCooldownOptions } ?: 24
+        set(v) {
+            sp(this).edit().putString("sticker_cooldown_h", v.toString()).apply()
+        }
+
     /**
      * 日志详细程度：simple（简洁，默认）/ detail（详细）。
      *
@@ -541,6 +572,9 @@ object BotStore {
             .put("master_word_guard", ctx.masterWordGuard)
             // 允许 bot 自己发表情（默认 true）：图片库本身在 <botdir>/stickers/
             .put("sticker_enabled", ctx.stickerEnabled)
+            // 发图节奏（int）：隔几条回复发一张 / 同一张图冷却多少小时
+            .put("sticker_every_n", ctx.stickerEveryN)
+            .put("sticker_cooldown_h", ctx.stickerCooldownH)
             // 全局每日上限：群配置「跟随全局」时 Python 侧读这一档（0 = 无上限）
             .put("daily_limit", ctx.dailyLimit)
             // 日志详细程度（simple / detail）：Python 写日志时按它决定是否带细节
