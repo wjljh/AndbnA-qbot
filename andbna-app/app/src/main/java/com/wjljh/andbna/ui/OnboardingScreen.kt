@@ -199,8 +199,30 @@ private class ProbeResult(
     val hint: String = "",
 )
 
-/** 引导的每一步都是一条路由：下一步 push、上一步（含侧滑）pop。 */
-private data class OnboardStep(val index: Int) : NavKey
+/**
+ * 引导的每一步各是一条**类型独立**的路由：下一步 push、上一步（含侧滑）pop。
+ *
+ * 不能用「一个类型 + 不同参数」装 6 步：库按 entry 类型铺内容，同类型在栈里出现两条时
+ * 会同时绘制（第 2 步起与第 1 步叠字）。所以 6 步各自一个 object。
+ */
+private sealed interface OnboardStep : NavKey {
+    data object Welcome : OnboardStep
+    data object AtRule : OnboardStep
+    data object KeepAlive : OnboardStep
+    data object Probe : OnboardStep
+    data object Model : OnboardStep
+    data object Done : OnboardStep
+}
+
+/** 步序 → 路由：下标就是进度条与「第 N / 6 步」用的步号 */
+private val ONBOARD_STEPS: List<OnboardStep> = listOf(
+    OnboardStep.Welcome,
+    OnboardStep.AtRule,
+    OnboardStep.KeepAlive,
+    OnboardStep.Probe,
+    OnboardStep.Model,
+    OnboardStep.Done,
+)
 
 @Composable
 fun OnboardingScreen(onFinish: () -> Unit) {
@@ -210,8 +232,8 @@ fun OnboardingScreen(onFinish: () -> Unit) {
 
     // 6 步走本层自己的 NavDisplay 栈：与 App 层二级页同一条通道（整屏滑入 + 下层视差 + 跟手预览）。
     // 以前是就地 AnimatedContent 切 Int，那层切法拿不到 entry 级返回分发，侧滑没有预览。
-    val stepStack = remember { navBackStackOf(OnboardStep(0)) }
-    val step = (stepStack.lastOrNull() as? OnboardStep)?.index ?: 0
+    val stepStack = remember { navBackStackOf(ONBOARD_STEPS[0]) }
+    val step = ONBOARD_STEPS.indexOfFirst { it === stepStack.lastOrNull() }.coerceAtLeast(0)
     fun popStep() { if (stepStack.size > 1) stepStack.removeLastOrNull() }
     // 第 ③ 步选的方式：默认取已落盘的值（没有就按 root 探测结果，与 ModeStore.initial 一致）
     var mode by remember { mutableStateOf(ModeStore.get(ctx) ?: ModeStore.initial(ctx)) }
@@ -303,7 +325,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
 
     fun next() {
         if (step == 4) vm.save(ctx)
-        if (step < STEPS - 1) stepStack.add(OnboardStep(step + 1)) else onFinish()
+        if (step < STEPS - 1) stepStack.add(ONBOARD_STEPS[step + 1]) else onFinish()
     }
 
     // 第 ② 步（@ 规则）这页没别的动作，底部那颗主按钮就直接说「知道了」，点了照常下一页
@@ -351,21 +373,18 @@ fun OnboardingScreen(onFinish: () -> Unit) {
             // 第一步再返回没有上一层可预览：等同于「跳过引导」，与顶栏那颗跳过同一条路
             onBack = { if (stepStack.size > 1) popStep() else onFinish() },
         ) {
-        entry<OnboardStep>(swipeDismiss = NavSwipeDirection.LeftToRight) { route ->
+        entry<OnboardStep.Welcome>(swipeDismiss = NavSwipeDirection.LeftToRight) {
             PredictiveBackGate(canPop = stepStack.size > 1) { popStep() }
-            val s = route.index
-            Column(
-                modifier = Modifier
-                    .fillMaxSize()
-                    .verticalScroll(rememberScrollState())
-                    .padding(horizontal = PanelTokens.PageHorizontal)
-                    .padding(bottom = PanelTokens.BottomBarSafetyGap),
-                verticalArrangement = Arrangement.spacedBy(PanelTokens.CardSpacing),
-            ) {
-                when (s) {
-                    0 -> WelcomeStep()
-                    1 -> AtRuleStep()
-                    2 -> ModeStep(current = mode, notice = modeNotice) { picked ->
+            OnboardStepFrame { WelcomeStep() }
+        }
+        entry<OnboardStep.AtRule>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+            PredictiveBackGate(canPop = stepStack.size > 1) { popStep() }
+            OnboardStepFrame { AtRuleStep() }
+        }
+        entry<OnboardStep.KeepAlive>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+            PredictiveBackGate(canPop = stepStack.size > 1) { popStep() }
+            OnboardStepFrame {
+                    ModeStep(current = mode, notice = modeNotice) { picked ->
                         probe = ProbeResult()
                         // ADB 只是「打算用」：模式要不要真落盘由第 ④ 步的 ShizukuShell.switchToAdb
                         // 决定（授权 + 绑定都成功才写），这里写了就是没权限也自称 ADB 的半死状态
@@ -379,7 +398,12 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                             modeNotice = ""
                         }
                     }
-                    3 -> ProbeStep(
+            }
+        }
+        entry<OnboardStep.Probe>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+            PredictiveBackGate(canPop = stepStack.size > 1) { popStep() }
+            OnboardStepFrame {
+                    ProbeStep(
                         mode = mode,
                         probe = probe,
                         detecting = detecting,
@@ -397,19 +421,43 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                         },
                         onOpenNotifSettings = { openNotifSettings(ctx) },
                     )
-                    4 -> ModelStep(
+            }
+        }
+        entry<OnboardStep.Model>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+            PredictiveBackGate(canPop = stepStack.size > 1) { popStep() }
+            OnboardStepFrame {
+                    ModelStep(
                         metrics = metrics,
                         vm = vm,
                         scope = scope,
-                        onSkip = { stepStack.add(OnboardStep(STEPS - 1)) },
+                        onSkip = { stepStack.add(ONBOARD_STEPS[STEPS - 1]) },
                     )
-                    else -> DoneStep(mode = mode, probe = probe, modelConfigured = vm.configured)
-                }
+            }
+        }
+        entry<OnboardStep.Done>(swipeDismiss = NavSwipeDirection.LeftToRight) {
+            PredictiveBackGate(canPop = stepStack.size > 1) { popStep() }
+            OnboardStepFrame {
+                    DoneStep(mode = mode, probe = probe, modelConfigured = vm.configured)
             }
         }
         }
         }
     }
+}
+
+/** 每步的滚动容器：不透明底 + 填满，保证同一时刻只看得到当前这一步（不叠字 / 叠卡）。 */
+@Composable
+private fun OnboardStepFrame(content: @Composable ColumnScope.() -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(PanelColors.surface)
+            .verticalScroll(rememberScrollState())
+            .padding(horizontal = PanelTokens.PageHorizontal)
+            .padding(bottom = PanelTokens.BottomBarSafetyGap),
+        verticalArrangement = Arrangement.spacedBy(PanelTokens.CardSpacing),
+        content = content,
+    )
 }
 
 // ── 顶部：3dp 细进度条 + 第 N / 6 步 · 名字 + 跳过 ──────────────────────
