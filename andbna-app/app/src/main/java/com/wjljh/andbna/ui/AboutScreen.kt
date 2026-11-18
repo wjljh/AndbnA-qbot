@@ -5,7 +5,6 @@ import android.content.pm.ApplicationInfo
 import android.graphics.Bitmap
 import android.graphics.Canvas
 import android.os.Build
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -85,8 +84,6 @@ fun AboutScreen(metrics: Metrics, onBack: () -> Unit) {
     var checkNote by remember { mutableStateOf("") }
     var checking by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
-
-    BackHandler { onBack() }
 
     Scaffold(
         containerColor = PanelColors.surface,

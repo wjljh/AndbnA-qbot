@@ -926,7 +926,8 @@ fun BotEditScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     NavDisplay(
         backStack = subStack,
         effects = NavDisplayEffects(cornerClipRadius = rememberNavSystemCornerRadius()),
-        onBack = onBack,
+        // 本层三个子页能弹就弹自己（以前直接调 onBack 会一次跳出整个编辑页），只在根层退出本页
+        onBack = { if (subStack.size > 1) popSub() else onBack() },
     ) {
         // 本页：根 entry，自己不带侧滑（与 App 层 Route.Main 同规矩）
         entry<BotSub.Edit>(swipeDismiss = NavSwipeDirection.None) {

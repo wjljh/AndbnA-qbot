@@ -1,6 +1,5 @@
 package com.wjljh.andbna.ui
 
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
@@ -72,8 +71,6 @@ fun TextsPage(bottomInset: Dp = 0.dp, onBack: () -> Unit = {}) {
         },
         onMessage = { importMsg = it },
     )
-
-    BackHandler { onBack() }
 
     val target = pending
     PanelConfirmDialog(

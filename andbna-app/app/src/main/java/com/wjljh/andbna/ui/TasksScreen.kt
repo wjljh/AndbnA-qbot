@@ -1,6 +1,5 @@
 package com.wjljh.andbna.ui
 
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -94,8 +93,6 @@ fun TasksScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     }
 
     LaunchedEffect(tick) { reload() }
-
-    BackHandler { onBack() }
 
     Scaffold(
         containerColor = PanelColors.surface,

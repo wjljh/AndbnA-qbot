@@ -1,7 +1,6 @@
 package com.wjljh.andbna.ui
 
 import android.content.Context
-import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.WindowInsets
@@ -150,8 +149,6 @@ fun ModelConfigScreen(metrics: Metrics, onBack: () -> Unit) {
     var models by remember { mutableStateOf<List<String>>(emptyList()) }
     var error by remember { mutableStateOf("") }
     var notice by remember { mutableStateOf("") }
-
-    BackHandler { onBack() }
 
     fun readInto(target: String) {
         if (api.isBlank() || key.isBlank()) {

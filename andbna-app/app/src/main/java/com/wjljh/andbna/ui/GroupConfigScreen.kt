@@ -1,7 +1,5 @@
 package com.wjljh.andbna.ui
 
-import androidx.activity.compose.BackHandler
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -34,7 +32,7 @@ import com.wjljh.andbna.ui.component.PanelPrimaryButton
 import com.wjljh.andbna.ui.component.PanelSecondaryButton
 import com.wjljh.andbna.ui.component.PanelTextField
 import com.wjljh.andbna.ui.component.PanelTokens
-import com.wjljh.andbna.ui.component.panelStepTransition
+import com.wjljh.andbna.ui.util.PredictiveBackGate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -46,6 +44,12 @@ import top.yukonga.miuix.kmp.basic.Text
 import top.yukonga.miuix.kmp.basic.TopAppBar
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Back
+import top.yukonga.miuix.kmp.nav.core.NavDisplay
+import top.yukonga.miuix.kmp.nav.core.NavDisplayEffects
+import top.yukonga.miuix.kmp.nav.core.NavKey
+import top.yukonga.miuix.kmp.nav.core.navBackStackOf
+import top.yukonga.miuix.kmp.nav.core.rememberNavSystemCornerRadius
+import top.yukonga.miuix.kmp.nav.transition.NavSwipeDirection
 import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
 import top.yukonga.miuix.kmp.preference.SwitchPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
@@ -63,15 +67,24 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  * 行一律 [PanelArrowRow]（[feedback] = false：可点、但没有按压动画），编辑页每行是 kit 原生
  * preference（[OverlayDropdownPreference] / [SwitchPreference]），与设置页、模型配置页同一套。
  */
+/** 「群配置」这一层自己的两条路由：列表 ↔ 单个群的设置。 */
+private sealed interface GroupSub : NavKey {
+    data object List : GroupSub
+    data class Edit(val gid: String) : GroupSub
+}
+
 @Composable
 fun GroupConfigScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     val ctx = LocalContext.current
     var rows by remember(appid) { mutableStateOf<List<GroupConfig.Row>>(emptyList()) }
     var names by remember(appid) { mutableStateOf<Map<String, GroupNames.Entry>>(emptyMap()) }
     var loaded by remember(appid) { mutableStateOf(false) }
-    // 点开的是哪个群（null = 列表页）。两个状态切走同一套过渡动画，返回即回列表。
-    var editing by remember(appid) { mutableStateOf<String?>(null) }
     var tick by remember(appid) { mutableStateOf(0) }
+    // 列表 ↔ 单群是本层自己的 NavDisplay 栈（与 App 层二级页同一条通道）：整屏滑入 + 下层视差 +
+    // 跟手预览。以前就地套 AnimatedContent，那层切法拿不到 entry 级返回分发，侧滑没有预览。
+    val subStack = remember(appid) { navBackStackOf(GroupSub.List) }
+    fun openSub(route: GroupSub) { if (route !in subStack) subStack.add(route) }
+    fun popSub() { if (subStack.size > 1) subStack.removeLastOrNull() }
 
     // 组合期不读盘：群列表要过 Chaquopy，一律放 IO
     LaunchedEffect(appid, tick) {
@@ -85,33 +98,36 @@ fun GroupConfigScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
         val got = withContext(Dispatchers.IO) { GroupNames.fill(ctx, appid, r.map { it.id }) }
         if (got > 0) names = withContext(Dispatchers.IO) { GroupNames.load(ctx, appid) }
     }
-    BackHandler { if (editing != null) editing = null else onBack() }
-
-    AnimatedContent(
-        targetState = editing,
-        transitionSpec = { panelStepTransition(forward = targetState != null) },
-        label = "group-config-step",
-    ) { gid ->
-        if (gid == null) {
+    NavDisplay(
+        backStack = subStack,
+        effects = NavDisplayEffects(cornerClipRadius = rememberNavSystemCornerRadius()),
+        // 库的回调是「用户按了返回」而不是「已经弹过」：本层还有上一层就弹自己，只在根层交给外层
+        onBack = { if (subStack.size > 1) popSub() else onBack() },
+    ) {
+        // 列表：本层根 entry（列表这一层的返回是回 bot 编辑页，交给外层 entry 的 gate / 库）
+        entry<GroupSub.List>(swipeDismiss = NavSwipeDirection.LeftToRight) {
             GroupListPage(
                 metrics = metrics,
                 appid = appid,
                 rows = rows,
                 names = names,
                 loaded = loaded,
-                onPick = { id -> editing = id },
+                onPick = { id -> openSub(GroupSub.Edit(id)) },
                 onBack = onBack,
             )
-        } else {
+        }
+        // 单群设置：推入式 entry，侧滑时下层（列表）跟着露出来
+        entry<GroupSub.Edit>(swipeDismiss = NavSwipeDirection.LeftToRight) { route ->
+            PredictiveBackGate(canPop = subStack.size > 1) { popSub() }
             GroupEditScreen(
                 metrics = metrics,
                 appid = appid,
-                gid = gid,
-                name = names[gid]?.name.orEmpty(),
-                onBack = { editing = null },
+                gid = route.gid,
+                name = names[route.gid]?.name.orEmpty(),
+                onBack = { popSub() },
                 onSaved = { note ->
                     AppToast.show(note)
-                    editing = null
+                    popSub()
                     tick++          // 覆盖状态变了，列表重新算一遍
                 },
             )
@@ -219,8 +235,6 @@ private fun GroupEditScreen(
         limit = conf.dailyLimit
         custom = conf.dailyLimit?.let { limitPresetIndex(it) == LIMIT_CUSTOM } ?: false
     }
-    BackHandler { onBack() }
-
     fun save() {
         val conf = GroupConfig.Conf(
             autoReply = autoReply,

@@ -1,6 +1,5 @@
 package com.wjljh.andbna.ui
 
-import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Image
@@ -145,8 +144,6 @@ fun StickerLibraryScreen(metrics: Metrics, appid: String, botName: String, onBac
         }
         got.forEach { pair -> thumbs[pair.first] = pair.second }
     }
-
-    BackHandler { onBack() }
 
     /** 开关：prefs + llm.json 各一份，Python 侧每条消息重读文件 —— 不用重启 bot。 */
     fun switchEnabled(on: Boolean) {

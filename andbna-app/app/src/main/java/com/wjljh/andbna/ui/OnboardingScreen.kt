@@ -86,7 +86,7 @@ import com.wjljh.andbna.ui.component.PanelPillRow
 import com.wjljh.andbna.ui.component.PanelPrimaryButton
 import com.wjljh.andbna.ui.component.PanelSecondaryButton
 import com.wjljh.andbna.ui.component.PanelTokens
-import com.wjljh.andbna.ui.component.panelStepTransition
+import com.wjljh.andbna.ui.util.PredictiveBackGate
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -94,6 +94,12 @@ import kotlinx.coroutines.withContext
 import top.yukonga.miuix.kmp.basic.Icon
 import top.yukonga.miuix.kmp.basic.Scaffold
 import top.yukonga.miuix.kmp.basic.Text
+import top.yukonga.miuix.kmp.nav.core.NavDisplay
+import top.yukonga.miuix.kmp.nav.core.NavDisplayEffects
+import top.yukonga.miuix.kmp.nav.core.NavKey
+import top.yukonga.miuix.kmp.nav.core.navBackStackOf
+import top.yukonga.miuix.kmp.nav.core.rememberNavSystemCornerRadius
+import top.yukonga.miuix.kmp.nav.transition.NavSwipeDirection
 import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.ChevronForward
 import top.yukonga.miuix.kmp.icon.extended.Close
@@ -193,13 +199,20 @@ private class ProbeResult(
     val hint: String = "",
 )
 
+/** 引导的每一步都是一条路由：下一步 push、上一步（含侧滑）pop。 */
+private data class OnboardStep(val index: Int) : NavKey
+
 @Composable
 fun OnboardingScreen(onFinish: () -> Unit) {
     val ctx = LocalContext.current
     val scope = rememberCoroutineScope()
     val metrics = rememberMetrics()
 
-    var step by remember { mutableIntStateOf(0) }
+    // 6 步走本层自己的 NavDisplay 栈：与 App 层二级页同一条通道（整屏滑入 + 下层视差 + 跟手预览）。
+    // 以前是就地 AnimatedContent 切 Int，那层切法拿不到 entry 级返回分发，侧滑没有预览。
+    val stepStack = remember { navBackStackOf(OnboardStep(0)) }
+    val step = (stepStack.lastOrNull() as? OnboardStep)?.index ?: 0
+    fun popStep() { if (stepStack.size > 1) stepStack.removeLastOrNull() }
     // 第 ③ 步选的方式：默认取已落盘的值（没有就按 root 探测结果，与 ModeStore.initial 一致）
     var mode by remember { mutableStateOf(ModeStore.get(ctx) ?: ModeStore.initial(ctx)) }
 
@@ -290,7 +303,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
 
     fun next() {
         if (step == 4) vm.save(ctx)
-        if (step < STEPS - 1) step += 1 else onFinish()
+        if (step < STEPS - 1) stepStack.add(OnboardStep(step + 1)) else onFinish()
     }
 
     // 第 ② 步（@ 规则）这页没别的动作，底部那颗主按钮就直接说「知道了」，点了照常下一页
@@ -319,7 +332,7 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                     exit = fadeOut(tween(PanelTokens.OnboardAnimMs)),
                 ) {
                     Box(Modifier.padding(end = PanelTokens.ButtonGap)) {
-                        PanelSecondaryButton(text = "上一步", onClick = { if (step > 0) step -= 1 })
+                        PanelSecondaryButton(text = "上一步", onClick = { popStep() })
                     }
                 }
                 PanelPrimaryButton(
@@ -330,12 +343,17 @@ fun OnboardingScreen(onFinish: () -> Unit) {
             }
         },
     ) { pad ->
-        AnimatedContent(
-            targetState = step,
-            transitionSpec = { onboardStepTransition() },
-            modifier = Modifier.fillMaxSize().padding(pad),
-            label = "onboard-step",
-        ) { s ->
+        Box(Modifier.fillMaxSize().padding(pad)) {
+        // 每一步都是一条 entry：推入式返回能拿到跟手预览（转场用库里那套，与 App 层同源）
+        NavDisplay(
+            backStack = stepStack,
+            effects = NavDisplayEffects(cornerClipRadius = rememberNavSystemCornerRadius()),
+            // 第一步再返回没有上一层可预览：等同于「跳过引导」，与顶栏那颗跳过同一条路
+            onBack = { if (stepStack.size > 1) popStep() else onFinish() },
+        ) {
+        entry<OnboardStep>(swipeDismiss = NavSwipeDirection.LeftToRight) { route ->
+            PredictiveBackGate(canPop = stepStack.size > 1) { popStep() }
+            val s = route.index
             Column(
                 modifier = Modifier
                     .fillMaxSize()
@@ -383,11 +401,13 @@ fun OnboardingScreen(onFinish: () -> Unit) {
                         metrics = metrics,
                         vm = vm,
                         scope = scope,
-                        onSkip = { step = STEPS - 1 },
+                        onSkip = { stepStack.add(OnboardStep(STEPS - 1)) },
                     )
                     else -> DoneStep(mode = mode, probe = probe, modelConfigured = vm.configured)
                 }
             }
+        }
+        }
         }
     }
 }
@@ -461,12 +481,6 @@ private fun OnboardHeader(step: Int, onSkip: () -> Unit) {
         }
     }
 }
-
-// ── 方向感：前进往左推、后退往右推，各走 1/6 屏宽 ────────────────────────
-
-private fun AnimatedContentTransitionScope<Int>.onboardStepTransition(): ContentTransform =
-    // 过渡本体在 component/PanelTransition.kt：群配置的二级页用的是同一份（别自造第二套）
-    panelStepTransition(forward = targetState > initialState)
 
 // ── hero：大图标 + 大标题 + 说明，上下各 24dp ─────────────────────────────
 

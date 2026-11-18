@@ -1,7 +1,5 @@
 package com.wjljh.andbna.ui
 
-import androidx.activity.compose.BackHandler
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ColumnScope
 import androidx.compose.foundation.layout.Row
@@ -53,7 +51,7 @@ import com.wjljh.andbna.ui.component.PanelPrimaryButton
 import com.wjljh.andbna.ui.component.PanelSecondaryButton
 import com.wjljh.andbna.ui.component.PanelTextField
 import com.wjljh.andbna.ui.component.PanelTokens
-import com.wjljh.andbna.ui.component.panelStepTransition
+import com.wjljh.andbna.ui.util.PredictiveBackGate
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -67,6 +65,12 @@ import top.yukonga.miuix.kmp.icon.MiuixIcons
 import top.yukonga.miuix.kmp.icon.extended.Add
 import top.yukonga.miuix.kmp.icon.extended.Back
 import top.yukonga.miuix.kmp.icon.extended.Delete
+import top.yukonga.miuix.kmp.nav.core.NavDisplay
+import top.yukonga.miuix.kmp.nav.core.NavDisplayEffects
+import top.yukonga.miuix.kmp.nav.core.NavKey
+import top.yukonga.miuix.kmp.nav.core.navBackStackOf
+import top.yukonga.miuix.kmp.nav.core.rememberNavSystemCornerRadius
+import top.yukonga.miuix.kmp.nav.transition.NavSwipeDirection
 import top.yukonga.miuix.kmp.preference.OverlayDropdownPreference
 import top.yukonga.miuix.kmp.theme.MiuixTheme
 
@@ -82,16 +86,25 @@ import top.yukonga.miuix.kmp.theme.MiuixTheme
  * kit 原生 preference（[OverlayDropdownPreference] / [Switch]）；输入框走 [PanelTextField]
  * （miuix / material 两套样式由它自己分支），页面外壳按 [LocalUiMode] 给两套 body。
  */
+/** 「群管理」这一层自己的两条路由：群列表 ↔ 单个群的规则页。 */
+private sealed interface AdminSub : NavKey {
+    data object List : AdminSub
+    data class Rule(val gid: String) : AdminSub
+}
+
 @Composable
 fun GroupAdminScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
     val ctx = LocalContext.current
     var rows by remember(appid) { mutableStateOf<List<AdminRow>>(emptyList()) }
     var names by remember(appid) { mutableStateOf<Map<String, GroupNames.Entry>>(emptyMap()) }
     var loaded by remember(appid) { mutableStateOf(false) }
-    // 点开的是哪个群（null = 列表页），两个状态共用同一套过渡动画
-    var editing by remember(appid) { mutableStateOf<String?>(null) }
     var msg by remember(appid) { mutableStateOf("") }
     var tick by remember(appid) { mutableStateOf(0) }
+    // 列表 ↔ 规则页走本层的 NavDisplay 栈（与群配置同一口径）：推入式返回能拿到跟手预览，
+    // 以前就地 AnimatedContent 切状态，系统返回分发收不到，侧滑只有硬切。
+    val subStack = remember(appid) { navBackStackOf(AdminSub.List) }
+    fun openSub(route: AdminSub) { if (route !in subStack) subStack.add(route) }
+    fun popSub() { if (subStack.size > 1) subStack.removeLastOrNull() }
 
     // 组合期一律不读盘：群列表要过 Chaquopy，全放 IO
     LaunchedEffect(appid, tick) {
@@ -112,14 +125,14 @@ fun GroupAdminScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
         names = n
         loaded = true
     }
-    BackHandler { if (editing != null) editing = null else onBack() }
-
-    AnimatedContent(
-        targetState = editing,
-        transitionSpec = { panelStepTransition(forward = targetState != null) },
-        label = "group-admin-step",
-    ) { gid ->
-        if (gid == null) {
+    NavDisplay(
+        backStack = subStack,
+        effects = NavDisplayEffects(cornerClipRadius = rememberNavSystemCornerRadius()),
+        // 同群配置：本层能弹就弹自己，只在根层交给外层
+        onBack = { if (subStack.size > 1) popSub() else onBack() },
+    ) {
+        // 列表：本层根 entry（这一层的返回是回 bot 编辑页，交给外层 entry 的 gate / 库）
+        entry<AdminSub.List>(swipeDismiss = NavSwipeDirection.LeftToRight) {
             AdminListPage(
                 metrics = metrics,
                 appid = appid,
@@ -129,18 +142,21 @@ fun GroupAdminScreen(metrics: Metrics, appid: String, onBack: () -> Unit) {
                 msg = msg,
                 onPick = { id ->
                     msg = ""
-                    editing = id
+                    openSub(AdminSub.Rule(id))
                 },
                 onBack = onBack,
             )
-        } else {
+        }
+        // 单群规则页：推入式 entry，侧滑时下层（列表）跟着露出来
+        entry<AdminSub.Rule>(swipeDismiss = NavSwipeDirection.LeftToRight) { route ->
+            PredictiveBackGate(canPop = subStack.size > 1) { popSub() }
             AdminRuleScreen(
                 metrics = metrics,
                 appid = appid,
-                gid = gid,
-                name = names[gid]?.name.orEmpty(),
+                gid = route.gid,
+                name = names[route.gid]?.name.orEmpty(),
                 onBack = {
-                    editing = null
+                    popSub()
                     tick++          // 规则可能刚改过，「已启用 / 未配置」重新算一遍
                 },
             )
@@ -267,8 +283,6 @@ private fun AdminRuleScreen(
         baseline = r
         stats = s
     }
-    BackHandler { onBack() }
-
     val r = rule
     if (r == null) {
         AdminShell(metrics, "群管理", adminGroupTitle(gid, null), onBack) {
