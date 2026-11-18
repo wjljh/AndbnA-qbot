@@ -153,7 +153,6 @@ cd andbna-app && for f in tests/test_*.py; do python3 "$f"; done
 - `andbna-app/app/src/main/assets/personas/` 内置人格文本
 - `andbna-app/tests/` 运行时单测（判定 / 闸门 / 存档 / 成本 / 群配置 / 日志格式 / 跨 bot 协同 …）
 - `docs/latest.json` 更新元数据（由 `.github/workflows/update-latest-json.yml` 在发布 Release 时自动更新）
-- `delivery/` 交付说明（构建、更新日志、验收清单、已知边界）
 - `docs/` 人格来源与许可
 
 ## 第三方与许可
