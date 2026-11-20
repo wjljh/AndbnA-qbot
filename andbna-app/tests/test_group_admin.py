@@ -40,6 +40,8 @@ GROUP_NAME = "测试群一"
 MASTER = "MASTER_OPENID_1"
 HUMAN = "HUMAN_OPENID_9"
 TARGET = "TARGET_OPENID_7"
+SELF_OID = "SELF_BOT_OPENID"      # 本 bot 的 openid（mentions.is_you=true 的那个）
+GID_MUTE = "0FE14634BEA6824FA46E90118503AB57"   # 只给「静音整群」那条用例用的群 id
 RESULTS = []
 FACTS = []          # 警告时交给模型的系统补充
 MODEL_CALLS = []    # 判定模型被问了几次
@@ -152,12 +154,15 @@ def reset():
     br._gm_claims.clear()
     br._gm_sent.clear()
     br._gm_mem.clear()
+    br._gm_msg_idx.clear()
+    br._gm_msg_idx_ts.clear()
+    br._gm_msg_idx_miss.clear()
     br._gm_welcome_mem.clear()
     del MODEL_CALLS[:]
     del FACTS[:]
     for d in (botdir(BOT_A), botdir(BOT_B)):
         shutil.rmtree(os.path.join(d, "group_admin"), ignore_errors=True)
-        for name in ("persona_meta.json", "persona_name.txt"):
+        for name in ("persona_meta.json", "persona_name.txt", "msg_idx.json"):
             try:
                 os.remove(os.path.join(d, name))
             except OSError:
@@ -518,7 +523,8 @@ def case_cmd():
         br._reply = stub_reply()
         # 1) 既不是主人也不是管理员
         msg = FakeMsg("c1", "#禁言 10", FakeAuthor(HUMAN, "路人"), GID_A,
-                      mentions=[{"member_openid": TARGET, "id": TARGET, "username": "甲"}])
+                      mentions=[{"member_openid": TARGET, "id": TARGET, "username": "甲"},
+                                {"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
         handled = asyncio.run(br.group_admin_cmd(BOT_A, d, msg, GID_A, msg.content, msg.id))
         check("I1 无权限：#禁言 → 回「没有群管理权限」并记日志，不发禁言请求",
               handled is True
@@ -532,7 +538,8 @@ def case_cmd():
         write_admin(d, GID_A)
         br._reply = stub_reply()
         msg = FakeMsg("c2", "#禁言 15", FakeAuthor(MASTER, "主人"), GID_A,
-                      mentions=[{"member_openid": TARGET, "id": TARGET, "username": "甲"}])
+                      mentions=[{"member_openid": TARGET, "id": TARGET, "username": "甲"},
+                                {"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
         asyncio.run(br.group_admin_cmd(BOT_A, d, msg, GID_A, msg.content, msg.id))
         posts = [(a, b) for (m, p, a, b) in API.http.calls
                  if m == "POST" and p.endswith("restrict_chat_setting")]
@@ -552,7 +559,8 @@ def case_cmd():
         write_admin(d, GID_A)
         br._reply = stub_reply()
         msg = FakeMsg("c3", "#解禁", FakeAuthor("ADMIN_OID", "管理员"), GID_A,
-                      mentions=[{"member_openid": TARGET, "id": TARGET, "username": "甲"}],
+                      mentions=[{"member_openid": TARGET, "id": TARGET, "username": "甲"},
+                                {"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}],
                       role="admin")
         asyncio.run(br.group_admin_cmd(BOT_A, d, msg, GID_A, msg.content, msg.id))
         posts = [(a, b) for (m, p, a, b) in API.http.calls
@@ -567,7 +575,8 @@ def case_cmd():
         write_admin(d, GID_A)
         br._reply = stub_reply()
         br._gm_note_sent(BOT_A, GID_A, "MINE_MSG_77")
-        msg = FakeMsg("c4", "#撤回", FakeAuthor(MASTER, "主人"), GID_A)
+        msg = FakeMsg("c4", "#撤回", FakeAuthor(MASTER, "主人"), GID_A,
+                      mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
         asyncio.run(br.group_admin_cmd(BOT_A, d, msg, GID_A, msg.content, msg.id))
         recs = [p for (m, p, _a, _b) in API.http.calls if m == "DELETE" and "/messages/" in p]
         check("I5 #撤回 不带回复 → 撤本 bot 上一条（outbox 记的 msg_id）",
@@ -818,6 +827,138 @@ def case_welcome_locked():
         pass
 
 
+class _RefObj(object):
+    """botpy 的 Reference：message_id / id 是属性，不是字典键。"""
+
+    def __init__(self, mid):
+        self.message_id = mid
+        self.id = ""
+
+
+def _idx_msg(mid, idx):
+    """一条「收到过的消息」：本地表要记的是它自己的 msg_idx。"""
+    m = FakeMsg(mid, "垃圾广告", FakeAuthor(HUMAN, "苏"), GID_A)
+    m.raw = scene_raw(msg_idx=idx)
+    return m
+
+
+# ── N 命令的 @ 门禁 + 引用解析（5 只 bot 各回一句报错的回归）──────────
+
+def scene_raw(msg_idx="", ref_idx=""):
+    """真机 payload 形状：引用在 message_scene.ext 的 ref_msg_idx=…，不是 message_reference。"""
+    ext = []
+    if ref_idx:
+        ext.append("ref_msg_idx=%s" % ref_idx)
+    if msg_idx:
+        ext.append("msg_idx=%s" % msg_idx)
+    return {"d": {"message_scene": {"ext": ext}, "message": {}}}
+
+
+def write_group_mute(d, gid):
+    """groups/<gid>.json enabled=false → _handle_group 记完 msg_idx 就返回，不花任何调用。"""
+    dd = os.path.join(d, "groups")
+    os.makedirs(dd, exist_ok=True)
+    with open(os.path.join(dd, gid + ".json"), "w", encoding="utf-8") as f:
+        json.dump({"enabled": False}, f)
+
+
+def case_gate_and_ref():
+    real_reply = br._reply
+    try:
+        d = botdir(BOT_A)
+        br._reply = stub_reply()
+
+        # N1 没 @ 本 bot 的群消息带 #撤回 → 不处理、不发任何话
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        m = FakeMsg("n1", "#撤回", FakeAuthor(MASTER, "主人"), GID_A,
+                    mentions=[{"id": "OTHER_BOT_OID", "member_openid": "OTHER_BOT_OID",
+                               "is_you": False}])
+        got = tick(m, GID_A, m.content)
+        check("N1 没 @ 本 bot：#撤回 静默跳过（不发消息 / 不撤回，只留 detail 一行）",
+              got is True and not API.sent
+              and not [c for c in API.http.calls if c[0] == "DELETE"]
+              and has("群管理：#撤回 不是叫本 bot，跳过"),
+              "sent=%s del=%s" % (len(API.sent),
+                                  len([c for c in API.http.calls if c[0] == "DELETE"])))
+
+        # N2 收消息时把本条 msg_idx → message id 记进本地表（真链路上挂的点）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        # 单独一个 gid：静音文件不能留给后面的用例（groups/<gid>.json 是整群静音）
+        write_group_mute(d, GID_MUTE)
+        target = FakeMsg("t1", "垃圾广告", FakeAuthor(HUMAN, "苏"), GID_MUTE)
+        target.raw = scene_raw(msg_idx="REFIDX_T1")
+        asyncio.run(br._handle_group(BOT_A, d, target, "群消息(新事件)"))
+        os.remove(os.path.join(d, "groups", GID_MUTE + ".json"))
+        check("N2 收到消息 → message_scene.ext 的 msg_idx 进本地表（msg_idx.json）",
+              br._msg_idx_find(d, "REFIDX_T1") == "t1"
+              and os.path.exists(os.path.join(d, "msg_idx.json")) and not API.sent,
+              "find=%r file=%s" % (br._msg_idx_find(d, "REFIDX_T1"),
+                                   os.path.exists(os.path.join(d, "msg_idx.json"))))
+
+        # N3 @ 了本 bot + ref_msg_idx 命中本地表 → 撤回那条 message_id，且只回 1 条
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        br._msg_idx_note(BOT_A, d, _idx_msg("t9", "REFIDX_T9"), "t9")
+        m = FakeMsg("n3", "#撤回", FakeAuthor(MASTER, "主人"), GID_A,
+                    mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+        m.raw = scene_raw(msg_idx="REFIDX_CMD", ref_idx="REFIDX_T9")
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        recs = [p for (meth, p, _a, _b) in API.http.calls if meth == "DELETE" and "/messages/" in p]
+        check("N3 @ 了本 bot + ref_msg_idx 命中本地表 → 撤回对应 message_id，只回 1 条",
+              len(recs) == 1 and "t9" in recs[0] and len(API.sent) == 1
+              and API.sent[0].get("content") == "已撤回",
+              "recalls=%s sent=%s" % (recs, [k.get("content") for k in API.sent]))
+
+        # N4 message_reference 是 botpy 的对象（不是 dict）也能取到 id
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        m = FakeMsg("n4", "#撤回", FakeAuthor(MASTER, "主人"), GID_A,
+                    mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+        m.message_reference = _RefObj("REF_OBJ_ID")
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        recs = [p for (meth, p, _a, _b) in API.http.calls if meth == "DELETE" and "/messages/" in p]
+        check("N4 message_reference 对象（Reference.message_id）也能取到被引用的 id",
+              br._gm_ref_id(m) == "REF_OBJ_ID" and len(recs) == 1 and "REF_OBJ_ID" in recs[0]
+              and len(API.sent) == 1,
+              "ref=%r recalls=%s" % (br._gm_ref_id(m), recs))
+
+        # N5 ref_idx 查不到 → 退化为「本 bot 上一条」，日志写明失败原因
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        br._gm_note_sent(BOT_A, GID_A, "MINE_LAST_88")
+        m = FakeMsg("n5", "#撤回", FakeAuthor(MASTER, "主人"), GID_A,
+                    mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+        m.raw = scene_raw(ref_idx="REFIDX_MISSING")
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        recs = [p for (meth, p, _a, _b) in API.http.calls if meth == "DELETE" and "/messages/" in p]
+        check("N5 ref_idx 不在本地表 → 撤「本 bot 上一条」并记「引用解析失败」",
+              len(recs) == 1 and "MINE_LAST_88" in recs[0]
+              and has("引用解析失败：ref_idx 不在本地表") and has("本 bot 上一条"),
+              "recalls=%s" % (recs,))
+
+        # N6 私聊 #撤回：门禁不适用、私聊入口不经过群管理命令（行为与 2.0.0 一致）
+        m = FakeMsg("n6", "#撤回", FakeAuthor(MASTER, "主人"), "")
+        allowed, why = br._gm_called_me(BOT_A, d, m, "", "#撤回")
+        src = open(os.path.join(ROOT, "app", "src", "main", "python", "bot_runner.py"),
+                   encoding="utf-8").read()
+        tail = src[src.index("async def on_c2c_message_create"):]
+        cut = tail.find("\n        async def ", 20)
+        body = tail[:cut] if cut > 0 else tail
+        check("N6 私聊：#撤回 不被群门禁拦（私聊入口本来就不走 group_admin_cmd）",
+              allowed is True and "group_admin_cmd" not in body
+              and "_group_admin_tick" not in body and br._gm_cmd_of("#撤回") == ("撤回", ""),
+              "allowed=%s why=%s c2c_hit=%s" % (allowed, why, "group_admin_cmd" in body))
+    finally:
+        br._reply = real_reply
+
+
 # ── Z 端到端：_handle_group 里接上了（不是只有单测能走通）────────
 
 def case_wired():
@@ -867,6 +1008,8 @@ def main():
     case_contract()
     reset()
     case_welcome_locked()
+    reset()
+    case_gate_and_ref()
     reset()
     case_wired()
     shutil.rmtree(BASE, ignore_errors=True)

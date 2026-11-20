@@ -7605,6 +7605,12 @@ _GM_ZW = "\u200b\u200c\u200d\ufeff\u2060"     # 零宽字符：有人用它拆�
 _GM_ADMIN_ROLES = ("owner", "admin", "administrator", "群主", "管理员")
 _GM_DEFAULT_STEP = {"n": 1, "mute_min": 10}
 _GM_REF_KEYS = ("message_id", "msg_id", "id")
+# 引用 → 可撤回的 id 之间只有这张表能对上：平台撤回要 message_id，
+# 而群里「回复某条消息」给的是 message_scene.ext 的 ref_msg_idx=REFIDX_…（不是 message_id）。
+_GM_MSG_IDX_FILE = "msg_idx.json"   # <botdir>/msg_idx.json
+_GM_MSG_IDX_LIMIT = 2000            # LRU 上限（条）
+_GM_MSG_IDX_FLUSH = 5.0             # 落盘合并窗口（秒）：每来一条消息都重写 2000 条太费闪存
+_GM_SKIP_ADDR = "群管理：#%s 不是叫本 bot，跳过"
 
 _gm_lock = threading.RLock()
 _gm_conf_cache = {}       # (path, stamp) -> 归一后的规则
@@ -7612,6 +7618,10 @@ _gm_names = {}            # (botdir, gid) -> 群名
 _gm_claims = {}           # (正文哈希前16, 30 秒桶) -> {"owner","name","ts"}
 _gm_sent = {}             # appid -> {gid: 本 bot 刚发出的 msg_id}（#撤回 用）
 _gm_mem = {}              # 计数内存兜底（文件写不进去时）
+_gm_msg_idx = {}          # msg_idx.json 路径 -> OrderedDict{ref idx: message id}
+_gm_msg_idx_lock = threading.RLock()
+_gm_msg_idx_ts = {}       # 同一路径 -> 上次落盘时间（合并窗口用）
+_gm_msg_idx_miss = set()  # 没有 msg_idx 的 payload 提示过哪些表（每 bot 只提示一次）
 _gm_welcome_mem = {}      # (appid, gid, member) -> ts：事件的 5 分钟去重
 
 
@@ -8448,32 +8458,192 @@ def _gm_is_admin(message):
     return _gm_member_role(message) in _GM_ADMIN_ROLES
 
 
-def _gm_ref_id(message):
-    """被引用的那条消息的 id（「回复某条消息」）；平台没给 → ""。"""
-    holders = [message]
+def _gm_holders(message):
+    """同一条消息可能挂字段的四层：对象本身 / raw / raw.d / raw.d.message。"""
+    out = [message]
     raw = getattr(message, "raw", None)
     if isinstance(raw, dict):
-        holders.append(raw)
+        out.append(raw)
         d = raw.get("d")
         if isinstance(d, dict):
-            holders.append(d)
+            out.append(d)
             if isinstance(d.get("message"), dict):
-                holders.append(d["message"])
-    for h in holders:
-        if h is None:
+                out.append(d["message"])
+    return [h for h in out if h is not None]
+
+
+def _gm_scene_pairs(message):
+    """message_scene.ext 里的 k=v；没有 → {}。
+
+    真机抓到的形状（设备上的 gateway_raw.jsonl）：
+        "message_scene": {"ext": ["ref_msg_idx=REFIDX_7IfodO78yK3Im5vBKu6JT…"]}
+    引用放在这里，不是 message_reference —— 只认字典字段的老实现因此在真机上
+    永远解析不出引用（「5 只 bot 各回一句没找到要撤回的消息」的第二个根因）。
+    ext 可能是 k=v 字符串的列表 / 单个字符串 / 字典，三种都认。
+    """
+    out = {}
+    for h in _gm_holders(message):
+        sc = h.get("message_scene") if isinstance(h, dict) else getattr(h, "message_scene", None)
+        if sc is None:
             continue
+        ext = sc.get("ext") if isinstance(sc, dict) else getattr(sc, "ext", None)
+        items = ext if isinstance(ext, (list, tuple, set)) else [ext]
+        for it in items:
+            if isinstance(it, dict):
+                pairs = [(str(k), str(v or "")) for k, v in it.items()]
+            elif isinstance(it, str):
+                pairs = []
+                for part in it.replace("&", ";").split(";"):
+                    if "=" in part:
+                        pairs.append(tuple(part.split("=", 1)))
+            else:
+                continue
+            for k, v in pairs:
+                k, v = k.strip(), v.strip()
+                if k and v and k not in out:
+                    out[k] = v
+    return out
+
+
+def _gm_ref_idx(message):
+    """被引用那条消息的平台序号（ref_msg_idx）；没有 → ""。"""
+    return str(_gm_scene_pairs(message).get("ref_msg_idx") or "").strip()
+
+
+def _msg_idx_own(message):
+    """本条消息自己的平台序号（msg_idx）；没有 → ""。"""
+    return str(_gm_scene_pairs(message).get("msg_idx") or "").strip()
+
+
+def _gm_ref_id(message):
+    """被引用的那条消息的 message id（平台直接给了 id 时）；没有 → ""。
+
+    第三优先级：message_reference / reference / ref / reply 这几种字段。值可能是
+    字典，也可能是 botpy 的对象（types/message.py 的 Reference），两种都取。
+    """
+    for h in _gm_holders(message):
         for name in ("message_reference", "reference", "ref", "reply"):
             r = h.get(name) if isinstance(h, dict) else getattr(h, name, None)
+            if r is None:
+                continue
             if isinstance(r, dict):
                 for k in _GM_REF_KEYS:
                     v = str(r.get(k) or "").strip()
                     if v:
                         return v
+                continue
+            for k in _GM_REF_KEYS:      # Reference 对象：message_id / id 属性
+                v = str(getattr(r, k, "") or "").strip()
+                if v:
+                    return v
         for name in ("ref_id", "reply_id"):
             v = h.get(name) if isinstance(h, dict) else getattr(h, name, None)
             if v:
                 return str(v).strip()
     return ""
+
+
+def _gm_msg_idx_path(botdir):
+    return os.path.join(_bot_root(botdir), _GM_MSG_IDX_FILE)
+
+
+def _gm_msg_idx_table(botdir):
+    """<botdir>/msg_idx.json 的内存视图（OrderedDict，第一条最旧）。启动后只读盘一次。"""
+    import collections
+
+    path = _gm_msg_idx_path(botdir)
+    t = _gm_msg_idx.get(path)
+    if not isinstance(t, collections.OrderedDict):
+        t = collections.OrderedDict()
+        raw = _load_json(path, {})
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                k, v = str(k or "").strip(), str(v or "").strip()
+                if k and v:
+                    t[k] = v
+        _gm_msg_idx[path] = t
+    return t
+
+
+def _msg_idx_note(appid, botdir, message, mid):
+    """收消息时记「本条 msg_idx → 本条 message id」。平台撤回只认 message_id。
+
+    LRU 保留最近 _GM_MSG_IDX_LIMIT 条；落盘用 _save_json（tmp + os.replace 原子替换），
+    但按 _GM_MSG_IDX_FLUSH 秒合并写 —— 每条消息都重写 2000 条对闪存太狠。
+    进程被杀最多丢最后几秒的新映射（查不到就退回「本 bot 上一条」）。拿不到即不记。
+    """
+    import collections
+
+    mid = str(mid or "").strip()
+    idx = _msg_idx_own(message)
+    if not idx:
+        # 真机取证：payload 里到底有没有 msg_idx —— 没有就只能退回「本 bot 上一条」
+        path = _gm_msg_idx_path(botdir)
+        if path not in _gm_msg_idx_miss:
+            _gm_msg_idx_miss.add(path)
+            log("群管理：收到的 payload 没有 message_scene.ext 的 msg_idx"
+                "（引用撤回只能退回「本 bot 上一条」｜每个 bot 只提示一次）",
+                appid, cat="判定", lv="detail")
+        return False
+    if not mid:
+        return False
+    path = _gm_msg_idx_path(botdir)
+    now = time.time()
+    with _gm_msg_idx_lock:
+        t = _gm_msg_idx_table(botdir)
+        if not isinstance(t, collections.OrderedDict):
+            t = collections.OrderedDict(t)
+            _gm_msg_idx[path] = t
+        t.pop(idx, None)
+        t[idx] = mid
+        while len(t) > _GM_MSG_IDX_LIMIT:
+            t.popitem(last=False)
+        due = (now - float(_gm_msg_idx_ts.get(path) or 0)) >= _GM_MSG_IDX_FLUSH
+        ok = _save_json(path, dict(t)) if due else True
+        if due:
+            _gm_msg_idx_ts[path] = now
+    if due:
+        log("群管理：记 msg_idx=%s → id=%s（本地表 %d 条｜落盘%s）"
+            % (idx[:16], mid[:12], len(t), "成功" if ok else "失败"),
+            appid, cat="判定", lv="detail")
+    return ok
+
+
+def _msg_idx_find(botdir, idx):
+    """ref_msg_idx → 可撤回的 message id；查不到 → ""。"""
+    idx = str(idx or "").strip()
+    if not idx:
+        return ""
+    path = _gm_msg_idx_path(botdir)
+    with _gm_msg_idx_lock:
+        t = _gm_msg_idx_table(botdir)
+        v = str(t.get(idx) or "")
+        if v:
+            t.move_to_end(idx)
+            return v
+        # 内存里没有：可能是上一次进程写的表 → 丢掉缓存重读一次再找
+        _gm_msg_idx.pop(path, None)
+        _gm_msg_idx_ts.pop(path, None)
+        return str(_gm_msg_idx_table(botdir).get(idx) or "")
+
+
+def _gm_called_me(appid, botdir, message, gid, text, trusted_at=False):
+    """这条消息是不是在叫本 bot（@ 本 bot，或正文点了本 bot 的名字）→ (是?, 原因)。
+
+    平台把同一条群消息推给群里每一只 bot：不判「叫的是不是我」，5 只 bot 就会各执行
+    一次 #撤回 并各回一句（用户真机截图）。私聊不走这条路径（gid 为空不拦）。
+    """
+    if not str(gid or ""):
+        return True, "非群聊（群门禁不适用）"
+    if trusted_at:
+        return True, "平台 @ 事件（tag=群@）"
+    state, why = _at_me(appid, botdir, message)
+    if state == "yes":
+        return True, why
+    name = str(_my_name(appid) or "").strip()
+    if name and name in str(text or ""):
+        return True, "正文点名（%s）" % name
+    return False, "at_state=%s（%s）" % (state, why)
 
 
 def _gm_target_oid(message, appid, botdir):
@@ -8499,8 +8669,12 @@ def _gm_target_oid(message, appid, botdir):
     return ""
 
 
-async def group_admin_cmd(appid, botdir, message, gid, text, mid=""):
+async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=False):
     """#撤回 / #禁言 / #解禁 → True = 这条已经处理完（调用方直接 return）。
+
+    门禁（2.0.1 修）：群里只有「@ 了本 bot」或「正文点了本 bot 的名字」才处理，
+    其它一律静默跳过 —— 平台把同一条群消息推给每一只 bot，缺这道门禁就是 5 只
+    各回一句。私聊不走这里，行为不变。
 
     权限：主人（_is_master_msg）或群管理员（member_role = owner/admin）。
     没权限必须回一句「没有群管理权限」并记日志 —— 不静默失败。
@@ -8508,6 +8682,10 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid=""):
     cmd, arg = _gm_cmd_of(text)
     if not cmd:
         return False
+    called, why_called = _gm_called_me(appid, botdir, message, gid, text, trusted_at)
+    if not called:
+        log(_GM_SKIP_ADDR % cmd + "（%s）" % why_called, appid, cat="判定", lv="detail")
+        return True
     api = getattr(message, "_api", None)
     mid = str(mid or _unique_msg_id(message)[1] or "")
     if not (_is_master_msg(botdir, gid, message) or _gm_is_admin(message)):
@@ -8516,8 +8694,23 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid=""):
         await _gm_say(api, appid, gid, mid, _GM_NO_PERM)
         return True
     if cmd == "撤回":
+        # 引用解析优先级：① message_scene.ext 的 ref_msg_idx 查本地表（真机格式）
+        # ② message_reference（字典或 botpy 对象）③ 本 bot 上一条
+        idx = _gm_ref_idx(message)
         ref = _gm_ref_id(message)
-        target = ref or _gm_last_sent(appid, gid)
+        target, how = "", ""
+        if idx:
+            target = _msg_idx_find(botdir, idx)
+            if target:
+                how = "被回复的那条（ref_idx=%s → 本地表）" % idx[:16]
+            else:
+                log("群管理：#撤回 引用解析失败：ref_idx 不在本地表（ref_idx=%s｜本地 %d 条）"
+                    % (idx[:20], len(_gm_msg_idx_table(botdir))), appid, cat="判定", lv="detail")
+        if not target and ref:
+            target, how = ref, "被回复的那条（平台直接给的 id）"
+        if not target:
+            target = _gm_last_sent(appid, gid)
+            how = "本 bot 上一条" if target else ""
         if not target:
             log("群管理：#撤回 找不到目标（没有引用消息，也没有本 bot 的上一条记录）",
                 appid, cat="系统")
@@ -8525,10 +8718,9 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid=""):
             return True
         ok = await _gm_recall(api, appid, gid, target)
         log("群管理：#撤回（%s｜id=%s）→ %s"
-            % ("被回复的那条" if ref else "本 bot 上一条", str(target)[:12],
-               "成功" if ok else "失败"), appid, cat="判定")
-        if not ok:
-            await _gm_say(api, appid, gid, mid, "撤回失败（可能没有群管理权限）")
+            % (how, str(target)[:12], "成功" if ok else "失败"), appid, cat="判定")
+        await _gm_say(api, appid, gid, mid,
+                      "已撤回" if ok else "撤回失败（可能没有群管理权限）")
         return True
     minutes = _gm_int(arg, 1, 30 * 24 * 60, 10) if arg else 10
     oid = _gm_target_oid(message, appid, botdir)
@@ -8867,9 +9059,10 @@ async def _gm_punish(appid, botdir, message, gid, conf, v, key, nick, shared, mi
     return True
 
 
-async def _group_admin_tick(appid, botdir, message, gid, text, mid=""):
+async def _group_admin_tick(appid, botdir, message, gid, text, mid="", trusted_at=False):
     """群管理总入口（_handle_group 里、回环判断之后调用）。
 
+    trusted_at = 平台的可信 @ 事件（tag=群@）：命令门禁直接放行。
     → True = 这条已经处理完（命令 / 违规已处置），调用方直接 return。
     """
     gid = str(gid or "")
@@ -8880,7 +9073,7 @@ async def _group_admin_tick(appid, botdir, message, gid, text, mid=""):
     # 静音群、没 @ 本 bot 也照发 —— 和 #撤回/#禁言 同一个位置。
     if await sticker_cmd(appid, botdir, message, "g" + gid, text, gid=gid, mid=mid):
         return True
-    if await group_admin_cmd(appid, botdir, message, gid, text, mid):
+    if await group_admin_cmd(appid, botdir, message, gid, text, mid, trusted_at):
         return True
     if not conf.get("enabled"):
         return False
@@ -8915,6 +9108,9 @@ async def _handle_group(appid, botdir, message, tag):
         return
     trusted_at = (tag == "群@")
     mid = _unique_msg_id(message)[1]
+    # 本条 msg_idx → 本条 message id：群里「回复它 + #撤回」拿到的是 ref_msg_idx，
+    # 撤回接口只认 message_id，只有这张表能对上。拿不到 msg_idx 的 payload 就不记。
+    _msg_idx_note(appid, botdir, message, mid)
     text = (getattr(message, "content", "") or "").strip()
     # 同一个消息 id 只处理一次；但键里带上正文哈希 —— id 万一被复用，不同内容不会被吃掉
     if not _mark_seen(("%s|%s" % (mid, _hash_text(text)[:12])) if mid else ""):
@@ -9026,7 +9222,7 @@ async def _handle_group(appid, botdir, message, tag):
     # 不该被后面那几道「回不回」的闸挡掉 —— 静音群、不 @ 本 bot 都要照样管。
     # 异常一律吞掉：群管理坏了不能连累正常回复。
     try:
-        if await _group_admin_tick(appid, botdir, message, gid, body, mid):
+        if await _group_admin_tick(appid, botdir, message, gid, body, mid, trusted_at):
             return
     except Exception as e:
         log("群管理异常（忽略，不影响回复）：%r" % e, appid, cat="错误")
