@@ -1058,6 +1058,155 @@ def case_gate_and_ref():
         br._reply = real_reply
 
 
+# ── O 多 @ 时没权限的那几只不该回嘴（5 只 bot 全 @ → 4 条噪音）──────
+
+class _NestErr(ForbiddenError):
+    """botpy 各种「code 藏在身上」的异常形状：整份返回体挂在 data 上（类名仍是 403）。"""
+
+    def __init__(self, msg, body):
+        ForbiddenError.__init__(self, msg)
+        self.data = dict(body)
+
+
+def case_multi_at_denied():
+    real_reply = br._reply
+    try:
+        d = botdir(BOT_A)
+        br._reply = stub_reply()
+
+        # O1 群里 @ 了多只 bot、本 bot 非主人非管理员 → 0 条消息，只留 1 行 detail
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        with open(os.path.join(d, "known_bots.json"), "w", encoding="utf-8") as f:
+            json.dump({"bots": ["OTHER_BOT_OID", "THIRD_BOT_OID"]}, f)
+        m = FakeMsg("o1", "<@!OTHER_BOT_OID> #撤回", FakeAuthor(HUMAN, "路人"), GID_A,
+                    mentions=[{"id": "OTHER_BOT_OID", "member_openid": "OTHER_BOT_OID",
+                               "is_you": False},
+                              {"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}],
+                    role="member")
+        called, why_called = br._gm_called_me(BOT_A, d, m, GID_A, m.content)
+        handled = asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        detail = [x for x in logs() if "未授权，且本条还叫了别的 bot → 静默" in x]
+        check("O1 群里 @ 多只 bot + 非主人非管理员 → 0 条消息、1 行 detail（以前回 1 条噪音）",
+              called is True and handled is True and not API.sent and len(detail) == 1
+              and not [x for x in logs() if "被拒" in x]
+              and not [c for c in API.http.calls if c[0] == "DELETE"],
+              "called=%s sent=%d detail=%d" % (called, len(API.sent), len(detail)))
+        check("O2 多 @ 场景下 _gm_called_me 依旧判「叫了我」（预期行为，不动）",
+              called is True and "is_you" in why_called, why_called)
+
+        # O3 只有正文能给线索（known_bots.json 还没学到别的 bot）→ 照样静默
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        try:
+            os.remove(os.path.join(d, "known_bots.json"))
+        except OSError:
+            pass
+        m = FakeMsg("o3", "<@!UNKNOWN_BOT_OID> #撤回", FakeAuthor(HUMAN, "路人"), GID_A,
+                    mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}],
+                    role="member")
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        check("O3 mentions 只给本 bot、正文里还有别的 <@id>（真机「@别人」占位）→ 静默",
+              not API.sent and has("未授权，且本条还叫了别的 bot → 静默"),
+              "sent=%s" % ([k.get("content") for k in API.sent],))
+
+        # O4 @ 的是真人（不是 bot）→ 不算「叫了别的 bot」，照旧回权限话
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        m = FakeMsg("o4", "#禁言 10", FakeAuthor(HUMAN, "路人"), GID_A,
+                    mentions=[{"member_openid": TARGET, "id": TARGET},
+                              {"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}],
+                    role="member")
+        multi, why = br._gm_other_at(BOT_A, d, m, m.content)
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        check("O4 只 @ 了真人（不是 bot）→ 不静默，仍回「没有群管理权限」",
+              multi is False and [k.get("content") for k in API.sent] == [br._GM_NO_PERM],
+              "multi=%s why=%r sent=%s" % (multi, why, [k.get("content") for k in API.sent]))
+
+        # O5 群里只 @ 了本 bot、非主人非管理员 → 仍回「没有群管理权限」（别让用户以为坏了）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        m = FakeMsg("o5", "<@!%s> #撤回" % SELF_OID, FakeAuthor(HUMAN, "路人"), GID_A,
+                    mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}],
+                    role="member")
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        check("O5 群里只 @ 本 bot + 非主人非管理员 → 仍回「没有群管理权限」",
+              [k.get("content") for k in API.sent] == [br._GM_NO_PERM]
+              and has("群管理：#撤回 被拒") and not has("未授权，且本条还叫了别的 bot"),
+              "sent=%s" % ([k.get("content") for k in API.sent],))
+
+        # O6 私聊（gid 为空）非主人 → 仍然明确回话（私聊只有一个对象，不能静默）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        m = FakeMsg("o6", "<@!OTHER_BOT_OID> #撤回", FakeAuthor(HUMAN, "路人"), "",
+                    mentions=[], role="member")
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, "", m.content, m.id))
+        check("O6 私聊非主人 → 仍回「没有群管理权限」（群里的多 @ 判定不适用私聊）",
+              [k.get("content") for k in API.sent] == [br._GM_NO_PERM]
+              and has("群管理：#撤回 被拒"),
+              "sent=%s" % ([k.get("content") for k in API.sent],))
+
+        # O7 撤回失败拿 code：异常体藏在 data 里 / 埋在 args 里 / 在 160 字截断之后
+        info = br._gm_err_info(_NestErr("no permission to delete message",
+                                        {"code": 306004, "message": "no permission"}))
+        check("O7 返回体挂在异常的 data 上 → 照样抠出 code=306004",
+              info["code"] == "306004"
+              and info["msg"] == "no permission to delete message", "info=%s" % (info,))
+        info = br._gm_err_info(RuntimeError("%s" % ({"errcode": 11244},)))
+        check("O7b 返回体埋在 args 里 + 键名是 errcode → 抠出 11244",
+              info["code"] == "11244", "info=%s" % (info,))
+        info = br._gm_err_info(ForbiddenError("x" * 200 + " retract error, code=306010"))
+        check("O7c code 在 160 字之后（_gm_why 会截断）→ 从异常原文再扫一遍，得 306010",
+              info["code"] == "306010", "info=%s" % (info,))
+        info = br._gm_err_info(ForbiddenError("权限不足"))
+        check("O7d 真拿不到 code → 留空，回复退回通用话（不编一个 code）",
+              info["code"] == "" and br._gm_recall_fail_text(info) == "撤回失败（可能没有群管理权限）",
+              "info=%s" % (info,))
+
+        # O8 真链路：_handle_group 收到多 @ 的非主人命令 → 一条都不发（不是只有单测能走通）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        with open(os.path.join(d, "known_bots.json"), "w", encoding="utf-8") as f:
+            json.dump({"bots": ["OTHER_BOT_OID"]}, f)
+        m = FakeMsg("o8a", "<@!OTHER_BOT_OID> #撤回", FakeAuthor(HUMAN, "路人"), GID_A,
+                    mentions=[{"id": "OTHER_BOT_OID", "member_openid": "OTHER_BOT_OID",
+                               "is_you": False},
+                              {"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}],
+                    role="member")
+        asyncio.run(br._handle_group(BOT_A, d, m, "群消息(新事件)"))
+        check("O9 真链路 _handle_group：多 @ + 非主人 → 0 条消息、0 个撤回请求、1 行 detail",
+              not API.sent and not [c for c in API.http.calls if c[0] == "DELETE"]
+              and len([x for x in logs() if "未授权，且本条还叫了别的 bot → 静默" in x]) == 1,
+              "sent=%s calls=%s" % (len(API.sent), [c[0] for c in API.http.calls]))
+
+        # O10 端到端：平台拒绝 + 异常里带 code → 群里回的那一句带 code
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        API.http.fail = {"/messages/": _NestErr("no permission to delete message",
+                                                {"code": 306004, "message": "no permission"})}
+        m = FakeMsg("o8", "<@!%s> #撤回" % SELF_OID, FakeAuthor(MASTER, "主人"), GID_A,
+                    mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+        m.message_reference = _RefObj("OTHER_MSG_9")
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        said = str(API.sent[0].get("content") or "") if API.sent else ""
+        check("O8 #撤回 失败（code 在异常 data 里）→ 回复带 code，日志里有 code=306004",
+              said == "撤回失败：平台拒绝（code 306004）" and has("群管理：撤回失败 code=306004"),
+              "said=%r" % (said,))
+    finally:
+        br._reply = real_reply
+        try:                     # 这一段造的 known_bots.json 别留给后面的用例
+            os.remove(os.path.join(d, "known_bots.json"))
+        except OSError:
+            pass
+
+
 # ── Z 端到端：_handle_group 里接上了（不是只有单测能走通）────────
 
 def case_wired():
@@ -1109,6 +1258,8 @@ def main():
     case_welcome_locked()
     reset()
     case_gate_and_ref()
+    reset()
+    case_multi_at_denied()
     reset()
     case_wired()
     shutil.rmtree(BASE, ignore_errors=True)

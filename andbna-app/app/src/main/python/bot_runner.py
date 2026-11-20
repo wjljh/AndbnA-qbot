@@ -8228,9 +8228,14 @@ def _gm_denied(why):
 _GM_HTTP_BY_KIND = {"AuthenticationFailedError": 401, "ForbiddenError": 403,
                     "NotFoundError": 404, "MethodNotAllowedError": 405,
                     "SequenceNumberError": 429, "ServerError": 500}
-_GM_CODE_RE = re.compile(r"(?:code|errcode|err_code)\s*[=:]\s*\"?([0-9]{3,8})", re.I)
-_GM_CODE_ANY = re.compile(r"\b(30[0-9]{4}|11[0-9]{3}|22[0-9]{3})\b")
+_GM_CODE_KEYS = ("code", "errcode", "err_code", "sub_code", "business_code", "errmsg_code")
+_GM_CODE_RE = re.compile(r"(?:code|errcode|err_code|sub_code)\s*[=:：]\s*\"?(-?[0-9]{3,8})", re.I)
+_GM_CODE_ANY = re.compile(r"\b(30[0-9]{4}|40[0-9]{3}|11[0-9]{3}|22[0-9]{3})\b")
 _GM_MSG_MAX = 120                 # 平台 message 进日志的长度上限
+# 返回体嵌在异常里时，优先看这些键 / 属性（按名字找，别把整棵对象翻一遍）
+_GM_NESTED_KEYS = ("data", "body", "error", "err", "result", "detail", "msg", "msgs", "response")
+_GM_NESTED_ATTRS = ("data", "body", "response", "error", "err", "result", "detail",
+                    "msgs", "message", "msg", "args", "__dict__")
 
 
 def _gm_err_status(e):
@@ -8249,11 +8254,57 @@ def _gm_body_code(data):
     """平台返回体里的业务 code（0 / 空 = 成功）；不是 dict 或没有 → ""。"""
     if not isinstance(data, dict):
         return ""
-    for k in ("code", "errcode", "err_code", "sub_code"):
+    for k in _GM_CODE_KEYS:
         v = data.get(k)
         if v in (None, "", 0, "0"):
             continue
         return str(v)
+    return ""
+
+
+def _gm_nested_code(src, depth=0):
+    """平台返回体可能藏在异常深处（.data / .body / .args / .msgs…）→ 挖出业务 code。
+
+    botpy 的 _handle_response 只把 body 的 message 抬进异常，各版本留 code 的位置
+    不一样：有时在字段上、有时整份 body 挂在 data/body/response、有时在 args 的 dict 里。
+    这里按白名单键名递归（深度 ≤3、每个对象最多看 8 个值），挖不到就 ""——
+    绝不猜、绝不拿 trace_id 之类当 code。
+    """
+    if depth > 3 or src is None:
+        return ""
+    if isinstance(src, dict):
+        code = _gm_body_code(src)
+        if code:
+            return code
+        picked = [(k, src.get(k)) for k in _GM_NESTED_KEYS if k in src]
+        if not picked:
+            picked = list(src.items())[:8]
+        for _k, v in picked:
+            if isinstance(v, (dict, list, tuple)):
+                code = _gm_nested_code(v, depth + 1)
+                if code:
+                    return code
+            elif isinstance(v, str):
+                m = _GM_CODE_RE.search(v) or _GM_CODE_ANY.search(v)
+                if m:
+                    return m.group(1)
+        return ""
+    if isinstance(src, (list, tuple)):
+        for v in list(src)[:5]:
+            code = _gm_nested_code(v, depth + 1)
+            if code:
+                return code
+        return ""
+    for name in _GM_CODE_KEYS:
+        v = getattr(src, name, None)
+        if v not in (None, "", 0, "0"):
+            return str(v)
+    for name in _GM_NESTED_ATTRS:
+        v = getattr(src, name, None)
+        if isinstance(v, (dict, list, tuple)) or (v is not None and not isinstance(v, (int, float, bool))):
+            code = _gm_nested_code(v, depth + 1)
+            if code:
+                return code
     return ""
 
 
@@ -8267,18 +8318,27 @@ def _gm_err_info(src):
     if isinstance(src, dict):
         code = _gm_body_code(src)
         msg = str(src.get("message") or src.get("msg") or "").strip()
+        if not code:
+            code = _gm_nested_code(src, 1)
     elif src is not None:
         http = _gm_err_status(src)
-        for name in ("code", "errcode", "err_code", "sub_code"):
+        msg = _gm_why(src).split(": ", 1)[-1].strip()
+        code = ""
+        for name in _GM_CODE_KEYS:
             v = getattr(src, name, None)
             if v not in (None, "", 0, "0"):
                 code = str(v)
                 break
-        msg = _gm_why(src).split(": ", 1)[-1].strip()
         if not code:
-            m = _GM_CODE_RE.search(msg) or _GM_CODE_ANY.search(msg)
-            if m:
-                code = m.group(1)
+            # ① 嵌在异常里的返回体（data / body / args…）② message 正文
+            # ③ 整个异常的原文（_gm_why 截到 160 字，code 可能正好在截断点后面）
+            code = _gm_nested_code(src, 1)
+        if not code:
+            for blob in (msg, "%s" % (src,), "%r" % (src,)):
+                m = _GM_CODE_RE.search(str(blob or "")) or _GM_CODE_ANY.search(str(blob or ""))
+                if m:
+                    code = m.group(1)
+                    break
     return {"code": str(code or ""), "msg": str(msg or "")[:_GM_MSG_MAX], "http": str(http or "")}
 
 
@@ -8733,6 +8793,53 @@ def _gm_called_me(appid, botdir, message, gid, text, trusted_at=False):
     return False, "at_state=%s（%s）" % (state, why)
 
 
+_GM_MULTI_SHOW = 3          # detail 日志里最多列几个「别的 @」的 id 前缀
+
+
+def _gm_other_at(appid, botdir, message, text):
+    """本条还 @ 了别人吗 → (是?, 说明)。
+
+    真机证据（2.0.1）：用户把群里 5 只 bot 全 @ 了，平台对每一只都推 is_you=true，
+    所以 _gm_called_me 判「叫了我」是对的，但它判不出「还叫了别人」—— 5 只里只有 1 只
+    的主人 openid 对得上，另外 4 只各回一句「没有群管理权限」就是 4 条噪音。
+
+    这里只数「本 bot 之外还有谁被 @ 了」，两个来源，任一命中就算：
+      ① mentions 里**能确认是 bot** 的 id（known_bots.json / bot_ids.json / mention 的 bot 标记）——
+         真人被 @ 不算，否则「@某人 #禁言 10」会被误静默；
+      ② 正文里不是本 bot 的 <@id> —— 真机日志里 5 只 bot 只有 1 只的正文渲染成「@我」，
+         另外 4 只渲染成「@别人」，这一条就是 brief 说的「@别人 占位」。
+    自己的 id 先剔掉（_own_mention_ids = 候选集合 + is_you 标记）。
+    """
+    mentions = _mentions_of(message)
+    own = _own_mention_ids(appid, botdir, mentions)
+    known = set(str(x).upper() for x in _known_bots(botdir))
+    known |= set(str(x).upper() for x in _bot_ids(botdir).keys())
+    bots, ids = [], []
+    # ① mentions 里能确认是 bot 的 id（known_bots.json / bot_ids.json / mention 的 bot 标记）。
+    #    只认 bot：真人被 @ 进来不算「叫了别的 bot」，否则「@某人 #禁言 10」会被误静默。
+    for e in mentions:
+        oid = str(_mention_id(e) or "").strip()
+        if not oid or oid.upper() in own:
+            continue
+        if _mention_flag(e, "bot", "is_bot", "isBot") is True or oid.upper() in known:
+            if oid not in bots:
+                bots.append(oid)
+    # ② 正文里的 <@id> 不是本 bot：真机日志里就是这样（同一批 5 只，只有 1 只的正文
+    #    渲染成「@我」，另外 4 只渲染成「@别人」）—— 这是 mentions 判不出来时唯一线索。
+    for m in _AT_ANY_RE.finditer(str(text or "")):
+        oid = str(m.group(1) or "").strip()
+        if oid and oid.upper() not in own and oid not in ids:
+            ids.append(oid)
+    others = bots + [i for i in ids if i not in bots]
+    if not others:
+        return False, ""
+    shown = ",".join(o[:8] for o in others[:_GM_MULTI_SHOW])
+    if len(others) > _GM_MULTI_SHOW:
+        shown += "…"
+    why = "本条还 @ 了 %d 个别的 id（确认是 bot 的 %d 个：%s）" % (len(others), len(bots), shown)
+    return True, why
+
+
 def _gm_target_oid(message, appid, botdir):
     """#禁言 / #解禁 的对象：先看 @ 了谁（最可靠），再看引用消息里的作者。"""
     mentions = _mentions_of(message) or []
@@ -8764,7 +8871,9 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
     各回一句。私聊不走这里，行为不变。
 
     权限：主人（_is_master_msg）或群管理员（member_role = owner/admin）。
-    没权限必须回一句「没有群管理权限」并记日志 —— 不静默失败。
+    没权限时怎么办（2.0.1）：私聊 / 群里只叫了本 bot → 回「没有群管理权限」（不静默失败）；
+    群里而且本条还 @ 了别的 bot（_gm_other_at）→ 静默，只记 detail —— 那种情况下
+    「叫我的那个人认的主人不是我」，回话就是纯噪音。
     """
     cmd, arg = _gm_cmd_of(text)
     if not cmd:
@@ -8776,6 +8885,18 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
     api = getattr(message, "_api", None)
     mid = str(mid or _unique_msg_id(message)[1] or "")
     if not (_is_master_msg(botdir, gid, message) or _gm_is_admin(message)):
+        # 未授权时回不回话，看「这一条是不是只叫了我」（2.0.1 真机：5 只 bot 全 @ 了，
+        # 另外 4 只各回一句「没有群管理权限」→ 4 条噪音）。
+        #   · 私聊：只有一个对象，一定回（不回就像坏了）；
+        #   · 群里 + 本条还叫了别的 bot：静默，只留 detail（别人会说话，我不掺和）；
+        #   · 群里 + 只叫了我：照旧回，避免用户以为坏了。
+        multi, why_multi = (False, "")
+        if str(gid or ""):
+            multi, why_multi = _gm_other_at(appid, botdir, message, text)
+        if multi:
+            log("群管理：#%s 未授权，且本条还叫了别的 bot → 静默（%s）" % (cmd, why_multi),
+                appid, cat="判定", lv="detail")
+            return True
         log("群管理：#%s 被拒（不是主人 / 群管理员，member_role=%s）→ 回「%s」"
             % (cmd, _gm_member_role(message) or "未知", _GM_NO_PERM), appid, cat="判定")
         await _gm_say(api, appid, gid, mid, _GM_NO_PERM)
