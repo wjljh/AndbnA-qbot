@@ -8709,6 +8709,54 @@ async def _gm_restrict_state(api, appid, gid):
     return ok, data
 
 
+def _gm_role_text(role):
+    """member_role → 人话（普通成员 / 管理员 / 群主）；不认识 → ""。"""
+    return _GM_ROLE_WORDS.get(str(role or "").strip().lower(), "")
+
+
+async def _gm_bot_state(api, appid, gid):
+    """群内身份自检：GET /v2/groups/{group_openid}/bot_state → (成功?, {"role","role_text"})。
+
+    官方文档「获取机器人群内状态」返回 member_role ∈ member/owner/admin，正好回答
+    「这只 bot 到底是不是群管理员」。绝不抛：
+      · 11253 应用无接口访问权限（该接口只对白名单机器人开放）→ 日志留一行就跳过；
+      · 返回体里没有 member_role（老版本 / 别的形状）→ 同样跳过，不硬编身份。
+    """
+    if not str(gid or ""):
+        return False, {}
+    try:
+        ok, data, _denied, info = await _gm_call(
+            api, "GET", _GM_BOT_STATE_PATH, group_openid=str(gid))
+    except Exception as e:                 # _gm_call 已经不抛了，这里只是双保险
+        log("群管理：群内身份自检异常（%s）→ 跳过" % _gm_why(e), appid, cat="错误", lv="detail")
+        return False, {}
+    if not ok:
+        log("群管理：群内身份自检拿不到（code=%s msg=%s）→ 跳过（11253 = 该接口只对白名单开放）"
+            % ((info or {}).get("code") or "无", (info or {}).get("msg") or "无"),
+            appid, cat="系统", lv="detail")
+        return False, {}
+    role = str((data or {}).get("member_role") or "") if isinstance(data, dict) else ""
+    text = _gm_role_text(role)
+    if not text:
+        log("群管理：群内身份自检没有 member_role → 跳过（不硬编身份）",
+            appid, cat="系统", lv="detail")
+        return False, {}
+    log("群管理：群内身份=%s（member_role=%s｜group=%s）" % (text, role, str(gid or "")[:8]),
+        appid, cat="系统")
+    return True, {"role": role.strip().lower(), "role_text": text}
+
+
+async def _gm_deny_reply(api, appid, gid, base):
+    """失败回复 + 群内身份那一句：拿得到身份才加，拿不到就原样返回（绝不编）。"""
+    ok, st = await _gm_bot_state(api, appid, gid)
+    if not ok:
+        return base
+    text = str(st.get("role_text") or "")
+    if str(st.get("role") or "") in ("admin", "owner"):
+        return "%s（群内身份=%s：权限已具备，可能是别的原因）" % (base, text)
+    return "%s（群内身份=%s：请把这只 bot 设为群管理员）" % (base, text)
+
+
 async def _gm_kick(api, appid, gid, member_oid):
     """踢出群成员 → 成功?（**需真机确认**：这条 DELETE 路径来自文档，尚未实测）。"""
     if not (str(gid or "") and str(member_oid or "")):
@@ -9029,13 +9077,15 @@ def _gm_msg_idx_table(botdir):
     return t
 
 
-def _msg_idx_put(botdir, idx, mid, appid="", force=False):
+def _msg_idx_put(botdir, idx, mid, appid="", force=False, stamp=True):
     """往 msg_idx.json 放一条「平台序号 → message id」→ 进表成功?（没有 idx/mid 就是 False）。
 
     收消息（_msg_idx_note）和本 bot 自己发出去的消息（_gm_note_sent 的 sent:<gid>）都走这里：
     LRU 保留最近 _GM_MSG_IDX_LIMIT 条，落盘用 _save_json（tmp + os.replace 原子替换），
     但按 _GM_MSG_IDX_FLUSH 秒合并写 —— 每条消息都重写 2000 条对闪存太狠。
     force=True：不等合并窗口立刻落盘（回填这种一次性批量写入用）。
+    stamp=True 顺手记这条的时刻（2 分钟预判用）；回填老消息时传 False —— 存档里没有
+    时间，记成「刚刚」就是在撒谎。
     """
     import collections
 
@@ -9055,7 +9105,8 @@ def _msg_idx_put(botdir, idx, mid, appid="", force=False):
         while len(t) > _GM_MSG_IDX_LIMIT:
             t.popitem(last=False)
         # 顺手记「这条 id 是什么时候收到 / 发出的」：「超 2 分钟撤不了」的本地预判只靠它
-        _msg_ts_put(botdir, mid, now)
+        if stamp:
+            _msg_ts_put(botdir, mid, now)
         due = force or (now - float(_gm_msg_idx_ts.get(path) or 0)) >= _GM_MSG_IDX_FLUSH
         ok = _save_json(path, dict(t)) if due else True
         if due:
@@ -9225,11 +9276,11 @@ def _msg_idx_backfill(botdir, appid=""):
         return _msg_idx_backfill_skip(appid, botdir, "读存档失败 %r" % e)
     n, last = 0, ("", "")
     for row in rows:
-        if _msg_idx_put(botdir, row[0], row[1], appid):
+        if _msg_idx_put(botdir, row[0], row[1], appid, stamp=False):
             n, last = n + 1, (row[0], row[1])
     if n:
         # 回填是一次性批量写入：最后一条强制落盘，别把整张表挂到合并窗口上
-        _msg_idx_put(botdir, last[0], last[1], appid, force=True)
+        _msg_idx_put(botdir, last[0], last[1], appid, force=True, stamp=False)
         log("群管理：msg_idx 回填 %d 条（来源 messages.db 的 %s → %s）" % (n, icol, mcol),
             appid, cat="系统", lv="detail")
     return n
@@ -9476,8 +9527,13 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
             % (how, str(target)[:12], (info or {}).get("code") or "无",
                (info or {}).get("reason") or "无", "成功" if ok else "失败"),
             appid, cat="判定")
-        await _gm_say(api, appid, gid, mid,
-                      "已撤回" if ok else _gm_recall_fail_text(info, (info or {}).get("mine")))
+        if ok:
+            await _gm_say(api, appid, gid, mid, "已撤回")
+        else:
+            # 失败才做一次群内身份自检：用户要知道的是「该去授权」还是「别的原因」
+            await _gm_say(api, appid, gid, mid,
+                          await _gm_deny_reply(api, appid, gid,
+                                               _gm_recall_fail_text(info, (info or {}).get("mine"))))
         return True
     minutes = _gm_int(arg, 1, 30 * 24 * 60, 10) if arg else 10
     oid = _gm_target_oid(message, appid, botdir)
@@ -9488,19 +9544,22 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
                       "请 @ 要%s的人再说一次（如：@某人 #%s 10）" % (cmd, cmd))
         return True
     if cmd == "禁言":
-        ok = await _gm_mute(api, appid, gid, oid, minutes)
+        ok, minfo = await _gm_mute_ex(api, appid, gid, oid, minutes)
         state_ok, _state = await _gm_restrict_state(api, appid, gid)
         log("群管理：#禁言 %d 分钟（对象=%s）→ %s｜查询禁言状态=%s"
             % (minutes, _oid8(oid), "成功" if ok else "失败",
                "成功" if state_ok else "失败"), appid, cat="判定")
         if not ok:
-            await _gm_say(api, appid, gid, mid, "禁言失败（可能没有群管理权限）")
+            await _gm_say(api, appid, gid, mid,
+                          await _gm_deny_reply(api, appid, gid, _gm_mute_fail_text(minfo)))
         return True
-    ok = await _gm_mute(api, appid, gid, oid, 0)
+    ok, minfo = await _gm_mute_ex(api, appid, gid, oid, 0)
     log("群管理：#解禁（对象=%s）→ %s" % (_oid8(oid), "成功" if ok else "失败"),
         appid, cat="判定")
     if not ok:
-        await _gm_say(api, appid, gid, mid, "解禁失败（可能没有群管理权限）")
+        await _gm_say(api, appid, gid, mid,
+                      await _gm_deny_reply(api, appid, gid,
+                                           _gm_mute_fail_text(minfo, "解禁")))
     return True
 
 

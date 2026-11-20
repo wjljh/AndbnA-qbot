@@ -57,6 +57,7 @@ class FakeHttp(object):
     def __init__(self):
         self.calls = []
         self.fail = {}            # path 子串 -> 要抛的异常
+        self.bot_state = None     # 「获取机器人群内状态」的返回体（None = 不返回内容）
 
     async def request(self, route, **kw):
         # 记 route.url（已把 {group_openid} 这些占位符填好）= 真机上真正打出去的那条路径
@@ -66,6 +67,8 @@ class FakeHttp(object):
         for key, exc in self.fail.items():
             if key in url or key in route.path:
                 raise exc
+        if self.bot_state is not None and route.path.endswith("/bot_state"):
+            return self.bot_state
         if route.path.endswith("/info"):
             return {"group_name": GROUP_NAME, "group_member_num": 12}
         return {}
@@ -179,13 +182,14 @@ def reset():
     br._gm_mem.clear()
     br._gm_msg_idx.clear()
     br._gm_msg_idx_ts.clear()
+    br._gm_msg_ts.clear()
     br._gm_msg_idx_miss.clear()
     br._gm_welcome_mem.clear()
     del MODEL_CALLS[:]
     del FACTS[:]
     for d in (botdir(BOT_A), botdir(BOT_B)):
         shutil.rmtree(os.path.join(d, "group_admin"), ignore_errors=True)
-        for name in ("persona_meta.json", "persona_name.txt", "msg_idx.json"):
+        for name in ("persona_meta.json", "persona_name.txt", "msg_idx.json", "msg_ts.json"):
             try:
                 os.remove(os.path.join(d, name))
             except OSError:
@@ -1609,6 +1613,136 @@ def case_wired():
         br._gm_model_ask, br._reply = real_model, real_reply
 
 
+# ── PM 平台错误码 + 群内身份自检 + 2 分钟预判（真机 11-20 20:10）──────────
+#
+# 真机取证：DELETE /v2/groups/<gid>/messages/ROBOT1.0_… → http=400 code=40062003「无操作权限」
+# （id 有效，卡在「机器人不是群管理员」）；同一个 id 换个群 → code=40061001「请求参数无效」。
+# 官方「获取机器人群内状态」GET /v2/groups/{group_openid}/bot_state → member_role。
+
+def case_perm_map():
+    real_reply = br._reply
+    try:
+        d = botdir(BOT_A)
+        br._reply = stub_reply()
+
+        # ① 码表四种：撤回失败的四句人话（码表压过「这条是不是我发的」）
+        pairs = [("40062003", "没有撤回权限：这只 bot 不是群管理员"),
+                 ("40064004", "超过 2 分钟，撤不了"),
+                 ("40061001", "消息 id 或群不匹配（多半是群/消息对不上）"),
+                 ("50065001", "平台侧撤回失败，稍后重试")]
+        got = [(c, br._gm_recall_fail_text({"code": c, "msg": "无操作权限"}, False))
+               for c, _e in pairs]
+        check("PM1 四个平台错误码 → 四句人话（40062003 不再被说成「不是我发的」）",
+              [g[1] for g in got] == [e for _c, e in pairs], "%s" % (got,))
+        check("PM1b 码表不认识的 code 仍走老文案（不硬套身份话）",
+              br._gm_recall_fail_text({"code": "306004"}, True) == "撤回失败：平台拒绝（code 306004）",
+              "%r" % (br._gm_recall_fail_text({"code": "306004"}, True),))
+
+        # ② 2 分钟预判：落盘 → 清内存（模拟重启）→ 仍判得出超时，不打平台
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        now = time.time()
+        br._msg_ts_put(d, "OLD_MSG_1", now - 600)
+        br._msg_ts_put(d, "THIRTY_SEC_1", now - 30)
+        br._msg_ts_put(d, "B119", now - 119)
+        br._msg_ts_put(d, "B121", now - 121)
+        flushed = br._msg_ts_flush(d)
+        br._gm_msg_ts.clear()          # 只剩磁盘那份：重启后预判还能用
+        ok, info = asyncio.run(br._gm_recall(API, BOT_A, GID_A, "OLD_MSG_1", d))
+        check("PM2 落盘过 600 秒 → 预判拦下：不调 DELETE、文案「超过 2 分钟，撤不了」",
+              flushed and ok is False and (info or {}).get("reason") == "expired"
+              and not [c for c in API.http.calls if c[0] == "DELETE"]
+              and br._gm_recall_fail_text(info) == "超过 2 分钟，撤不了"
+              and has("撤回跳过"),
+              "flushed=%s info=%s calls=%s" % (flushed, info, [c[0] for c in API.http.calls]))
+        check("PM2b 边界：119 秒放行、121 秒拦下（官方 2 分钟）",
+              br._gm_recall_expired(d, "B119", now) is None
+              and (br._gm_recall_expired(d, "B121", now) or 0) > 120,
+              "%s/%s" % (br._gm_recall_expired(d, "B119", now),
+                         br._gm_recall_expired(d, "B121", now)))
+        ok, info = asyncio.run(br._gm_recall(API, BOT_A, GID_A, "NO_TS_1", d))
+        check("PM2c 本地没有时刻记录 → 不拦（平台才是裁决方）",
+              ok is True and len([c for c in API.http.calls if c[0] == "DELETE"]) == 1,
+              "ok=%s info=%s" % (ok, info))
+        ok, _info = asyncio.run(br._gm_recall(API, BOT_A, GID_A, "THIRTY_SEC_1", d))
+        check("PM2d 30 秒 → 照常打平台（窗口内不误伤）",
+              ok is True and len([c for c in API.http.calls if c[0] == "DELETE"]) == 2,
+              "ok=%s" % (ok,))
+
+        # ③ 群内身份自检：拿得到 → 日志 + 失败回复带一句
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        API.http.fail = {"/messages/": ForbiddenError("无操作权限", 40062003)}
+        API.http.bot_state = {"member_openid": SELF_OID,
+                              "joined_at": "2026-08-10T10:00:00+08:00",
+                              "allow_proactive_msg": False,
+                              "recv_msg_setting": "all", "member_role": "member"}
+        m = FakeMsg("pm3", "#撤回", FakeAuthor(MASTER, "主人"), GID_A,
+                    mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+        m.message_reference = _RefObj("MEMBER_MSG_1")
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        said = str(API.sent[-1].get("content") or "") if API.sent else ""
+        check("PM3 撤回被拒 40062003 → 回复 = 码表那句 + 群内身份=普通成员（日志里也有）",
+              said.startswith("没有撤回权限：这只 bot 不是群管理员")
+              and "群内身份=普通成员" in said
+              and has("群内身份=普通成员") and has("群管理：撤回失败 code=40062003"),
+              "said=%r" % (said,))
+
+        # ④ 自检拿不到（11253 白名单 / 没有 member_role）→ 不抛、回复退回原文
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        API.http.fail = {"/messages/": ForbiddenError("无操作权限", 40062003),
+                         "bot_state": ForbiddenError("应用无接口访问权限", 11253)}
+        m = FakeMsg("pm4", "#撤回", FakeAuthor(MASTER, "主人"), GID_A,
+                    mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+        m.message_reference = _RefObj("MEMBER_MSG_2")
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        said = str(API.sent[-1].get("content") or "") if API.sent else ""
+        check("PM4 身份自检拿不到（code=11253）→ 不抛、回复只有码表那句",
+              said == "没有撤回权限：这只 bot 不是群管理员"
+              and has("群内身份自检拿不到"), "said=%r" % (said,))
+
+        # ⑤ 禁言同理：「无操作权限」→ 「没有禁言权限：这只 bot 不是群管理员」+ 身份
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        API.http.fail = {"restrict_chat_setting": ForbiddenError("无操作权限")}
+        API.http.bot_state = {"member_role": "member"}
+        m = FakeMsg("pm5", "#禁言 10", FakeAuthor(MASTER, "主人"), GID_A,
+                    mentions=[{"member_openid": TARGET, "id": TARGET},
+                              {"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        said = str(API.sent[-1].get("content") or "") if API.sent else ""
+        check("PM5 #禁言 被拒（无操作权限）→ 「没有禁言权限：这只 bot 不是群管理员」+ 身份",
+              said.startswith("没有禁言权限：这只 bot 不是群管理员")
+              and "群内身份=普通成员" in said and has("reason=not_admin"), "said=%r" % (said,))
+        check("PM6 _gm_mute_fail_text 三档文案 + _gm_mute 仍返回 bool（老签名没变）",
+              br._gm_mute_fail_text({"reason": "not_admin"}) == "没有禁言权限：这只 bot 不是群管理员"
+              and br._gm_mute_fail_text({"reason": "denied", "msg": "x"}) == "禁言失败：平台拒绝（x）"
+              and br._gm_mute_fail_text({}, "解禁") == "解禁失败（可能没有群管理权限）"
+              and isinstance(asyncio.run(br._gm_mute(API, BOT_A, GID_A, TARGET, 10)), bool),
+              "mute-text")
+
+        # ⑥ 管理员身份被拒 → 话术不同（不说「去授权」，说「可能是别的原因」）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        API.http.fail = {"/messages/": ForbiddenError("无操作权限", 40062003)}
+        API.http.bot_state = {"member_role": "admin"}
+        m = FakeMsg("pm7", "#撤回", FakeAuthor(MASTER, "主人"), GID_A,
+                    mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+        m.message_reference = _RefObj("MEMBER_MSG_3")
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        said = str(API.sent[-1].get("content") or "") if API.sent else ""
+        check("PM7 群内身份=管理员还失败 → 不回「去设为管理员」，说「可能是别的原因」",
+              "群内身份=管理员" in said and "设为群管理员" not in said, "said=%r" % (said,))
+    finally:
+        br._reply = real_reply
+
+
 def main():
     write_roster()
     reset()
@@ -1647,6 +1781,8 @@ def main():
     case_idx_hit_rate()
     reset()
     case_multi_at_denied()
+    reset()
+    case_perm_map()
     reset()
     case_wired()
     shutil.rmtree(BASE, ignore_errors=True)
