@@ -1132,6 +1132,130 @@ def case_recall_texts():
         br._reply = real_reply
 
 
+# ── R 撤回失败按「target 是不是本 bot 发的」分家（真机 11-20 19:44:15）──────
+#
+# 真机那一条：被回复的是「人（或别的 bot）发的」消息 → code=无 / msg=无操作权限 / http=500；
+# 同一只 bot 18:47:34 撤「本 bot 上一条」却成功 —— 平台只允许撤自己发的消息。
+# 所以失败文案先分「是不是我发的」：不是我发的就说清楚，是我发的才叫「平台拒绝」，
+# 并且把平台的「无操作权限」归一化成 reason=not_mine 方便统计。
+
+def case_recall_own_split():
+    real_reply = br._reply
+    try:
+        d = botdir(BOT_A)
+        br._reply = stub_reply()
+
+        def cmd(mid, raw=None, ref_obj=None, text="#撤回"):
+            m = FakeMsg(mid, text, FakeAuthor(MASTER, "主人"), GID_A,
+                        mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+            if raw is not None:
+                m.raw = raw
+            if ref_obj:
+                m.message_reference = _RefObj(ref_obj)
+            asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+            said = str(API.sent[-1].get("content") or "") if API.sent else ""
+            deletes = [p for (meth, p, _a, _b) in API.http.calls if meth == "DELETE"]
+            return said, deletes
+
+        # R1 target 在已发集合（#撤回自己 撤的就是 sent:<gid> 那条）+ 平台拒绝 → 「平台拒绝」
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        br._gm_note_sent(BOT_A, GID_A, "MINE_R1", d)
+        API.http.fail = {"/messages/": ForbiddenError("no permission to delete message", 306012)}
+        said, deletes = cmd("r1", text="#撤回自己")
+        check("R1 target 在本 bot 已发集合 + 仍失败 → 「撤回失败：平台拒绝（code …）」",
+              said == "撤回失败：平台拒绝（code 306012）"
+              and len(deletes) == 1 and "MINE_R1" in deletes[0]
+              and has("群管理：撤回失败 code=306012") and has("reason=denied")
+              and said != br._GM_RECALL_NOT_MINE,
+              "said=%r deletes=%s" % (said, deletes))
+
+        # R1b 我发的、平台没给 code → 用平台原话，不退成「可能没有群管理权限」
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        br._gm_note_sent(BOT_A, GID_A, "MINE_R1B", d)
+        API.http.fail = {"/messages/": ForbiddenError("撤回接口限流")}
+        said, _deletes = cmd("r1b", text="#撤回自己")
+        check("R1b 我发的 + 平台只给 msg → 「撤回失败：平台拒绝（<平台原话>）」",
+              said == "撤回失败：平台拒绝（撤回接口限流）" and has("reason=denied")
+              and br._GM_NOT_MINE_MSG not in said,
+              "said=%r" % (said,))
+
+        # R2 不在已发集合 + 平台「无操作权限」→ 「这条不是我发的」，日志 reason=not_mine
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        br._msg_idx_note(BOT_A, d, _idx_msg("human_r2", "REFIDX_HUMAN_R2"), "human_r2")
+        API.http.fail = {"/messages/": ForbiddenError("无操作权限")}
+        said, deletes = cmd("r2", scene_raw(ref_idx="REFIDX_HUMAN_R2"))
+        check("R2 本地表能对上 id 但不在已发集合 + msg=无操作权限 → 「这条不是我发的…」",
+              said == br._GM_RECALL_NOT_MINE and "不是我发的" in said
+              and "平台只让我撤自己发的消息" in said
+              and len(deletes) == 1 and "human_r2" in deletes[0]
+              and has("reason=not_mine") and said != br._GM_RECALL_EARLY,
+              "said=%r deletes=%s" % (said, deletes))
+
+        # R2b 只有「无操作权限」这条平台原话（没有本地表线索）→ 也是「不是我发的」
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        API.http.fail = {"/messages/": ForbiddenError("无操作权限")}
+        said, _deletes = cmd("r2b", ref_obj="OTHER_MSG_R2B")
+        check("R2b 平台原话「无操作权限」单独成立 → 也判「不是我发的」（不看本地表）",
+              said == br._GM_RECALL_NOT_MINE and has("reason=not_mine"),
+              "said=%r" % (said,))
+
+        # R2c 三种文案互不混淆：太早 / 不是我发的 / 没有引用 两两不同
+        check("R2c 「不是我发的」与「太早了」「要撤哪条」三句两两不同",
+              len(set([br._GM_RECALL_NOT_MINE, br._GM_RECALL_EARLY, br._GM_RECALL_ASK])) == 3
+              and "太早了" not in br._GM_RECALL_NOT_MINE
+              and "只记得最近收到的一批" not in br._GM_RECALL_NOT_MINE,
+              br._GM_RECALL_NOT_MINE)
+
+        # R3 归一化函数：mine / 平台原话 / 本地表解析三条判据各自成立
+        check("R3 reason 归一化：我发的=denied、无操作权限=not_mine、本地表解析=not_mine",
+              br._gm_recall_reason({"msg": "无操作权限"}, False) == "not_mine"
+              and br._gm_recall_reason({"msg": "x"}, True) == "denied"
+              and br._gm_recall_reason({"msg": "x"}, False, True) == "not_mine"
+              and br._gm_recall_reason({"msg": "no permission to delete message"}, False)
+              == "denied",
+              "%s/%s/%s/%s" % (br._gm_recall_reason({"msg": "无操作权限"}, False),
+                               br._gm_recall_reason({"msg": "x"}, True),
+                               br._gm_recall_reason({"msg": "x"}, False, True),
+                               br._gm_recall_reason({"msg": "no permission"}, False)))
+
+        # R4 平台拒绝但既没 code 也没有「无操作权限」字样 + 不是本地表解析出来的
+        #    → 不硬说成「不是我发的」，也不编 code：把平台原话带出来；
+        #    老调用方（mine/reason 都没有）仍然退回通用话，行为不变。
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        API.http.fail = {"/messages/": ForbiddenError("权限不足")}
+        said, _deletes = cmd("r4", ref_obj="OTHER_MSG_R4")
+        check("R4 没 code 也没线索 → 带平台原话、不说成「不是我发的」；老调用仍是通用话",
+              said == "撤回失败：平台拒绝（权限不足）"
+              and said != br._GM_RECALL_NOT_MINE
+              and has("reason=denied")
+              and br._gm_recall_fail_text({"code": ""}) == "撤回失败（可能没有群管理权限）",
+              "said=%r legacy=%r" % (said, br._gm_recall_fail_text({"code": ""})))
+
+        # R5 已发集合不止「最后一条」：更早发的那条也认得出来（mine:<message id> 落盘）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        br._gm_note_sent(BOT_A, GID_A, "MINE_OLD", d)
+        br._gm_note_sent(BOT_A, GID_A, "MINE_NEW", d)
+        check("R5 更早发出去的 id 仍算「我发的」（sent:<gid> 只记最后一条，另有 mine:<id>）",
+              br._gm_own_sent(BOT_A, d, GID_A, "MINE_OLD") is True
+              and br._gm_own_sent(BOT_A, d, GID_A, "MINE_NEW") is True
+              and br._gm_own_sent(BOT_A, d, GID_A, "SOMEONE_ELSE") is False
+              and br._gm_last_sent(BOT_A, GID_A, d) == "MINE_NEW", "own-sent set")
+    finally:
+        br._reply = real_reply
+
+
 def case_idx_hit_rate():
     """让本地表真有命中率：bot 自己发的消息也记 id（#撤回自己 是平台唯一允许的那条路）。"""
     real_reply = br._reply
@@ -1415,6 +1539,8 @@ def main():
     case_gate_and_ref()
     reset()
     case_recall_texts()
+    reset()
+    case_recall_own_split()
     reset()
     case_idx_hit_rate()
     reset()

@@ -7716,6 +7716,11 @@ _GM_RECALL_ASK = "要撤哪条？回复它再说 #撤回"   # 没有引用时的
 # 绝不暗示能撤别人的消息，也绝不拿本 bot 的上一条顶替。
 _GM_RECALL_EARLY = ("那条太早了，我现在撤不了（只记得最近收到的一批）。"
                     "要撤就让我先说一句，再发 #撤回自己 —— 平台只允许我撤自己发的消息。")
+# 平台只允许撤「本 bot 自己发的」消息（真机 19:44:15：撤被回复的那条 → code=无
+# msg=无操作权限 http=500，而 18:47:34 撤本 bot 上一条是成功）。所以失败文案要先分
+# 「是不是我发的」：不是我发的说清楚原因，是我发的才叫「平台拒绝」。
+_GM_RECALL_NOT_MINE = "这条不是我发的，平台只让我撤自己发的消息"
+_GM_NOT_MINE_MSG = "无操作权限"   # 平台拒撤别人消息时的原话（归一化成 reason=not_mine）
 _GM_ZW = "\u200b\u200c\u200d\ufeff\u2060"     # 零宽字符：有人用它拆词绕关键词
 _GM_ADMIN_ROLES = ("owner", "admin", "administrator", "群主", "管理员")
 _GM_DEFAULT_STEP = {"n": 1, "mute_min": 10}
@@ -7728,6 +7733,9 @@ _GM_MSG_IDX_FLUSH = 5.0             # 落盘合并窗口（秒）：每来一条
 # 本 bot 自己发出去的那条（#撤回自己 用）：平台发的消息没有 msg_idx，只有 id，
 # 所以借同一张表存一行 sent:<群 gid> —— 重启后 #撤回自己 仍然撤得掉。
 _GM_MSG_IDX_SENT = "sent:"
+# 本 bot 发过的每一条各留一行 mine:<message id>：sent:<gid> 只记得最后一条，
+# 用户回复的是更早那条时「是不是我发的」就判不出来。
+_GM_MSG_IDX_MINE = "mine:"
 _GM_SKIP_ADDR = "群管理：#%s 不是叫本 bot，跳过"
 
 _gm_lock = threading.RLock()
@@ -8455,11 +8463,38 @@ def _gm_err_info(src):
     return {"code": str(code or ""), "msg": str(msg or "")[:_GM_MSG_MAX], "http": str(http or "")}
 
 
-def _gm_recall_fail_text(info):
-    """撤回失败的回复：有平台 code 就给 code，拿不到才是通用话。"""
-    code = str((info or {}).get("code") or "")
+def _gm_recall_reason(info, mine, from_idx=False):
+    """撤回失败归因 → "not_mine"（这条不是我发的）/ "denied"（我发的平台还是拒了）。
+
+    归一化平台原话：撤别人发的消息时平台回「无操作权限」（真机 19:44:15 那条
+    code=无 / msg=无操作权限 / http=500），这是「不是我发的」最可靠的信号。
+    另一个信号是引用从本地表解析出了 id、它却不在已发集合里 —— 本地表只记收到的
+    消息，能对上号的就不是本 bot 发的。
+    """
+    if mine:
+        return "denied"
+    if _GM_NOT_MINE_MSG in str((info or {}).get("msg") or ""):
+        return "not_mine"
+    return "not_mine" if from_idx else "denied"
+
+
+def _gm_recall_fail_text(info, mine=None):
+    """撤回失败的回复：先分「是不是我发的」，再看平台给的 code / msg。
+
+    mine=True → 我发的还失败：平台拒绝（有 code 给 code，没 code 用平台原话）；
+    mine=False（或 info 里已有 reason=not_mine）→ 这条不是我发的；
+    mine=None（老调用方 / 单测直接算文案）→ 维持原来的通用话。
+    """
+    info = info or {}
+    reason = str(info.get("reason") or "")
+    if reason == "not_mine" or (not reason and mine is False):
+        return _GM_RECALL_NOT_MINE
+    code = str(info.get("code") or "")
     if code:
         return "撤回失败：平台拒绝（code %s）" % code
+    msg = str(info.get("msg") or "").strip()
+    if msg and (reason == "denied" or mine is True):
+        return "撤回失败：平台拒绝（%s）" % msg
     return "撤回失败（可能没有群管理权限）"
 
 
@@ -8485,24 +8520,30 @@ async def _gm_call(api, method, path, body=None, **params):
     return True, data, False, {}
 
 
-async def _gm_recall(api, appid, gid, mid):
-    """撤回群消息 → (成功?, {"code","msg","http"})。
+async def _gm_recall(api, appid, gid, mid, botdir="", from_idx=False):
+    """撤回群消息 → (成功?, {"code","msg","http","mine","reason"})。
 
     失败绝不抛（不能影响后面的禁言 / 警告），但失败原因必须原样带回去：调用方要把它
     回给用户。官方文档（v2 群聊撤回）只允许撤回「机器人自己发送在当前群」的消息，
-    所以撤别人的消息失败时，原因（306004 no permission to delete message）是唯一线索。
+    所以撤别人的消息失败时，原因（306004 no permission to delete message / 无操作权限）
+    是唯一线索；reason=not_mine 就是「这条不是我发的」的归一化写法，便于统计。
     """
     if not (str(gid or "") and str(mid or "")):
         log("群管理：撤回缺少 group_openid / message_id → 跳过", appid, cat="错误")
-        return False, {"code": "", "msg": "缺少 group_openid / message_id", "http": ""}
+        return False, {"code": "", "msg": "缺少 group_openid / message_id", "http": "",
+                       "mine": False, "reason": "denied"}
     ok, data, denied, info = await _gm_call(
         api, "DELETE", "/v2/groups/{group_openid}/messages/{message_id}",
         group_openid=str(gid), message_id=str(mid))
     if ok:
         return True, {}
-    log("群管理：撤回失败 code=%s msg=%s｜group=%s｜target=%s｜http=%s%s"
+    mine = _gm_own_sent(appid, botdir, gid, mid)
+    info = dict(info or {})
+    info["mine"] = mine
+    info["reason"] = _gm_recall_reason(info, mine, from_idx)
+    log("群管理：撤回失败 code=%s msg=%s｜group=%s｜target=%s｜http=%s｜reason=%s%s"
         % (info.get("code") or "无", info.get("msg") or "无", str(gid or "")[:8],
-           str(mid)[:12], info.get("http") or "无",
+           str(mid)[:12], info.get("http") or "无", info["reason"],
            "｜没有群管理权限 → 继续后面几步" if denied else ""), appid, cat="错误")
     return False, info
 
@@ -8610,6 +8651,7 @@ def _gm_note_sent(appid, gid, mid, botdir=""):
         _gm_sent.setdefault(str(appid), {})[str(gid or "")] = mid
     if str(botdir or "").strip():
         _msg_idx_put(botdir, _GM_MSG_IDX_SENT + str(gid or ""), mid)
+        _msg_idx_put(botdir, _GM_MSG_IDX_MINE + mid, mid)
     return True
 
 
@@ -8620,6 +8662,25 @@ def _gm_last_sent(appid, gid, botdir=""):
     if mid or not str(botdir or "").strip():
         return mid
     return _msg_idx_find(botdir, _GM_MSG_IDX_SENT + str(gid or ""))
+
+
+def _gm_own_sent(appid, botdir, gid, mid):
+    """这个 message_id 是不是本 bot 自己发出去的 → 撤回失败时分开两种文案用。
+
+    三个来源，任一命中就算「我发的」：
+      ① 进程内存 _gm_sent[appid][gid]（刚发的那条）
+      ② msg_idx.json 的 sent:<群 gid>（重启后还在，见 _gm_last_sent）
+      ③ msg_idx.json 的 mine:<message id>（发过的每一条各一行，不止最后一条）
+    _outbox 存的是「文本哈希」，没有 message id，所以它帮不上这个判定（别指望它）。
+    """
+    mid = str(mid or "").strip()
+    if not mid:
+        return False
+    if _gm_last_sent(appid, gid, botdir) == mid:
+        return True
+    if not str(botdir or "").strip():
+        return False
+    return _msg_idx_find(botdir, _GM_MSG_IDX_MINE + mid) == mid
 
 
 async def _gm_say(api, appid, gid, mid, content, at_oid=""):
@@ -9161,7 +9222,7 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
         # 平台只允许撤回「机器人自己发的」消息（见 _gm_recall 的注释），所以撤别人的
         # 消息必然失败 —— 失败原因（平台 code）原样回给用户，不再拿自己的消息顶替。
         want_self = arg in _GM_RECALL_SELF
-        target, how = "", ""
+        target, how, from_idx = "", "", False
         if want_self:
             target = _gm_last_sent(appid, gid, botdir)
             how = "本 bot 上一条（#撤回%s）" % arg
@@ -9177,6 +9238,7 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
                 target = _msg_idx_find(botdir, idx)
                 if target:
                     how = "被回复的那条（ref_idx=%s → 本地表）" % idx[:16]
+                    from_idx = True
                 else:
                     log("群管理：#撤回 引用解析失败：ref_idx 不在本地表（ref_idx=%s｜本地 %d 条）→ 不退化"
                         % (idx[:20], len(_gm_msg_idx_table(botdir))),
@@ -9196,12 +9258,13 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
                         appid, cat="判定")
                     await _gm_say(api, appid, gid, mid, _GM_RECALL_ASK)
                 return True
-        ok, info = await _gm_recall(api, appid, gid, target)
-        log("群管理：#撤回（%s｜id=%s｜code=%s）→ %s"
+        ok, info = await _gm_recall(api, appid, gid, target, botdir, from_idx)
+        log("群管理：#撤回（%s｜id=%s｜code=%s｜reason=%s）→ %s"
             % (how, str(target)[:12], (info or {}).get("code") or "无",
-               "成功" if ok else "失败"), appid, cat="判定")
+               (info or {}).get("reason") or "无", "成功" if ok else "失败"),
+            appid, cat="判定")
         await _gm_say(api, appid, gid, mid,
-                      "已撤回" if ok else _gm_recall_fail_text(info))
+                      "已撤回" if ok else _gm_recall_fail_text(info, (info or {}).get("mine")))
         return True
     minutes = _gm_int(arg, 1, 30 * 24 * 60, 10) if arg else 10
     oid = _gm_target_oid(message, appid, botdir)
@@ -9515,7 +9578,7 @@ async def _gm_punish(appid, botdir, message, gid, conf, v, key, nick, shared, mi
     kick_at = int(conf.get("kick_at") or 0)
     recall_ok = False
     if conf.get("recall_enabled"):
-        recall_ok, _recall_info = await _gm_recall(api, appid, gid, mid)
+        recall_ok, _recall_info = await _gm_recall(api, appid, gid, mid, botdir)
     action = ""
     if kick_at > 0 and n >= kick_at and oid:
         if await _gm_kick(api, appid, gid, oid):
