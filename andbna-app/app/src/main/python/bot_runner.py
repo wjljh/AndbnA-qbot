@@ -7583,6 +7583,10 @@ def _make_intents(flags, appid=""):
 #
 # botpy 17 的 BotAPI 没有这四个接口，所以直接用它的 HTTP 层（token / session 复用）：
 #   撤回   DELETE /v2/groups/{group_openid}/messages/{message_id}
+#          官方文档原文：「用于撤回机器人发送在当前群 group_openid 的消息 message_id，
+#          发送超出2分钟的消息不可撤回」→ 只能撤本 bot 自己发的，撤别人的消息平台回
+#          306004 no permission to delete message。所以 #撤回 的目标必须由用户指清楚
+#          （回复它 / #撤回自己），失败原因（平台 code）原样回给用户，绝不拿自己的顶替。
 #   禁言   POST   /v2/groups/{group_openid}/restrict_chat_setting
 #   查状态 GET    /v2/groups/{group_openid}/restrict_chat_setting
 #   踢人   DELETE /v2/groups/{group_openid}/members/{member_openid}   ← 需真机确认
@@ -7601,6 +7605,7 @@ _GM_WELCOME_TTL = 300.0           # 同一 (群, 成员) 5 分钟内只欢迎一
 _GM_WELCOME_GENERIC = "（抬眼）来了？随便坐，别拘束。"
 _GM_WARN_FALLBACK = "这条内容涉及外挂/脚本，请不要在本群发布。"
 _GM_NO_PERM = "没有群管理权限"
+_GM_RECALL_ASK = "要撤哪条？回复它再说 #撤回"   # 没有引用时的引导语（绝不撤自己的）
 _GM_ZW = "\u200b\u200c\u200d\ufeff\u2060"     # 零宽字符：有人用它拆词绕关键词
 _GM_ADMIN_ROLES = ("owner", "admin", "administrator", "群主", "管理员")
 _GM_DEFAULT_STEP = {"n": 1, "mute_min": 10}
@@ -7843,8 +7848,8 @@ async def _gm_group_name(botdir, gid, api=None, appid=""):
         return hit
     name = _gm_name_cached(botdir, gid)
     if not name and gid and api is not None:
-        ok, data, _why = await _gm_call(api, "GET", "/v2/groups/{group_openid}/info",
-                                        group_openid=gid)
+        ok, data, _why, _info = await _gm_call(api, "GET", "/v2/groups/{group_openid}/info",
+                                               group_openid=gid)
         if ok and isinstance(data, dict):
             name = str(data.get("group_name") or "").strip()
         if not name:
@@ -8218,37 +8223,115 @@ def _gm_denied(why):
     return any(w in low for w in _GM_DENIED_WORDS)
 
 
+# botpy 的错误类不带状态码（errors.py 只存 msgs），按类名反查；业务 code 只能从
+# 返回体 / 异常正文里抠。两样都拿不到时如实留空 —— 绝不编一个 code 回给用户。
+_GM_HTTP_BY_KIND = {"AuthenticationFailedError": 401, "ForbiddenError": 403,
+                    "NotFoundError": 404, "MethodNotAllowedError": 405,
+                    "SequenceNumberError": 429, "ServerError": 500}
+_GM_CODE_RE = re.compile(r"(?:code|errcode|err_code)\s*[=:]\s*\"?([0-9]{3,8})", re.I)
+_GM_CODE_ANY = re.compile(r"\b(30[0-9]{4}|11[0-9]{3}|22[0-9]{3})\b")
+_GM_MSG_MAX = 120                 # 平台 message 进日志的长度上限
+
+
+def _gm_err_status(e):
+    """异常的 HTTP 状态码 → "403" / ""（类名反查优先，其次同名字段）。"""
+    kind = type(e).__name__
+    if kind in _GM_HTTP_BY_KIND:
+        return str(_GM_HTTP_BY_KIND[kind])
+    for name in ("status", "status_code", "http_status"):
+        v = getattr(e, name, None)
+        if isinstance(v, int) and 400 <= v <= 599:
+            return str(v)
+    return ""
+
+
+def _gm_body_code(data):
+    """平台返回体里的业务 code（0 / 空 = 成功）；不是 dict 或没有 → ""。"""
+    if not isinstance(data, dict):
+        return ""
+    for k in ("code", "errcode", "err_code", "sub_code"):
+        v = data.get(k)
+        if v in (None, "", 0, "0"):
+            continue
+        return str(v)
+    return ""
+
+
+def _gm_err_info(src):
+    """异常 或 平台返回体 → {"code","msg","http"}（msg 截断 _GM_MSG_MAX 字）。
+
+    botpy 的 _handle_response 只把 body 的 message 抬进异常（code 丢了），所以 code
+    依次试：字段 → 正文里的 code=xxx → 正文里裸的业务码。都没有就留空。
+    """
+    code = msg = http = ""
+    if isinstance(src, dict):
+        code = _gm_body_code(src)
+        msg = str(src.get("message") or src.get("msg") or "").strip()
+    elif src is not None:
+        http = _gm_err_status(src)
+        for name in ("code", "errcode", "err_code", "sub_code"):
+            v = getattr(src, name, None)
+            if v not in (None, "", 0, "0"):
+                code = str(v)
+                break
+        msg = _gm_why(src).split(": ", 1)[-1].strip()
+        if not code:
+            m = _GM_CODE_RE.search(msg) or _GM_CODE_ANY.search(msg)
+            if m:
+                code = m.group(1)
+    return {"code": str(code or ""), "msg": str(msg or "")[:_GM_MSG_MAX], "http": str(http or "")}
+
+
+def _gm_recall_fail_text(info):
+    """撤回失败的回复：有平台 code 就给 code，拿不到才是通用话。"""
+    code = str((info or {}).get("code") or "")
+    if code:
+        return "撤回失败：平台拒绝（code %s）" % code
+    return "撤回失败（可能没有群管理权限）"
+
+
 async def _gm_call(api, method, path, body=None, **params):
-    """调一个官方群管理接口 → (成功?, 返回体或错误人话, 是不是没有权限)。
+    """调一个官方群管理接口 → (成功?, 返回体或错误人话, 是不是没有权限, 失败信息)。
 
     botpy 的 BotAPI 没有这几个接口，所以直接用它的 HTTP 层；参数名与官方文档一致，
     将来 botpy 原生支持了只改这里一处。没有 api（单测 / 半启动）→ 一律优雅失败。
     """
     http = getattr(api, "_http", None) if api is not None else None
     if http is None or not hasattr(http, "request"):
-        return False, "没有可用的 api 对象", False
+        return False, "没有可用的 api 对象", False, {"code": "", "msg": "没有可用的 api 对象", "http": ""}
     kw = {"json": body} if body is not None else {}
     try:
         data = await http.request(_gm_route(method, path, **params), **kw)
     except Exception as e:
         why = _gm_why(e)
-        return False, why, _gm_denied(why)
-    return True, data, False
+        return False, why, _gm_denied(why), _gm_err_info(e)
+    # 有的实现不抛、直接把 {"code":…,"message":…} 当成功返回：这里的 code 才是判据
+    if _gm_body_code(data):
+        why = _gm_why(data)
+        return False, data, _gm_denied(why), _gm_err_info(data)
+    return True, data, False, {}
 
 
 async def _gm_recall(api, appid, gid, mid):
-    """撤回群消息 → 成功?（失败只记日志：绝不影响后面的禁言 / 警告）。"""
+    """撤回群消息 → (成功?, {"code","msg","http"})。
+
+    失败绝不抛（不能影响后面的禁言 / 警告），但失败原因必须原样带回去：调用方要把它
+    回给用户。官方文档（v2 群聊撤回）只允许撤回「机器人自己发送在当前群」的消息，
+    所以撤别人的消息失败时，原因（306004 no permission to delete message）是唯一线索。
+    """
     if not (str(gid or "") and str(mid or "")):
         log("群管理：撤回缺少 group_openid / message_id → 跳过", appid, cat="错误")
-        return False
-    ok, data, denied = await _gm_call(
+        return False, {"code": "", "msg": "缺少 group_openid / message_id", "http": ""}
+    ok, data, denied, info = await _gm_call(
         api, "DELETE", "/v2/groups/{group_openid}/messages/{message_id}",
         group_openid=str(gid), message_id=str(mid))
     if ok:
-        return True
-    log("群管理：撤回失败（%s）%s" % (data, "｜没有群管理权限 → 继续后面几步" if denied else ""),
-        appid, cat="错误")
-    return False
+        return True, {}
+    log("群管理：撤回失败 code=%s msg=%s｜group=%s｜target=%s｜http=%s%s"
+        % (info.get("code") or "无", info.get("msg") or "无", str(gid or "")[:8],
+           str(mid)[:12], info.get("http") or "无",
+           "｜没有群管理权限 → 继续后面几步" if denied else ""), appid, cat="错误")
+    return False, info
 
 
 def _gm_restrict_body(member_oid, minutes, now=None):
@@ -8266,7 +8349,7 @@ async def _gm_mute(api, appid, gid, member_oid, minutes, now=None):
     if not (str(gid or "") and str(member_oid or "")):
         log("群管理：禁言缺少 group_openid / member_openid → 跳过", appid, cat="错误")
         return False
-    ok, data, denied = await _gm_call(
+    ok, data, denied, _info = await _gm_call(
         api, "POST", "/v2/groups/{group_openid}/restrict_chat_setting",
         body=_gm_restrict_body(member_oid, minutes, now), group_openid=str(gid))
     if ok:
@@ -8279,7 +8362,7 @@ async def _gm_mute(api, appid, gid, member_oid, minutes, now=None):
 
 async def _gm_restrict_state(api, appid, gid):
     """查询群禁言状态 → (成功?, 返回体)。"""
-    ok, data, denied = await _gm_call(
+    ok, data, denied, _info = await _gm_call(
         api, "GET", "/v2/groups/{group_openid}/restrict_chat_setting",
         group_openid=str(gid))
     if not ok:
@@ -8293,7 +8376,7 @@ async def _gm_kick(api, appid, gid, member_oid):
     if not (str(gid or "") and str(member_oid or "")):
         log("群管理：踢出缺少 group_openid / member_openid → 跳过", appid, cat="错误")
         return False
-    ok, data, denied = await _gm_call(
+    ok, data, denied, _info = await _gm_call(
         api, "DELETE", "/v2/groups/{group_openid}/members/{member_openid}",
         group_openid=str(gid), member_openid=str(member_oid))
     if ok:
@@ -8419,19 +8502,23 @@ def _gm_user_key(message, appid):
 
 # ── 管理命令：#撤回 / #禁言 / #解禁 ──────────────────
 
-_GM_CMD_RE = re.compile(r"^#\s*(撤回|禁言|解禁)\s*(\d{1,4})?$")
+_GM_CMD_RE = re.compile(r"^#\s*(撤回|禁言|解禁)\s*(自己|上一条|\d{1,4})?$")
+_GM_RECALL_SELF = ("自己", "上一条")   # #撤回自己 / #撤回自己 上一条：唯一的「撤本 bot」入口
 
 
 def _gm_cmd_of(text):
     """→ (命令, 参数)；不是群管理命令 → ("", "")。
 
     先去掉 <@…>：真机上「@某人 #禁言 10」的正文是 "<@!openid> #禁言 10"，
-    不剥掉这一层就永远匹配不上。
+    不剥掉这一层就永远匹配不上。「自己 / 上一条」只对 #撤回 有效（#禁言 自己 不是命令）。
     """
     m = _GM_CMD_RE.match(_strip_mentions(text).strip())
     if not m:
         return "", ""
-    return m.group(1), (m.group(2) or "")
+    cmd, arg = m.group(1), (m.group(2) or "")
+    if arg in _GM_RECALL_SELF and cmd != "撤回":
+        return "", ""
+    return cmd, arg
 
 
 def _gm_member_role(message):
@@ -8570,19 +8657,19 @@ def _msg_idx_note(appid, botdir, message, mid):
 
     LRU 保留最近 _GM_MSG_IDX_LIMIT 条；落盘用 _save_json（tmp + os.replace 原子替换），
     但按 _GM_MSG_IDX_FLUSH 秒合并写 —— 每条消息都重写 2000 条对闪存太狠。
-    进程被杀最多丢最后几秒的新映射（查不到就退回「本 bot 上一条」）。拿不到即不记。
+    进程被杀最多丢最后几秒的新映射（查不到就如实说「解析不到」，不退回本 bot 上一条）。
     """
     import collections
 
     mid = str(mid or "").strip()
     idx = _msg_idx_own(message)
     if not idx:
-        # 真机取证：payload 里到底有没有 msg_idx —— 没有就只能退回「本 bot 上一条」
+        # 真机取证：payload 里到底有没有 msg_idx —— 没有就没人能用引用撤回
         path = _gm_msg_idx_path(botdir)
         if path not in _gm_msg_idx_miss:
             _gm_msg_idx_miss.add(path)
             log("群管理：收到的 payload 没有 message_scene.ext 的 msg_idx"
-                "（引用撤回只能退回「本 bot 上一条」｜每个 bot 只提示一次）",
+                "（引用撤回会解析不到，只能靠 #撤回自己｜每个 bot 只提示一次）",
                 appid, cat="判定", lv="detail")
         return False
     if not mid:
@@ -8694,33 +8781,53 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
         await _gm_say(api, appid, gid, mid, _GM_NO_PERM)
         return True
     if cmd == "撤回":
-        # 引用解析优先级：① message_scene.ext 的 ref_msg_idx 查本地表（真机格式）
-        # ② message_reference（字典或 botpy 对象）③ 本 bot 上一条
-        idx = _gm_ref_idx(message)
-        ref = _gm_ref_id(message)
+        # 目标只有两个来源，且**绝不互相退化**（2.0.1 真机事故：用户要撤群员的消息，
+        # 引用解析不到 → 撤掉了本 bot 自己的消息）：
+        #   ① 有引用 → ref_msg_idx 查本地表 / message_reference 给的 id，撤那条；
+        #   ② 没有引用 → 不撤任何东西，回一句「要撤哪条」；
+        #   ③ 只有显式的 #撤回自己 / #撤回上一条 才撤本 bot 上一条。
+        # 平台只允许撤回「机器人自己发的」消息（见 _gm_recall 的注释），所以撤别人的
+        # 消息必然失败 —— 失败原因（平台 code）原样回给用户，不再拿自己的消息顶替。
+        want_self = arg in _GM_RECALL_SELF
         target, how = "", ""
-        if idx:
-            target = _msg_idx_find(botdir, idx)
-            if target:
-                how = "被回复的那条（ref_idx=%s → 本地表）" % idx[:16]
-            else:
-                log("群管理：#撤回 引用解析失败：ref_idx 不在本地表（ref_idx=%s｜本地 %d 条）"
-                    % (idx[:20], len(_gm_msg_idx_table(botdir))), appid, cat="判定", lv="detail")
-        if not target and ref:
-            target, how = ref, "被回复的那条（平台直接给的 id）"
-        if not target:
+        if want_self:
             target = _gm_last_sent(appid, gid)
-            how = "本 bot 上一条" if target else ""
-        if not target:
-            log("群管理：#撤回 找不到目标（没有引用消息，也没有本 bot 的上一条记录）",
-                appid, cat="系统")
-            await _gm_say(api, appid, gid, mid, "没找到要撤回的消息（回复它 + #撤回 试试）")
-            return True
-        ok = await _gm_recall(api, appid, gid, target)
-        log("群管理：#撤回（%s｜id=%s）→ %s"
-            % (how, str(target)[:12], "成功" if ok else "失败"), appid, cat="判定")
+            how = "本 bot 上一条（#撤回%s）" % arg
+            if not target:
+                log("群管理：#撤回%s 没有本 bot 上一条的记录（outbox 里没有）" % arg,
+                    appid, cat="系统")
+                await _gm_say(api, appid, gid, mid, "本 bot 刚没发过消息，没有可撤的")
+                return True
+        else:
+            idx = _gm_ref_idx(message)
+            ref = _gm_ref_id(message)
+            if idx:
+                target = _msg_idx_find(botdir, idx)
+                if target:
+                    how = "被回复的那条（ref_idx=%s → 本地表）" % idx[:16]
+                else:
+                    log("群管理：#撤回 引用解析失败：ref_idx 不在本地表（ref_idx=%s｜本地 %d 条）→ 不退化"
+                        % (idx[:20], len(_gm_msg_idx_table(botdir))),
+                        appid, cat="判定", lv="detail")
+            if not target and ref:
+                target, how = ref, "被回复的那条（平台直接给的 id）"
+            if not target:
+                if idx or ref:
+                    log("群管理：#撤回 有引用但没有可撤的 id（ref_idx=%s｜ref_id=%s）→ 不撤本 bot 的消息"
+                        % ((idx or "无")[:20], (ref or "无")[:16]), appid, cat="判定")
+                    await _gm_say(api, appid, gid, mid,
+                                  "撤回失败：被回复的那条解析不到（回复它再说 #撤回）")
+                else:
+                    log("群管理：#撤回 没有引用 → 不撤本 bot 的消息（要撤自己得写 #撤回自己）",
+                        appid, cat="判定")
+                    await _gm_say(api, appid, gid, mid, _GM_RECALL_ASK)
+                return True
+        ok, info = await _gm_recall(api, appid, gid, target)
+        log("群管理：#撤回（%s｜id=%s｜code=%s）→ %s"
+            % (how, str(target)[:12], (info or {}).get("code") or "无",
+               "成功" if ok else "失败"), appid, cat="判定")
         await _gm_say(api, appid, gid, mid,
-                      "已撤回" if ok else "撤回失败（可能没有群管理权限）")
+                      "已撤回" if ok else _gm_recall_fail_text(info))
         return True
     minutes = _gm_int(arg, 1, 30 * 24 * 60, 10) if arg else 10
     oid = _gm_target_oid(message, appid, botdir)
@@ -9034,7 +9141,7 @@ async def _gm_punish(appid, botdir, message, gid, conf, v, key, nick, shared, mi
     kick_at = int(conf.get("kick_at") or 0)
     recall_ok = False
     if conf.get("recall_enabled"):
-        recall_ok = await _gm_recall(api, appid, gid, mid)
+        recall_ok, _recall_info = await _gm_recall(api, appid, gid, mid)
     action = ""
     if kick_at > 0 and n >= kick_at and oid:
         if await _gm_kick(api, appid, gid, oid):

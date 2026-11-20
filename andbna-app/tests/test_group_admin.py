@@ -84,10 +84,31 @@ class FakeApi(object):
 
 
 class ForbiddenError(RuntimeError):
-    """botpy 的 403（名字与真的一致：_gm_denied 只看类名）。"""
+    """botpy 的 403（名字与真的一致：_gm_denied 只看类名）。
 
-    def __init__(self, msg):
+    code 可选：真机上市台把业务 code 丢在返回体里，botpy 只抬出 message；
+    单测两种形状（有 code 字段 / 只有正文）都要能取。
+    """
+
+    def __init__(self, msg, code=None):
         self.msgs = msg
+        if code is not None:
+            self.code = code
+
+
+class _BodyHttp(object):
+    """http 层不抛、直接把平台返回体当成功值返回的实现（有的版本就这样）。"""
+
+    def __init__(self, body):
+        self.body = body
+
+    async def request(self, route, **kw):
+        return self.body
+
+
+class _BodyApi(object):
+    def __init__(self, body):
+        self._http = _BodyHttp(body)
 
 
 class FakeAuthor(object):
@@ -569,19 +590,27 @@ def case_cmd():
               bool(posts) and posts[-1][1]["members"][0]["op"] == "del" and has("群管理：#解禁"),
               "body=%s" % (posts[-1][1] if posts else None,))
 
-        # 4) #撤回 不带回复 → 撤本 bot 上一条（用发出去时记下的 msg_id）
+        # 4) #撤回自己 → 撤本 bot 上一条（用发出去时记下的 msg_id）：唯一的「撤自己」入口
         reset()
         write_owner(d)
         write_admin(d, GID_A)
         br._reply = stub_reply()
         br._gm_note_sent(BOT_A, GID_A, "MINE_MSG_77")
-        msg = FakeMsg("c4", "#撤回", FakeAuthor(MASTER, "主人"), GID_A,
+        msg = FakeMsg("c4", "#撤回自己", FakeAuthor(MASTER, "主人"), GID_A,
                       mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
         asyncio.run(br.group_admin_cmd(BOT_A, d, msg, GID_A, msg.content, msg.id))
         recs = [p for (m, p, _a, _b) in API.http.calls if m == "DELETE" and "/messages/" in p]
-        check("I5 #撤回 不带回复 → 撤本 bot 上一条（outbox 记的 msg_id）",
+        check("I5 #撤回自己 → 撤本 bot 上一条（outbox 记的 msg_id）",
               len(recs) == 1 and "MINE_MSG_77" in recs[0] and has("本 bot 上一条"),
               "recalls=%s" % recs)
+        check("I5b #撤回自己 / #撤回 自己 / #撤回上一条 都解析成命令，#禁言 自己 不算命令",
+              br._gm_cmd_of("#撤回自己") == ("撤回", "自己")
+              and br._gm_cmd_of("#撤回 自己") == ("撤回", "自己")
+              and br._gm_cmd_of("#撤回上一条") == ("撤回", "上一条")
+              and br._gm_cmd_of("<@!ME> #撤回 上一条") == ("撤回", "上一条")
+              and br._gm_cmd_of("#禁言 自己") == ("", ""),
+              "%s / %s / %s" % (br._gm_cmd_of("#撤回自己"), br._gm_cmd_of("#撤回上一条"),
+                                br._gm_cmd_of("#禁言 自己")))
 
         # 5) 不是命令的正文不动
         check("I6 普通正文不当作命令", br._gm_cmd_of("今天 #撤回 一下") == ("" , "")
@@ -928,7 +957,7 @@ def case_gate_and_ref():
               and len(API.sent) == 1,
               "ref=%r recalls=%s" % (br._gm_ref_id(m), recs))
 
-        # N5 ref_idx 查不到 → 退化为「本 bot 上一条」，日志写明失败原因
+        # N5 ref_idx 查不到 → 不退化撤自己的（2.0.1 真机事故回归）：不发 DELETE，回失败原因
         reset()
         write_owner(d)
         write_admin(d, GID_A)
@@ -938,10 +967,80 @@ def case_gate_and_ref():
         m.raw = scene_raw(ref_idx="REFIDX_MISSING")
         asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
         recs = [p for (meth, p, _a, _b) in API.http.calls if meth == "DELETE" and "/messages/" in p]
-        check("N5 ref_idx 不在本地表 → 撤「本 bot 上一条」并记「引用解析失败」",
-              len(recs) == 1 and "MINE_LAST_88" in recs[0]
-              and has("引用解析失败：ref_idx 不在本地表") and has("本 bot 上一条"),
-              "recalls=%s" % (recs,))
+        said = str(API.sent[0].get("content") or "") if API.sent else ""
+        check("N5 ref_idx 不在本地表 → 不撤本 bot 上一条（不退化），回「解析不到」+ 日志写明",
+              not recs and len(API.sent) == 1 and "已撤回" not in said
+              and "解析不到" in said
+              and has("引用解析失败：ref_idx 不在本地表") and has("→ 不退化")
+              and has("有引用但没有可撤的 id"),
+              "recalls=%s said=%r" % (recs, said))
+
+        # 5) 完全没有引用 → 一个 DELETE 都不发，回引导语（以前这里会撤掉本 bot 的上一条）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        br._gm_note_sent(BOT_A, GID_A, "MINE_NOREF_11")
+        m = FakeMsg("n5b", "#撤回", FakeAuthor(MASTER, "主人"), GID_A,
+                    mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        check("N5b 无引用 + 没有「自己」→ 不调 DELETE，回「要撤哪条？回复它再说 #撤回」",
+              not [c for c in API.http.calls if c[0] == "DELETE"]
+              and [k.get("content") for k in API.sent] == ["要撤哪条？回复它再说 #撤回"]
+              and has("没有引用 → 不撤本 bot 的消息"),
+              "sent=%s" % ([k.get("content") for k in API.sent],))
+
+        # 6) 有引用但平台拒绝撤回 → 不发「已撤回」、不撤自己的，回复带平台 code
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        br._gm_note_sent(BOT_A, GID_A, "MINE_LAST_99")
+        API.http.fail = {"/messages/": ForbiddenError("no permission to delete message", 306004)}
+        m = FakeMsg("n5c", "#撤回", FakeAuthor(MASTER, "主人"), GID_A,
+                    mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+        m.message_reference = _RefObj("OTHER_MSG_1")
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        recs = [p for (meth, p, _a, _b) in API.http.calls if meth == "DELETE" and "/messages/" in p]
+        said = str(API.sent[0].get("content") or "") if API.sent else ""
+        check("N6 有引用但撤回失败 → 只试那条、不撤自己的、不发「已撤回」、回复带 code 306004",
+              len(recs) == 1 and "OTHER_MSG_1" in recs[0]
+              and not [p for p in recs if "MINE_LAST_99" in p]
+              and len(API.sent) == 1 and "已撤回" not in said
+              and said == "撤回失败：平台拒绝（code 306004）"
+              and has("群管理：撤回失败 code=306004"),
+              "recalls=%s said=%r" % (recs, said))
+
+        # 7) 平台返回体 / 异常 → code、message、HTTP 状态各自取对（日志里必须有 code）
+        info = br._gm_err_info({"code": 306004, "message": "no permission to delete message"})
+        check("N7 返回体：code=306004、msg 原样",
+              info["code"] == "306004" and info["msg"] == "no permission to delete message"
+              and info["http"] == "", "info=%s" % (info,))
+        info = br._gm_err_info(ForbiddenError("no permission to delete message", 306004))
+        check("N7b 异常：类名反查 HTTP 403 + 业务 code 从字段取",
+              info["code"] == "306004" and info["http"] == "403", "info=%s" % (info,))
+        info = br._gm_err_info(ForbiddenError("retract message error, code=306005 retry"))
+        check("N7c 异常正文里只有 code=306005 → 也抠得出来（botpy 丢了 body 的 code）",
+              info["code"] == "306005" and info["http"] == "403", "info=%s" % (info,))
+        info = br._gm_err_info(ForbiddenError("权限不足"))
+        check("N7d 真拿不到 code → 留空（不编一个），回复退回通用话",
+              info["code"] == "" and info["http"] == "403"
+              and br._gm_recall_fail_text(info) == "撤回失败（可能没有群管理权限）",
+              "info=%s text=%r" % (info, br._gm_recall_fail_text(info)))
+        check("N7e msg 截断到 120 字；成功返回体的 code=0 不算失败",
+              len(br._gm_err_info({"message": "x" * 500})["msg"]) == 120
+              and br._gm_body_code({"code": 0}) == ""
+              and br._gm_body_code({"code": 306004}) == "306004",
+              "trunc/body-code")
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        br._gm_note_sent(BOT_A, GID_A, "MINE_LAST_77")
+        api0 = _BodyApi({"code": 306004, "message": "no permission to delete message"})
+        ok, info = asyncio.run(br._gm_recall(api0, BOT_A, GID_A, "OTHER_MSG_2"))
+        check("N7f http 层不抛、直接把 {code,message} 当成功返回 → 仍判失败并记 code",
+              ok is False and info["code"] == "306004"
+              and has("群管理：撤回失败 code=306004 msg=no permission to delete message")
+              and br._gm_recall_fail_text(info) == "撤回失败：平台拒绝（code 306004）",
+              "ok=%s info=%s" % (ok, info))
 
         # N6 私聊 #撤回：门禁不适用、私聊入口不经过群管理命令（行为与 2.0.0 一致）
         m = FakeMsg("n6", "#撤回", FakeAuthor(MASTER, "主人"), "")
@@ -951,7 +1050,7 @@ def case_gate_and_ref():
         tail = src[src.index("async def on_c2c_message_create"):]
         cut = tail.find("\n        async def ", 20)
         body = tail[:cut] if cut > 0 else tail
-        check("N6 私聊：#撤回 不被群门禁拦（私聊入口本来就不走 group_admin_cmd）",
+        check("N9 私聊：#撤回 不被群门禁拦（私聊入口本来就不走 group_admin_cmd）",
               allowed is True and "group_admin_cmd" not in body
               and "_group_admin_tick" not in body and br._gm_cmd_of("#撤回") == ("撤回", ""),
               "allowed=%s why=%s c2c_hit=%s" % (allowed, why, "group_admin_cmd" in body))
