@@ -968,9 +968,10 @@ def case_gate_and_ref():
         asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
         recs = [p for (meth, p, _a, _b) in API.http.calls if meth == "DELETE" and "/messages/" in p]
         said = str(API.sent[0].get("content") or "") if API.sent else ""
-        check("N5 ref_idx 不在本地表 → 不撤本 bot 上一条（不退化），回「解析不到」+ 日志写明",
+        check("N5 ref_idx 不在本地表 → 不撤本 bot 上一条（不退化），回「太早了」+ #撤回自己",
               not recs and len(API.sent) == 1 and "已撤回" not in said
-              and "解析不到" in said
+              and said == br._GM_RECALL_EARLY
+              and "太早了" in said and "#撤回自己" in said and "解析不到" not in said
               and has("引用解析失败：ref_idx 不在本地表") and has("→ 不退化")
               and has("有引用但没有可撤的 id"),
               "recalls=%s said=%r" % (recs, said))
@@ -1054,6 +1055,160 @@ def case_gate_and_ref():
               allowed is True and "group_admin_cmd" not in body
               and "_group_admin_tick" not in body and br._gm_cmd_of("#撤回") == ("撤回", ""),
               "allowed=%s why=%s c2c_hit=%s" % (allowed, why, "group_admin_cmd" in body))
+    finally:
+        br._reply = real_reply
+
+
+# ── P 撤回文案分家 + 让本地表真有命中率（真机 11-20 19:27:59）─────────
+#
+# 真机那一条：群消息 payload 带 ref_msg_idx=REFIDX_HTsaCK…，msg_idx.json 里 68 条没有它
+# （那条是在表开始记录之前 / 换包重启之前收到的），于是回了一句「解析不到」——用户既不知道
+# 为什么，也没有出路。现在：三种失败三种话，且 bot 自己发出去的消息也进表（#撤回自己 才是
+# 平台真正允许的那条路）。
+
+def case_recall_texts():
+    real_reply = br._reply
+    try:
+        d = botdir(BOT_A)
+        br._reply = stub_reply()
+        said = {}
+
+        def cmd(mid, raw, ref_obj=None):
+            m = FakeMsg(mid, "#撤回", FakeAuthor(MASTER, "主人"), GID_A,
+                        mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+            m.raw = raw
+            if ref_obj:
+                m.message_reference = _RefObj(ref_obj)
+            asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+            return str(API.sent[-1].get("content") or "") if API.sent else ""
+
+        # ① 命中：上了表的那条 → 已撤回
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        br._msg_idx_note(BOT_A, d, _idx_msg("t1", "REFIDX_HIT1"), "t1")
+        said["hit"] = cmd("p1", scene_raw(ref_idx="REFIDX_HIT1"))
+        recs = [p for (m, p, _a, _b) in API.http.calls if m == "DELETE" and "/messages/" in p]
+        check("P1 ref_idx 命中本地表 → 撤那条、回「已撤回」",
+              said["hit"] == "已撤回" and len(recs) == 1 and "t1" in recs[0],
+              "said=%r recalls=%s" % (said["hit"], recs))
+
+        # ② 未命中：表里没有那条 → 「太早了」+ 一条能用的出路（不是「解析不到」）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        said["early"] = cmd("p2", scene_raw(ref_idx="REFIDX_HTsaCK+NxS1ha"))
+        check("P2 ref_idx 未命中 → 「太早了，我现在撤不了（只记得最近收到的一批）」+ #撤回自己",
+              said["early"] == br._GM_RECALL_EARLY
+              and "太早了" in said["early"] and "只记得最近收到的一批" in said["early"]
+              and "#撤回自己" in said["early"] and "解析不到" not in said["early"]
+              and not [c for c in API.http.calls if c[0] == "DELETE"],
+              "said=%r" % (said["early"],))
+        check("P2b 文案不暗示「能撤别人的」：写明平台只允许撤本 bot 自己发的",
+              "平台只允许我撤自己发的消息" in said["early"]
+              and "别人的" not in said["early"], "said=%r" % (said["early"],))
+
+        # ③ 没有引用 → 维持原来的引导
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        said["ask"] = cmd("p3", scene_raw())
+        check("P3 完全没有引用 → 维持引导语（与 ② 不是同一句）",
+              said["ask"] == br._GM_RECALL_ASK
+              and not [c for c in API.http.calls if c[0] == "DELETE"],
+              "said=%r" % (said["ask"],))
+
+        # ④ 有 ref_id 但平台拒绝 → 带平台 code（不是 ② 也不是 ③）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        API.http.fail = {"/messages/": ForbiddenError("no permission to delete message", 306008)}
+        said["deny"] = cmd("p4", scene_raw(), ref_obj="OTHER_MSG_P4")
+        check("P4 平台拒绝 → 回平台 code（306008），三句文案两两不同",
+              said["deny"] == "撤回失败：平台拒绝（code 306008）"
+              and len(set([said["hit"], said["early"], said["ask"], said["deny"]])) == 4,
+              "said=%s" % (said,))
+    finally:
+        br._reply = real_reply
+
+
+def case_idx_hit_rate():
+    """让本地表真有命中率：bot 自己发的消息也记 id（#撤回自己 是平台唯一允许的那条路）。"""
+    real_reply = br._reply
+    try:
+        d = botdir(BOT_A)
+        br._reply = stub_reply()
+
+        # Q1 bot 自己发出去的一条 → 表里有 sent:<gid>（进程内存 + 落盘都有）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        asyncio.run(br._gm_say(API, BOT_A, GID_A, "", "本 bot 的通知"))
+        idx = br._GM_MSG_IDX_SENT + GID_A
+        check("Q1 bot 自己发的消息也记 message_id（msg_idx.json 的 sent:<gid>）",
+              br._gm_last_sent(BOT_A, GID_A, d) == "SENT_1"
+              and br._msg_idx_find(d, idx) == "SENT_1"
+              and os.path.exists(os.path.join(d, "msg_idx.json")),
+              "last=%r find=%r" % (br._gm_last_sent(BOT_A, GID_A, d), br._msg_idx_find(d, idx)))
+
+        # Q2 模拟重启（进程内存清空、盘上的表还在）→ #撤回自己 仍然撤得掉
+        br._gm_sent.clear()
+        br._gm_msg_idx.clear()
+        br._gm_msg_idx_ts.clear()
+        m = FakeMsg("q2", "#撤回自己", FakeAuthor(MASTER, "主人"), GID_A,
+                    mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        recs = [p for (meth, p, _a, _b) in API.http.calls if meth == "DELETE" and "/messages/" in p]
+        check("Q2 重启后 #撤回自己 靠落盘那份仍能撤（不再「本 bot 刚没发过消息」）",
+              len(recs) == 1 and "SENT_1" in recs[0]
+              and str(API.sent[-1].get("content") or "") == "已撤回", "recalls=%s" % recs)
+
+        # Q3 私聊收到的消息也进同一张表（以前只有 _handle_group 记）
+        reset()
+        write_owner(d)
+        br._msg_idx_note(BOT_A, d, _idx_msg("c9", "REFIDX_C2C1"), "c9")
+        check("Q3 私聊 / 群聊共用一个记录点（那条有 msg_idx 就进表）",
+              br._msg_idx_find(d, "REFIDX_C2C1") == "c9", br._msg_idx_find(d, "REFIDX_C2C1"))
+        src = open(os.path.join(ROOT, "app", "src", "main", "python", "bot_runner.py"),
+                   encoding="utf-8").read()
+        tail = src[src.index("async def on_c2c_message_create"):]
+        cut = tail.find("\n        async def ", 20)
+        body = tail[:cut] if cut > 0 else tail
+        check("Q3b 私聊处理入口里真的调了 _msg_idx_note",
+              "_msg_idx_note(" in body, "in_c2c=%s" % ("_msg_idx_note(" in body))
+
+        # Q4 回填：真机 messages.db 的 msg 表就是这一套列（没有消息 id）→ 跳过 0 条 + 一条 detail
+        br._arc_connect(d)
+        n0 = br._msg_idx_backfill(d, BOT_A)
+        check("Q4 存档里没有消息 id → 回填 0 条，并记一条 detail 说明原因",
+              n0 == 0 and (has("msg_idx 回填跳过") or has("msg_idx 回填")),
+              "n=%d log=%s" % (n0, [x for x in logs() if "回填" in x][:1]))
+
+        # Q5 存档里真有（msg_idx, message_id）两列 → 回填进表，引用重新能命中
+        d2 = botdir(BOT_B)
+        os.makedirs(d2, exist_ok=True)
+        db = os.path.join(d2, "messages.db")
+        try:
+            os.remove(db)
+        except OSError:
+            pass
+        import sqlite3
+        conn = sqlite3.connect(db)
+        conn.execute("CREATE TABLE msg(id INTEGER PRIMARY KEY, chat_type TEXT, chat_id TEXT,"
+                     " author_openid TEXT, author_name TEXT, ts INTEGER, text TEXT,"
+                     " reply_text TEXT, msg_idx TEXT, message_id TEXT)")
+        conn.execute("INSERT INTO msg(chat_type, chat_id, ts, text, msg_idx, message_id)"
+                     " VALUES('group', ?, ?, 'x', 'REFIDX_BF1', 'bf_mid_1')",
+                     (GID_B, int(time.time())))
+        conn.commit()
+        conn.close()
+        br._gm_msg_idx.clear()
+        br._gm_msg_idx_ts.clear()
+        br._msg_idx_fill_miss.clear()
+        n1 = br._msg_idx_backfill(d2, BOT_B)
+        check("Q5 存档里同时有序号 + id → 回填进表（REFIDX_BF1 → bf_mid_1）",
+              n1 == 1 and br._msg_idx_find(d2, "REFIDX_BF1") == "bf_mid_1",
+              "n=%d find=%r" % (n1, br._msg_idx_find(d2, "REFIDX_BF1")))
     finally:
         br._reply = real_reply
 
@@ -1258,6 +1413,10 @@ def main():
     case_welcome_locked()
     reset()
     case_gate_and_ref()
+    reset()
+    case_recall_texts()
+    reset()
+    case_idx_hit_rate()
     reset()
     case_multi_at_denied()
     reset()

@@ -7200,8 +7200,9 @@ async def _sticker_send(appid, api, botdir, key, item, mid="", only_image=False)
             raise RuntimeError("上传响应里没有 file_info")
         seq = _next_msg_seq(appid, mid)
         if key[:1] == "g":
-            await api.post_group_message(group_openid=key[1:], msg_id=mid, msg_seq=seq,
-                                         msg_type=7, content="", media={"file_info": info})
+            resp = await api.post_group_message(group_openid=key[1:], msg_id=mid, msg_seq=seq,
+                                               msg_type=7, content="", media={"file_info": info})
+            _gm_note_sent(appid, key[1:], _gm_resp_id(resp), _msg_idx_botdir(appid))
         else:
             await api.post_c2c_message(openid=key[1:], msg_id=mid, msg_seq=seq,
                                        msg_type=7, content="", media={"file_info": info})
@@ -7475,7 +7476,7 @@ async def _post_group(api, appid, gid, mid, content="", markdown=None):
             log("发送失败（msgseq 冲突重试后仍失败）：%r" % e2, appid, cat="错误")
             return False
         seq = new
-    _gm_note_sent(appid, gid, _gm_resp_id(resp))
+    _gm_note_sent(appid, gid, _gm_resp_id(resp), _msg_idx_botdir(appid))
     shown = _snip((markdown or {}).get("content") if markdown is not None else content)
     log("发送：%s（msg_id=%s｜seq=%d｜%d 字）"
         % (shown, (str(mid or "") or "无")[-8:], seq, body_len), appid, cat="回复")
@@ -7709,6 +7710,12 @@ _GM_WELCOME_GENERIC = "（抬眼）来了？随便坐，别拘束。"
 _GM_WARN_FALLBACK = "这条内容涉及外挂/脚本，请不要在本群发布。"
 _GM_NO_PERM = "没有群管理权限"
 _GM_RECALL_ASK = "要撤哪条？回复它再说 #撤回"   # 没有引用时的引导语（绝不撤自己的）
+# 有 ref_msg_idx 但本地表里没有：那条是在 msg_idx.json 开始记录之前（或换包重启之前）收到的。
+# 平台只允许撤「本 bot 自己发的」消息（306004 no permission to delete message /
+# 306008 同类拒绝），所以出路只有一条 —— 让我先说一句再 #撤回自己，
+# 绝不暗示能撤别人的消息，也绝不拿本 bot 的上一条顶替。
+_GM_RECALL_EARLY = ("那条太早了，我现在撤不了（只记得最近收到的一批）。"
+                    "要撤就让我先说一句，再发 #撤回自己 —— 平台只允许我撤自己发的消息。")
 _GM_ZW = "\u200b\u200c\u200d\ufeff\u2060"     # 零宽字符：有人用它拆词绕关键词
 _GM_ADMIN_ROLES = ("owner", "admin", "administrator", "群主", "管理员")
 _GM_DEFAULT_STEP = {"n": 1, "mute_min": 10}
@@ -7718,6 +7725,9 @@ _GM_REF_KEYS = ("message_id", "msg_id", "id")
 _GM_MSG_IDX_FILE = "msg_idx.json"   # <botdir>/msg_idx.json
 _GM_MSG_IDX_LIMIT = 2000            # LRU 上限（条）
 _GM_MSG_IDX_FLUSH = 5.0             # 落盘合并窗口（秒）：每来一条消息都重写 2000 条太费闪存
+# 本 bot 自己发出去的那条（#撤回自己 用）：平台发的消息没有 msg_idx，只有 id，
+# 所以借同一张表存一行 sent:<群 gid> —— 重启后 #撤回自己 仍然撤得掉。
+_GM_MSG_IDX_SENT = "sent:"
 _GM_SKIP_ADDR = "群管理：#%s 不是叫本 bot，跳过"
 
 _gm_lock = threading.RLock()
@@ -8580,18 +8590,36 @@ def _gm_intent_value(intents):
         return -1
 
 
-def _gm_note_sent(appid, gid, mid):
-    """记下本 bot 在这个群刚发出的消息 id：不带回复的 #撤回 撤的就是它。"""
+def _msg_idx_botdir(appid):
+    """appid → 本 bot 的目录（msg_idx.json 就在这儿）；_base_dir 还没设（单测半启动）→ ""。"""
+    return _bot_dir(_base_dir, appid) if _base_dir else ""
+
+
+def _gm_note_sent(appid, gid, mid, botdir=""):
+    """记下本 bot 在这个群刚发出的消息 id：#撤回自己 撤的就是它。
+
+    除了进程内存里那条，还给 botdir 有值时就落进 msg_idx.json（键 sent:<群 gid>）——
+    重启 / 换包之后 #撤回自己 仍然撤得掉（之前重启就只剩一句「本 bot 刚没发过消息」）。
+    bot 自己发的消息被平台推回来时另有一条 msg_idx → id 的路（_msg_idx_note），
+    所以「回复 bot 自己那条 + #撤回」也走得通。
+    """
     mid = str(mid or "").strip()
     if not mid:
-        return
+        return False
     with _gm_lock:
         _gm_sent.setdefault(str(appid), {})[str(gid or "")] = mid
+    if str(botdir or "").strip():
+        _msg_idx_put(botdir, _GM_MSG_IDX_SENT + str(gid or ""), mid)
+    return True
 
 
-def _gm_last_sent(appid, gid):
+def _gm_last_sent(appid, gid, botdir=""):
+    """本 bot 在这个群刚发出的消息 id：内存里有就用内存，否则读落盘那份（重启后）。"""
     with _gm_lock:
-        return str((_gm_sent.get(str(appid)) or {}).get(str(gid or "")) or "")
+        mid = str((_gm_sent.get(str(appid)) or {}).get(str(gid or "")) or "")
+    if mid or not str(botdir or "").strip():
+        return mid
+    return _msg_idx_find(botdir, _GM_MSG_IDX_SENT + str(gid or ""))
 
 
 async def _gm_say(api, appid, gid, mid, content, at_oid=""):
@@ -8607,10 +8635,11 @@ async def _gm_say(api, appid, gid, mid, content, at_oid=""):
         kw = ({"group_openid": str(gid), "msg_type": 2, "markdown": {"content": md}}
               if md else {"group_openid": str(gid), "msg_type": 0, "content": content})
         try:
-            await api.post_group_message(**kw)
+            resp = await api.post_group_message(**kw)
         except Exception as e:
             log("群管理：主动消息发送失败 %r" % e, appid, cat="错误")
             return False
+        _gm_note_sent(appid, gid, _gm_resp_id(resp), _msg_idx_botdir(appid))
         log("群管理：主动消息已发（群=%s｜%d 字）" % (str(gid or "")[:8], len(content)),
             appid, cat="回复", lv="detail")
         _gm_sys_note_sent(_base_dir, content, at_oid)
@@ -8815,27 +8844,19 @@ def _gm_msg_idx_table(botdir):
     return t
 
 
-def _msg_idx_note(appid, botdir, message, mid):
-    """收消息时记「本条 msg_idx → 本条 message id」。平台撤回只认 message_id。
+def _msg_idx_put(botdir, idx, mid, appid="", force=False):
+    """往 msg_idx.json 放一条「平台序号 → message id」→ 进表成功?（没有 idx/mid 就是 False）。
 
-    LRU 保留最近 _GM_MSG_IDX_LIMIT 条；落盘用 _save_json（tmp + os.replace 原子替换），
+    收消息（_msg_idx_note）和本 bot 自己发出去的消息（_gm_note_sent 的 sent:<gid>）都走这里：
+    LRU 保留最近 _GM_MSG_IDX_LIMIT 条，落盘用 _save_json（tmp + os.replace 原子替换），
     但按 _GM_MSG_IDX_FLUSH 秒合并写 —— 每条消息都重写 2000 条对闪存太狠。
-    进程被杀最多丢最后几秒的新映射（查不到就如实说「解析不到」，不退回本 bot 上一条）。
+    force=True：不等合并窗口立刻落盘（回填这种一次性批量写入用）。
     """
     import collections
 
-    mid = str(mid or "").strip()
-    idx = _msg_idx_own(message)
-    if not idx:
-        # 真机取证：payload 里到底有没有 msg_idx —— 没有就没人能用引用撤回
-        path = _gm_msg_idx_path(botdir)
-        if path not in _gm_msg_idx_miss:
-            _gm_msg_idx_miss.add(path)
-            log("群管理：收到的 payload 没有 message_scene.ext 的 msg_idx"
-                "（引用撤回会解析不到，只能靠 #撤回自己｜每个 bot 只提示一次）",
-                appid, cat="判定", lv="detail")
-        return False
-    if not mid:
+    idx, mid = str(idx or "").strip(), str(mid or "").strip()
+    botdir = str(botdir or "").strip()
+    if not (idx and mid and botdir):
         return False
     path = _gm_msg_idx_path(botdir)
     now = time.time()
@@ -8848,15 +8869,107 @@ def _msg_idx_note(appid, botdir, message, mid):
         t[idx] = mid
         while len(t) > _GM_MSG_IDX_LIMIT:
             t.popitem(last=False)
-        due = (now - float(_gm_msg_idx_ts.get(path) or 0)) >= _GM_MSG_IDX_FLUSH
+        due = force or (now - float(_gm_msg_idx_ts.get(path) or 0)) >= _GM_MSG_IDX_FLUSH
         ok = _save_json(path, dict(t)) if due else True
         if due:
             _gm_msg_idx_ts[path] = now
+        size = len(t)
     if due:
         log("群管理：记 msg_idx=%s → id=%s（本地表 %d 条｜落盘%s）"
-            % (idx[:16], mid[:12], len(t), "成功" if ok else "失败"),
+            % (idx[:16], mid[:12], size, "成功" if ok else "失败"),
             appid, cat="判定", lv="detail")
     return ok
+
+
+def _msg_idx_note(appid, botdir, message, mid):
+    """收消息时记「本条 msg_idx → 本条 message id」。平台撤回只认 message_id。
+
+    群聊和私聊都在这里记（同一个 botdir 一张表）：平台只给「回复某条」推 ref_msg_idx，
+    没有这张表就永远对不上 id。取不到 msg_idx 的 payload 不记（每 bot 只提示一次）。
+    """
+    idx = _msg_idx_own(message)
+    if not idx:
+        # 真机取证：payload 里到底有没有 msg_idx —— 没有就没人能用引用撤回
+        path = _gm_msg_idx_path(botdir)
+        if path not in _gm_msg_idx_miss:
+            _gm_msg_idx_miss.add(path)
+            log("群管理：收到的 payload 没有 message_scene.ext 的 msg_idx"
+                "（引用撤回会解析不到，只能靠 #撤回自己｜每个 bot 只提示一次）",
+                appid, cat="判定", lv="detail")
+        return False
+    return _msg_idx_put(botdir, idx, mid, appid)
+
+
+# 回填时认的列名（存档里同时有「消息序号」和「消息 id」才填得动）
+_GM_IDX_COLS = ("msg_idx", "ref_idx", "message_idx")
+_GM_MID_COLS = ("message_id", "msg_id", "messageid", "mid")
+_msg_idx_fill_miss = set()      # 回填跳过过哪些表（每 bot 只记一条 detail）
+
+
+def _msg_idx_pick(cols, names):
+    """表结构里按名字挑一列 → 列名；没有 → ""。"""
+    for name in names:
+        if name in cols:
+            return name
+    return ""
+
+
+def _msg_idx_backfill(botdir, appid=""):
+    """启动时用存档回填 msg_idx.json → 补进去的条数（0 = 存档里没有消息 id）。
+
+    msg_idx.json 只在「收到消息」时写，所以在它开始记录之前收到的那些消息永远查不到
+    （真机 11-20 19:27 的 REFIDX_HTsaCK… 就是：表里 68 条，没有它）。
+    能回填的唯一来源是 messages.db 里同时存了「消息序号」和「消息 id」两列。
+    真机库的 msg 表是 chat_type/chat_id/author_openid/author_name/ts/text/reply_text，
+    memory.json 的行是 [role, text, ts, uid] —— 两处都没有 id，所以这里如实跳过并记一条
+    detail：**没有 id 绝不硬凑**（凑错一个 id 会撤错别人的消息，平台只会回 306004）。
+    """
+    botdir = str(botdir or "").strip()
+    appid = str(appid or _arc_appid(botdir))
+    if not botdir:
+        return 0
+    path = _arc_path(botdir)
+    if not os.path.exists(path):
+        return _msg_idx_backfill_skip(appid, botdir, "没有 messages.db")
+    try:
+        import sqlite3
+        conn = sqlite3.connect(path, timeout=5.0)
+        try:
+            cols = [str(r[1] or "").strip().lower()
+                    for r in conn.execute("PRAGMA table_info(msg)").fetchall()]
+            icol, mcol = _msg_idx_pick(cols, _GM_IDX_COLS), _msg_idx_pick(cols, _GM_MID_COLS)
+            if not (icol and mcol):
+                shown = "/".join(cols) or "空表结构"
+                return _msg_idx_backfill_skip(appid, botdir, "msg 表没有序号+id 两列（%s）" % shown)
+            rows = conn.execute(
+                "SELECT %s, %s FROM msg WHERE %s <> '' AND %s <> ''"
+                " ORDER BY ts DESC, id DESC LIMIT %d" % (icol, mcol, icol, mcol, _GM_MSG_IDX_LIMIT)
+            ).fetchall()
+        finally:
+            conn.close()
+    except Exception as e:
+        return _msg_idx_backfill_skip(appid, botdir, "读存档失败 %r" % e)
+    n, last = 0, ("", "")
+    for row in rows:
+        if _msg_idx_put(botdir, row[0], row[1], appid):
+            n, last = n + 1, (row[0], row[1])
+    if n:
+        # 回填是一次性批量写入：最后一条强制落盘，别把整张表挂到合并窗口上
+        _msg_idx_put(botdir, last[0], last[1], appid, force=True)
+        log("群管理：msg_idx 回填 %d 条（来源 messages.db 的 %s → %s）" % (n, icol, mcol),
+            appid, cat="系统", lv="detail")
+    return n
+
+
+def _msg_idx_backfill_skip(appid, botdir, why):
+    """回填没有来源：每 bot 只记一条 detail，然后当作 0 条（不硬凑）。"""
+    key = str(botdir or "")
+    if key in _msg_idx_fill_miss:
+        return 0
+    _msg_idx_fill_miss.add(key)
+    log("群管理：msg_idx 回填跳过（%s）→ 只记今后收到的消息；"
+        "更早的只能靠 #撤回自己" % why, appid, cat="系统", lv="detail")
+    return 0
 
 
 def _msg_idx_find(botdir, idx):
@@ -9050,7 +9163,7 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
         want_self = arg in _GM_RECALL_SELF
         target, how = "", ""
         if want_self:
-            target = _gm_last_sent(appid, gid)
+            target = _gm_last_sent(appid, gid, botdir)
             how = "本 bot 上一条（#撤回%s）" % arg
             if not target:
                 log("群管理：#撤回%s 没有本 bot 上一条的记录（outbox 里没有）" % arg,
@@ -9071,11 +9184,13 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
             if not target and ref:
                 target, how = ref, "被回复的那条（平台直接给的 id）"
             if not target:
-                if idx or ref:
-                    log("群管理：#撤回 有引用但没有可撤的 id（ref_idx=%s｜ref_id=%s）→ 不撤本 bot 的消息"
-                        % ((idx or "无")[:20], (ref or "无")[:16]), appid, cat="判定")
-                    await _gm_say(api, appid, gid, mid,
-                                  "撤回失败：被回复的那条解析不到（回复它再说 #撤回）")
+                if idx:
+                    # 有 ref_idx、本地表没有：那条是表开始记录之前收到的（真机 19:27 那次）。
+                    # 平台只许撤本 bot 自己的消息，所以只给「#撤回自己」这一条出路，
+                    # 绝不说成「撤不了别人的」也不拿本 bot 的上一条顶替。
+                    log("群管理：#撤回 有引用但没有可撤的 id（ref_idx=%s｜ref_id=无）"
+                        "→ 不撤本 bot 的消息" % idx[:20], appid, cat="判定")
+                    await _gm_say(api, appid, gid, mid, _GM_RECALL_EARLY)
                 else:
                     log("群管理：#撤回 没有引用 → 不撤本 bot 的消息（要撤自己得写 #撤回自己）",
                         appid, cat="判定")
@@ -9856,6 +9971,9 @@ def _make_client(appid, secret, botdir, gen=None):
             # 同一条私聊消息有时会被两个事件回调各投一次：按 msg_id 去重，只处理一次
             if _dedupe_message(appid, message, "私聊"):
                 return
+            # 私聊也记「本条 msg_idx → 本条 message id」：群聊 / 私聊同一个 botdir 一张表，
+            # 少记一半就是「回复那条 + #撤回」永远对不上 id 的另一半根因。
+            _msg_idx_note(appid, botdir, message, str(getattr(message, "id", "") or ""))
             text = (getattr(message, "content", "") or "").strip()
             images = _attachments_of(message)
             if images:
@@ -10266,6 +10384,12 @@ def start_one(appid, secret, base_dir):
         _arc_boot(botdir)
     except Exception as e:
         log("消息存档初始化失败（忽略，收发照常）：%r" % e, appid, cat="错误")
+    # msg_idx.json（引用 → message id）只在收到消息时写：启动时看看存档里有没有 id 能补
+    # 之前那一段（真机库没存 id → 如实跳过并记 detail，不硬凑）。
+    try:
+        _msg_idx_backfill(botdir, appid)
+    except Exception as e:
+        log("msg_idx 回填失败（忽略，收发照常）：%r" % e, appid, cat="错误")
     # 「群里只回 @」的一次性提示：状态页那行小字是界面侧，日志这边只在本次进程写一条
     _hint_autochat_once(appid)
     # 人格摘要：导入人格 / 编辑保存后（Kotlin 会 restart）在这里补生成，后台线程、不挡启动。
