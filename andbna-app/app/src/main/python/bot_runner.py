@@ -4979,8 +4979,37 @@ def _own_ids(botdir):
     return set(str(x) for x in rows) if isinstance(rows, list) else set()
 
 
+def _human_openids(botdir):
+    """本 bot 见过的真人 openid（主人 + known_chats.json）：绝不许进 own_ids。"""
+    ids = set()
+    o = _owner_openid(botdir)
+    if o:
+        ids.add(str(o).upper())
+    d = _load_json(os.path.join(_bot_root(botdir), "known_chats.json"), {})
+    chats = d.get("chats") if isinstance(d, dict) else None
+    for c in (chats if isinstance(chats, list) else []):
+        if isinstance(c, dict):
+            v = str(c.get("openid") or "").strip()
+            if v:
+                ids.add(v.upper())
+    return ids
+
+
 def _note_own_ids(botdir, ids):
+    """写 own_ids.json 的唯一入口：**入库前**就把别的 bot / 真人 openid 挡掉。
+
+    历史上这个文件被真人 openid 污染过（写进去以后，凡是 @ 那个人都会被判成
+    「@ 我」）。所以过滤放在写入口，而不是只在读的时候兜。
+    """
     ids = set(str(x) for x in ids if x)
+    if not ids:
+        return set()
+    bad = set(str(x).upper() for x in _known_bots(botdir)) | _human_openids(botdir)
+    dropped = set(x for x in ids if str(x).upper() in bad)
+    if dropped:
+        ids -= dropped
+        log("own_ids 拒收：%s 是别的 bot / 真人 openid（学错就是永久抢答）"
+            % ",".join(sorted(_oid8(x) for x in dropped))[:60], cat="系统", lv="detail")
     if not ids:
         return set()
     old = _own_ids(botdir)
@@ -4990,7 +5019,34 @@ def _note_own_ids(botdir, ids):
     return new
 
 
-def _learn_own_ids(botdir, content):
+_own_ids_healed = set()     # 每个 botdir 每次进程只体检一次
+
+
+def _heal_own_ids(botdir):
+    """体检 own_ids.json：剔掉别的 bot 的 id / 真人 openid。
+
+    真机取证（2.0.1，5 只 bot）：每一份 own_ids.json 里恰好 1 个 id，且等于本 bot
+    收到的 is_you=true 那条 mention 的 id —— 现在**没有**污染。这条体检是为了
+    「以后被写脏了也不会一直抢答」，不是修历史数据（所以不会误删正常条目）。
+    """
+    key = str(botdir or "")
+    if key in _own_ids_healed:
+        return set()
+    _own_ids_healed.add(key)
+    old = _own_ids(botdir)
+    if not old:
+        return set()
+    bad = set(str(x).upper() for x in _known_bots(botdir)) | _human_openids(botdir)
+    drop = set(x for x in old if str(x).upper() in bad)
+    if not drop:
+        return set()
+    _save_json(_own_ids_path(botdir), {"ids": sorted(old - drop)})
+    log("own_ids.json 清理：%s 不是本 bot 的 openid（别的 bot / 真人）→ 已剔除，之后不再据此判「叫我」"
+        % ",".join(sorted(_oid8(x) for x in drop))[:60], cat="系统")
+    return drop
+
+
+def _learn_own_ids(botdir, content, mentions=()):
     """**只允许**在 group_at_message_create 里调用。
 
     普通群消息（group_message_create）推的是群里每一条消息，正文里出现的是别人
@@ -4998,10 +5054,22 @@ def _learn_own_ids(botdir, content):
 
     已知会发消息的 bot 的 openid（known_bots.json）和 mentions 里的 id 是同一套
     空间，所以学的时候剔除它们：一条 "@A @B" 不会让 A 把 B 的 id 记成自己的。
+
+    还要跟平台判定交叉验证：mentions 声明了 is_you 时，正文里那个 id 必须**就是**
+    is_you=true 的那个。平台一旦把 @ 事件多推给别的 bot，正文里是别人的 id，
+    这一步就是最后一道闸（否则 5 只都会把同一只 bot 的 id 记成自己）。
     """
     found = set(m.group(1) for m in _MENTION_RE.finditer(str(content or "")))
     if not found:
         return set()
+    if mentions:
+        true_ids = set(str(_mention_id(e)) for e in mentions
+                       if _mention_flag(e, "is_you", "isYou") is True and _mention_id(e))
+        if found != true_ids:
+            log("学 own_ids：正文提及（%s）与平台 is_you=true（%s）对不上 → 本次不学"
+                % (",".join(sorted(found))[:40], ",".join(sorted(true_ids))[:40] or "空"),
+                cat="系统", lv="detail")
+            return set()
     if len(found) > 1:
         # 一条 "@A @B" 会让 A 和 B 各收到一个 @ 事件，正文里两个 id 都在。
         # 判不出哪个是自己 → 这次一条都不学（学错就是永久抢答）。
@@ -5309,12 +5377,21 @@ def _my_id_set(appid, botdir):
 
 
 def _at_tag(appid, botdir, message):
-    """这条消息的 @ 标记：@我 / @别人 / 空串（没 @）。"""
+    """这条消息的 @ 标记：@我 / @别人 / @判不出 / 空串（没 @）。
+
+    必须和 @ 判定用同一个判据（_at_me）。2.0.1 这里用的是 _own_mention_ids ——
+    那个集合恒包含 appid/robot.id，永远非空，所以 5 只 bot 的「消息」行全打成
+    「@ 我」（真机 11-20 18:57:42：只 @ 了桑多涅，5 只的日志却都是 @ 我），
+    排查时直接把「判定放行了不该放的 bot」这个假象立了起来。
+    """
     content = str(getattr(message, "content", "") or "")
     mentions = _mentions_of(message)
     if not mentions and not _AT_ANY_RE.search(content):
         return ""
-    return "@我" if _own_mention_ids(appid, botdir, mentions) else "@别人"
+    state, _why = _at_me(appid, botdir, message)
+    if state == "yes":
+        return "@我"
+    return "@别人" if state == "no" else "@判不出"
 
 
 _AT_ANY_RE = re.compile(r"<@!?([^>]*)>")    # 正文里任意 <@…>（openid 不必是纯 hex）
@@ -5376,38 +5453,64 @@ def _at_me(appid, botdir, message):
     "no"      = 能确定不是 @ 本 bot
     "unknown" = 判不出来 —— 调用方必须「不回」（旧实现这时当 yes 用，才炸的）
 
-    三级判定，platform 的 is_you 优先（真机证据：同一条消息，4 个 bot 各自收到的
-    正文 <@id> 全都不一样 —— QQ 的 openid 按 bot 分配，拿 appid/robot.id/own_ids
-    去比正文永远不命中，所以 is_you 才是权威）：
-      1) d.mentions 里有 is_you=true            → yes，顺手学自己的 id；
-      2) d.mentions 非空且声明了 is_you，无 true → no（明确不是叫我，不做 id 兜底比对，
-         否则每个 bot 都会兜底比对，重新引入误判）；
-      3) mentions 缺失/没声明 is_you            → 退回正文 <@id> 比候选集合，
-         仍判不出 → unknown（不回）。
+    真机取证（5 只 bot 的 gateway_raw.jsonl，共 3143 条下行事件）：mentions 恒为
+    1 个元素、is_you 恒存在，且**只有被 @ 的那只**收到 is_you=true；id 是 32 位
+    十六进制群 openid（按 bot 分配，拿 appid / robot.id 去比永远不命中）。所以：
+
+      1) 恰好一个 is_you=true                    → yes，顺手学自己的 id；
+      2) is_you=true 有多个（平台多推，真机尚未见到但必须防）→ is_you 不再权威，
+         退化成本 bot 自己的 openid（own_ids.json）精确比对：命中 yes，不命中
+         unknown（不执行）；
+      3) 有 is_you=false 且无 true               → no（平台明确说没叫我）；
+      4) mentions 缺失/没声明 is_you             → 正文 <@id> 先比 own_ids（精确），
+         再退回候选集合；仍判不出 → unknown（不回）。
     """
+    _heal_own_ids(botdir)       # 每个进程一次；被写脏了就趁早剔掉，别让它继续放行
     text = str(getattr(message, "content", "") or "")
     mentions = _mentions_of(message)
     flags = [_mention_flag(e, "is_you", "isYou") for e in mentions]
+    yes_n = sum(1 for f in flags if f is True)
+    no_n = sum(1 for f in flags if f is False)
+    mids = [_mention_id(e) for e in mentions]
+    toks = [m.group(1) for m in _MENTION_RE.finditer(text)]
+    own_learned = _own_ids(botdir)      # 只信学到的（群 @ 的 id 空间）
 
-    if any(f is True for f in flags):
+    true_ids = [m for m, f in zip(mids, flags) if f is True and m]
+
+    if yes_n == 1:
+        # is_you=true 还要跟自己学到的 openid 对一遍：平台一旦「多推」（把同一只被 @ 的
+        # bot 标成每只的 is_you），只看 is_you 就是 5 只全执行。正常情况这里一定命中。
+        if own_learned and true_ids and not [m for m in true_ids if _id_is_mine(m, own_learned)]:
+            return "unknown", "is_you=true 的 id %s 不是本 bot 的 openid（own_ids=%s）→ 判不出" % (
+                ",".join(_oid8(m) for m in true_ids)[:40],
+                ",".join(sorted(_oid8(x) for x in own_learned))[:40])
         _learn_from_mentions(botdir, mentions)
-        return "yes", "mentions.is_you=true（平台权威判定）"
-    if any(f is False for f in flags):
+        if len(mentions) <= 1:
+            return "yes", "mentions 唯一且 is_you=true（平台权威判定）"
+        return "yes", "mentions 有 %d 个，只有 is_you=true 的那个是本 bot" % len(mentions)
+    if yes_n > 1:
+        hit = [m for m in true_ids if _id_is_mine(m, own_learned)]
+        if hit:
+            return "yes", "is_you 多推（%d 个 true）→ own_ids 精确命中 %s" % (
+                yes_n, _oid8(hit[0]))
+        return "unknown", "is_you 多推（%d 个 true）且 own_ids 都不命中 → 判不出" % yes_n
+    if no_n:
         return "no", "明确不是叫我（mentions 非空，但没有 is_you=true）"
-    if not mentions and _MENTION_RE.search(text):
-        # 平台没给 mentions，正文里却有 <@hex>：id 归属读不出来（QQ 的 openid 按 bot 分配，
-        # 正文里的 id 永远不在我们的候选集合里）。fail-closed：当「@ 了别人」，
-        # 让 _at_others 跳过总模型 —— 绝不抢走别人头上的 @，也绝不因此白烧一次总模型。
+    if not mentions and toks:
+        # 平台没给 mentions，正文里却有 <@hex>：先按本 bot 自己的 openid 精确比对。
+        # 命中 → 就是叫我（平台漏推 mentions）；不命中 → fail-closed 当「@ 了别人」，
+        # 让 _at_others 跳过总模型 —— 绝不抢走别人头上的 @。
+        hit = [t for t in toks if _id_is_mine(t, own_learned)]
+        if hit:
+            return "yes", "正文 <@%s> 命中本 bot 的 openid（无 mentions，own_ids 精确）" % _oid8(hit[0])
         return "no", "正文有 <@…> 但平台 mentions 为空（视为 @ 别人）"
 
     cand = _candidates(appid, botdir)
     if not cand:
         return "unknown", "候选 id 集合为空（appid / robot.id / own_ids.json 都没有）"
-    mids = [_mention_id(e) for e in mentions]
     for mid in mids:
         if mid and _id_is_mine(mid, cand):
             return "yes", "mentions 命中本 bot（无 is_you，id 兜底）"
-    toks = [m.group(1) for m in _MENTION_RE.finditer(text)]
     for t in toks:
         if _id_is_mine(t, cand):
             return "yes", "正文 <@%s> 命中本 bot（id 兜底）" % t
@@ -8779,18 +8882,48 @@ def _gm_called_me(appid, botdir, message, gid, text, trusted_at=False):
 
     平台把同一条群消息推给群里每一只 bot：不判「叫的是不是我」，5 只 bot 就会各执行
     一次 #撤回 并各回一句（用户真机截图）。私聊不走这条路径（gid 为空不拦）。
+
+    trusted_at（tag=群@，平台 @ 事件）**不再是无条件放行**：2.0.1 直接 return True，
+    等于把「平台只会把 @ 事件推给被 @ 的那只」当成公理 —— 一旦平台对多只都推
+    @ 事件，5 只全执行。现在它是判据的一部分：
+      · payload 说 yes                → 执行；
+      · payload 判不出（unknown）      → 按 @ 事件类型放行（这时只剩事件类型可依）；
+      · payload 说 no（is_you=false）  → 不执行，记 detail（平台推错了，不跟）。
     """
     if not str(gid or ""):
         return True, "非群聊（群门禁不适用）"
-    if trusted_at:
-        return True, "平台 @ 事件（tag=群@）"
     state, why = _at_me(appid, botdir, message)
     if state == "yes":
-        return True, why
+        return True, ("平台 @ 事件 + " + why) if trusted_at else why
+    if trusted_at and state == "unknown":
+        return True, "平台 @ 事件（payload 判不出，按事件类型放行：%s）" % why
     name = str(_my_name(appid) or "").strip()
     if name and name in str(text or ""):
         return True, "正文点名（%s）" % name
+    if trusted_at:
+        return False, "平台推了 @ 事件，但 payload 说不是叫我（%s）→ 不执行" % why
     return False, "at_state=%s（%s）" % (state, why)
+
+
+_GM_PROBE_IDS = 4           # 判据行里最多列几个 id 前缀
+
+
+def _at_probe(appid, botdir, message, tag=""):
+    """一行判据（只给命令消息用）：mentions 的 is_you + 本 bot 认的 openid。
+
+    下次再出现「只 @ 了一只却多只执行」，这一行就能定位到底哪个判据放的人。
+    """
+    mentions = _mentions_of(message)
+    rows = []
+    for e in mentions[:_GM_PROBE_IDS]:
+        mid = _oid8(_mention_id(e)) or "?"
+        f = _mention_flag(e, "is_you", "isYou")
+        rows.append("%s:%s" % (mid, "无标记" if f is None else ("true" if f else "false")))
+    if len(mentions) > _GM_PROBE_IDS:
+        rows.append("…+%d" % (len(mentions) - _GM_PROBE_IDS))
+    own = sorted(_oid8(x) for x in _own_ids(botdir) if x)
+    return "tag=%s mentions=[%s] own_ids=[%s]" % (
+        str(tag or "?"), ",".join(rows) or "空", ",".join(own[:_GM_PROBE_IDS]) or "空")
 
 
 _GM_MULTI_SHOW = 3          # detail 日志里最多列几个「别的 @」的 id 前缀
@@ -8799,9 +8932,10 @@ _GM_MULTI_SHOW = 3          # detail 日志里最多列几个「别的 @」的 i
 def _gm_other_at(appid, botdir, message, text):
     """本条还 @ 了别人吗 → (是?, 说明)。
 
-    真机证据（2.0.1）：用户把群里 5 只 bot 全 @ 了，平台对每一只都推 is_you=true，
-    所以 _gm_called_me 判「叫了我」是对的，但它判不出「还叫了别人」—— 5 只里只有 1 只
-    的主人 openid 对得上，另外 4 只各回一句「没有群管理权限」就是 4 条噪音。
+    这条只兜「本条到底还叫了谁」的第二个口子：2.0.0 群里 5 只 bot 各回一句
+    「没有群管理权限」（真机截图），根因是没有 @ 门禁；2.0.1 加了门禁以后这里负责
+    「多 @ 场景下没被授权的那只别回嘴」。真机取证（gateway_raw.jsonl）：平台**只**对
+    被 @ 的那只推 is_you=true，所以 is_you 是权威判据，这里只是「还叫了别人」的补充。
 
     这里只数「本 bot 之外还有谁被 @ 了」，两个来源，任一命中就算：
       ① mentions 里**能确认是 bot** 的 id（known_bots.json / bot_ids.json / mention 的 bot 标记）——
@@ -8863,7 +8997,7 @@ def _gm_target_oid(message, appid, botdir):
     return ""
 
 
-async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=False):
+async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=False, tag=""):
     """#撤回 / #禁言 / #解禁 → True = 这条已经处理完（调用方直接 return）。
 
     门禁（2.0.1 修）：群里只有「@ 了本 bot」或「正文点了本 bot 的名字」才处理，
@@ -8879,6 +9013,10 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
     if not cmd:
         return False
     called, why_called = _gm_called_me(appid, botdir, message, gid, text, trusted_at)
+    # 一次性判据行（只在命令消息上打，不刷屏）：下次「只 @ 了一只却多只执行」一行定位
+    log("群管理：#%s 判据 %s → called=%s（%s）"
+        % (cmd, _at_probe(appid, botdir, message, tag), called, why_called),
+        appid, cat="判定")
     if not called:
         log(_GM_SKIP_ADDR % cmd + "（%s）" % why_called, appid, cat="判定", lv="detail")
         return True
@@ -9287,10 +9425,10 @@ async def _gm_punish(appid, botdir, message, gid, conf, v, key, nick, shared, mi
     return True
 
 
-async def _group_admin_tick(appid, botdir, message, gid, text, mid="", trusted_at=False):
+async def _group_admin_tick(appid, botdir, message, gid, text, mid="", trusted_at=False, tag=""):
     """群管理总入口（_handle_group 里、回环判断之后调用）。
 
-    trusted_at = 平台的可信 @ 事件（tag=群@）：命令门禁直接放行。
+    trusted_at = 平台推来的是 @ 事件（tag=群@）；tag 原样带进判据日志。
     → True = 这条已经处理完（命令 / 违规已处置），调用方直接 return。
     """
     gid = str(gid or "")
@@ -9301,7 +9439,7 @@ async def _group_admin_tick(appid, botdir, message, gid, text, mid="", trusted_a
     # 静音群、没 @ 本 bot 也照发 —— 和 #撤回/#禁言 同一个位置。
     if await sticker_cmd(appid, botdir, message, "g" + gid, text, gid=gid, mid=mid):
         return True
-    if await group_admin_cmd(appid, botdir, message, gid, text, mid, trusted_at):
+    if await group_admin_cmd(appid, botdir, message, gid, text, mid, trusted_at, tag):
         return True
     if not conf.get("enabled"):
         return False
@@ -9326,8 +9464,8 @@ async def _group_admin_tick(appid, botdir, message, gid, text, mid="", trusted_a
 async def _handle_group(appid, botdir, message, tag):
     """群消息的唯一处理入口：@ 事件和普通群消息都走这里。
 
-    tag="群@" 是平台的可信 @ 事件（只在本 bot 被 @ 时推），@ 判定直接放行，
-    但作者过滤 / 回环 / 限流一样要过 —— 它是复读的另一个入口。
+    tag="群@" 是平台推来的 @ 事件（真机取证：只有被 @ 的那只收到），@ 判定仍
+    以 payload 为准（见 _gm_called_me），作者过滤 / 回环 / 限流一样要过。
 
     1.0.8：启用中的 bot ≥2 且 gate_enabled=true 时，先由「总模型」决定这一轮谁说
     （一条消息只点一个人）；总模型没生效 / 失败才退回各 bot 自判（1.0.7 的老逻辑）。
@@ -9417,10 +9555,11 @@ async def _handle_group(appid, botdir, message, tag):
         if limit > 0 and n_human > limit:
             _downgrade_note(gid, n_human, limit, appid)
 
-    # 闸 0 · 只有可信 @ 事件允许从正文猜 id；mentions.is_you=true 是平台判定，两种事件都学
+    # 闸 0 · 只有可信 @ 事件允许从正文猜 id（且要与 is_you 对得上）。
+    # mentions.is_you=true 的学习放在 _at_me 的「yes」分支里，不在这里无条件学：
+    # 平台一旦把同一条 @ 推给别的 bot，这里就会在判定之前把别人的 id 写成自己的。
     if trusted_at:
-        _learn_own_ids(botdir, text)
-    _learn_from_mentions(botdir, _mentions_of(message))
+        _learn_own_ids(botdir, text, _mentions_of(message))
 
     # ── bot 作者：老逻辑一律不接；总模型生效时才可能续一句（句数上限 + 成对静默管着）
     why = _bot_author(botdir, message)
@@ -9450,7 +9589,7 @@ async def _handle_group(appid, botdir, message, tag):
     # 不该被后面那几道「回不回」的闸挡掉 —— 静音群、不 @ 本 bot 都要照样管。
     # 异常一律吞掉：群管理坏了不能连累正常回复。
     try:
-        if await _group_admin_tick(appid, botdir, message, gid, body, mid, trusted_at):
+        if await _group_admin_tick(appid, botdir, message, gid, body, mid, trusted_at, tag):
             return
     except Exception as e:
         log("群管理异常（忽略，不影响回复）：%r" % e, appid, cat="错误")
@@ -9644,6 +9783,7 @@ def _make_client(appid, secret, botdir, gen=None):
             # @ 判定只认本 bot 自己的 id：appid 一定算，robot 上还有别的就一起登记
             _register_self_id(appid, getattr(self.robot, "id", None),
                               getattr(self.robot, "union_openid", None))
+            _heal_own_ids(botdir)
             log("本 bot 的 @ 判定 id 集合：%s｜own_ids.json：%s｜群里自动接话：%s（全局%s / 该 bot 覆盖=%s）" % (
                 (",".join(sorted(_self_id_set(appid))[:4]) or "(空)")[:60],
                 (",".join(sorted(_own_ids(botdir))[:4]) or "(空，等可信 @ 事件学习)"),
