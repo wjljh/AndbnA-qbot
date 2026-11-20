@@ -1,8 +1,8 @@
 # AndbnA
 
-把整套 QQ 官方机器人跑在手机里的 Android App：Python 运行时（Chaquopy）打包进 APK，由本机前台服务托管，不依赖模块、不上报任何数据。
-
-当前版本：**2.1.0**（versionCode 2100）。
+> 把整套 QQ 官方机器人跑在手机里的 Android App：Python 运行时（Chaquopy）打包进 APK，由本机前台服务托管，不依赖模块、不上报任何数据。
+>
+> 当前版本 **2.1.0**（versionCode 2100）。
 
 ## 功能
 
