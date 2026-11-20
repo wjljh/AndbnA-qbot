@@ -19,8 +19,10 @@
     cd andbna-app && flock /tmp/andbna.py.lock python3 tests/test_group_admin.py
 """
 import asyncio
+import datetime
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -262,6 +264,22 @@ def check(name, cond, detail):
     print(("  PASS  " if cond else "  FAIL  ") + name + " :: " + str(detail))
 
 
+def expire_ts(body):
+    """请求体里的 mute_expire_at（RFC3339 字符串）→ epoch 秒；缺失/不是字符串 → None。
+
+    平台的字段类型是 string（不是老的整数时间戳），所以单测必须按字符串解析，
+    顺手也就验证了「能解析成 RFC3339」这件事。
+    """
+    members = (body or {}).get("members") or [{}]
+    s = members[0].get("mute_expire_at")
+    if not isinstance(s, str):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s).timestamp()
+    except ValueError:
+        return None
+
+
 def tick(msg, gid, text, appid=BOT_A, d=None):
     return asyncio.run(br._group_admin_tick(appid, d or botdir(appid), msg, gid, text, msg.id))
 
@@ -343,6 +361,85 @@ def case_steps():
           "%d" % br._gm_longest_minutes(steps))
 
 
+# ── D0 禁言请求体：RFC3339 / 时区 / 30 天钳制 / 解禁 ──────────
+
+GM_RFC3339 = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}$")
+NOW_FIX = 1786000000            # 固定时刻（epoch 秒），跨时区的断言全靠它
+
+
+def case_mute_body():
+    """官方文档：mute_expire_at 是 RFC3339 字符串（不是整数时间戳），上限 30 天。"""
+    real_tz = os.environ.get("TZ")
+    try:
+        # ① 东八区（无夏令时）：格式 + 具体字符串
+        os.environ["TZ"] = "Asia/Shanghai"
+        time.tzset()
+        b = br._gm_restrict_body(TARGET, 10, NOW_FIX)
+        s = b["members"][0].get("mute_expire_at")
+        check("D0-1 mute_expire_at 是 RFC3339 字符串（偏移带冒号、秒级）",
+              isinstance(s, str) and bool(GM_RFC3339.match(s)), "%r" % (s,))
+        check("D0-2 东八区 + 固定 now → 具体字符串（2026-08-06T15:16:40+08:00）",
+              s == "2026-08-06T15:16:40+08:00"
+              and b["members"][0]["op"] == "add"
+              and b["members"][0]["member_openid"] == TARGET, "%s" % (b,))
+
+        # ② 夏令时：同一时刻夏令时/冬令时各一个具体字符串（-04:00 / -05:00）
+        os.environ["TZ"] = "America/New_York"
+        time.tzset()
+        jul = br._gm_restrict_body(TARGET, 10, NOW_FIX)["members"][0]["mute_expire_at"]
+        jan_utc = datetime.datetime(2026, 1, 15, 12, 0, 0,
+                                    tzinfo=datetime.timezone.utc).timestamp()
+        jan = br._gm_restrict_body(TARGET, 10, jan_utc)["members"][0]["mute_expire_at"]
+        check("D0-3 夏令时 -04:00 / 冬令时 -05:00（按到期时刻的实际偏移）",
+              jul == "2026-08-06T03:16:40-04:00" and jan == "2026-01-15T07:10:00-05:00",
+              "jul=%s jan=%s" % (jul, jan))
+
+        # ③ 超过 30 天 → 钳到 30 天（并留一行日志）
+        os.environ["TZ"] = "Asia/Shanghai"
+        time.tzset()
+        over = br._gm_restrict_body(TARGET, 40 * 24 * 60, NOW_FIX)
+        span = (expire_ts(over) or 0) - NOW_FIX
+        check("D0-4 minutes>30 天 → 钳到 30 天（日志：禁言时长钳到 30 天）",
+              span == 30 * 24 * 60 * 60 and has("禁言时长钳到 30 天"),
+              "span=%s logs=%s" % (span, [x for x in logs() if "钳到" in x][:1]))
+        fit = br._gm_restrict_body(TARGET, 30 * 24 * 60, NOW_FIX)
+        check("D0-5 正好 30 天不钳（边界）",
+              (expire_ts(fit) or 0) - NOW_FIX == 30 * 24 * 60 * 60,
+              "span=%s" % ((expire_ts(fit) or 0) - NOW_FIX,))
+
+        # ④ 解禁：op=del 且不带 mute_expire_at
+        d0 = br._gm_restrict_body(TARGET, 0, NOW_FIX)
+        dneg = br._gm_restrict_body(TARGET, -5, NOW_FIX)
+        check("D0-6 minutes<=0 → op=del 且不含 mute_expire_at",
+              all(x["members"][0]["op"] == "del"
+                  and "mute_expire_at" not in x["members"][0] for x in (d0, dneg)),
+              "%s %s" % (d0, dneg))
+
+        # ⑤ 失败日志：code / msg / http 都留着，「非管理员」归一化成 reason=not_admin
+        reset()
+        API.http.fail = {"restrict_chat_setting": ForbiddenError("非管理员不能操作")}
+        ok = asyncio.run(br._gm_mute(API, BOT_A, GID_A, TARGET, 10, NOW_FIX))
+        line = [x for x in logs() if "禁言失败" in x][:1]
+        check("D0-7 失败日志保留 code/msg/http + reason=not_admin",
+              ok is False and bool(line) and "reason=not_admin" in line[0]
+              and "msg=非管理员不能操作" in line[0] and "http=403" in line[0], line)
+
+        # ⑥ GET 返回体按文档字段名解析（global_rule.mode + members[]）
+        doc = {"global_rule": {"mode": "always", "schedule_rules": []},
+               "members": [{"member_openid": TARGET,
+                            "mute_expire_at": "2026-08-05T11:23:05+08:00"}]}
+        mode, members = br._gm_restrict_summary(doc)
+        check("D0-8 GET 返回体按文档字段名解析（global_rule.mode + members[]）",
+              mode == "always" and len(members) == 1
+              and members[0]["member_openid"] == TARGET, "%s %s" % (mode, members))
+    finally:
+        if real_tz is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = real_tz
+        time.tzset()
+
+
 # ── D 违规全流程：撤回 + 阶梯禁言 + 警告 ──────────────────
 
 def case_punish():
@@ -365,9 +462,10 @@ def case_punish():
                                     [x for x in logs() if "群管理：违规" in x][:1]))
         check("D2 撤回走 DELETE /messages/{id}", len(recalls) == 1 and "m1" in recalls[0],
               "recalls=%s" % recalls)
-        check("D3 禁言走 POST restrict_chat_setting（op=add，10 分钟）",
+        exp = expire_ts(mutes[0][1] if mutes else None)
+        check("D3 禁言走 POST restrict_chat_setting（op=add，10 分钟，RFC3339 到期时刻）",
               len(mutes) == 1 and mutes[0][1]["members"][0]["op"] == "add"
-              and abs(mutes[0][1]["members"][0]["mute_expire_at"] - (time.time() + 600)) < 90,
+              and exp is not None and abs(exp - (time.time() + 600)) < 90,
               "%s" % (mutes[0][1] if mutes else None,))
         check("D4 警告按人格生成并 @ 了对方（markdown + qqbot-at-user）",
               FACTS and "累计第 1 次" in FACTS[0]
@@ -408,7 +506,8 @@ def case_kick():
         kicks = [p for (m, p, _a, _b) in API.http.calls if m == "DELETE" and "/members/" in p]
         mutes = [(a, b) for (m, p, a, b) in API.http.calls
                  if m == "POST" and p.endswith("restrict_chat_setting")]
-        mins = ((mutes[-1][1]["members"][0]["mute_expire_at"] - time.time()) // 60) if mutes else -1
+        exp = expire_ts(mutes[-1][1] if mutes else None)
+        mins = ((exp - time.time()) // 60) if exp is not None else -1
         check("E1 n=3 ≥ kick_at → 尝试踢出（DELETE /members/{openid}）",
               ok is True and len(kicks) == 1 and TARGET not in kicks[0] and HUMAN in kicks[0],
               "kicks=%s" % kicks)
@@ -565,7 +664,8 @@ def case_cmd():
         posts = [(a, b) for (m, p, a, b) in API.http.calls
                  if m == "POST" and p.endswith("restrict_chat_setting")]
         body = posts[-1][1] if posts else {}
-        mins = ((body["members"][0]["mute_expire_at"] - time.time()) // 60) if body else -1
+        exp = expire_ts(body)
+        mins = ((exp - time.time()) // 60) if exp is not None else -1
         check("I2 主人：#禁言 15 → op=add 且 15 分钟",
               bool(posts) and body["members"][0]["op"] == "add" and 14 <= mins <= 15
               and body["members"][0]["member_openid"] == TARGET,
@@ -1515,6 +1615,8 @@ def main():
     case_norm()
     case_model()
     case_steps()
+    reset()
+    case_mute_body()
     reset()
     case_punish()
     reset()

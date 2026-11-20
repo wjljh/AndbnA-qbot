@@ -11,6 +11,7 @@
 import asyncio
 import base64
 import contextvars
+import datetime
 import json
 import os
 import random
@@ -7721,6 +7722,28 @@ _GM_RECALL_EARLY = ("那条太早了，我现在撤不了（只记得最近收�
 # 「是不是我发的」：不是我发的说清楚原因，是我发的才叫「平台拒绝」。
 _GM_RECALL_NOT_MINE = "这条不是我发的，平台只让我撤自己发的消息"
 _GM_NOT_MINE_MSG = "无操作权限"   # 平台拒撤别人消息时的原话（归一化成 reason=not_mine）
+# 群成员级禁言（官方文档 v2 群聊管理）：机器人需拥有群管理员身份，最大禁言时长为 30 天。
+# 文档原文的失败原话（「无操作权限」/ not admin /「非管理员」）归一化成 reason=not_admin。
+_GM_MUTE_MAX_MIN = 30 * 24 * 60              # 30 天（文档上限），超过就钳到这里
+_GM_NOT_ADMIN_WORDS = ("无操作权限", "not admin", "非管理员", "没有群管理权限")
+# 平台错误码 → 人话。真机 2026-11-20 取证：撤群员的消息 → http=400 code=40062003「无操作权限」
+# （id 有效，卡在「不是群管理员」）；同一个 id 换成别的群 → code=40061001「请求参数无效」。
+# 只认官方文档给出的这四个码，码表优先级高于「这条是不是我发的」—— 它直接说明缺的是
+# 「机器人是群管理员」这个前提。
+_GM_RECALL_CODES = {
+    "40062003": "没有撤回权限：这只 bot 不是群管理员",
+    "40064004": "超过 2 分钟，撤不了",
+    "40061001": "消息 id 或群不匹配（多半是群/消息对不上）",
+    "50065001": "平台侧撤回失败，稍后重试",
+}
+_GM_MUTE_NOT_ADMIN = "没有%s权限：这只 bot 不是群管理员"   # 禁言 / 解禁（文档同样要求群管理员）
+_GM_RECALL_WINDOW = 120.0        # 官方：发送超过 2 分钟的消息不可撤回（秒）
+_GM_RECALL_EXPIRED = _GM_RECALL_CODES["40064004"]
+# 官方「获取机器人群内状态」：GET /v2/groups/{group_openid}/bot_state，返回体里
+# member_role ∈ member/owner/admin（另有 joined_at / allow_proactive_msg / recv_msg_setting）。
+# 失败码 11253 = 应用无接口访问权限（该接口只对白名单机器人开放）→ 拿不到就跳过，别硬编。
+_GM_BOT_STATE_PATH = "/v2/groups/{group_openid}/bot_state"
+_GM_ROLE_WORDS = {"member": "普通成员", "owner": "群主", "admin": "管理员"}
 _GM_ZW = "\u200b\u200c\u200d\ufeff\u2060"     # 零宽字符：有人用它拆词绕关键词
 _GM_ADMIN_ROLES = ("owner", "admin", "administrator", "群主", "管理员")
 _GM_DEFAULT_STEP = {"n": 1, "mute_min": 10}
@@ -7730,6 +7753,9 @@ _GM_REF_KEYS = ("message_id", "msg_id", "id")
 _GM_MSG_IDX_FILE = "msg_idx.json"   # <botdir>/msg_idx.json
 _GM_MSG_IDX_LIMIT = 2000            # LRU 上限（条）
 _GM_MSG_IDX_FLUSH = 5.0             # 落盘合并窗口（秒）：每来一条消息都重写 2000 条太费闪存
+# 同一批消息的「时刻」另存一张表：msg_idx.json 的值是字符串（序号 → id），塞进时间戳就得
+# 改所有读它的人。「超 2 分钟撤不了」的预判只认 <botdir>/msg_ts.json（message id → epoch 秒）。
+_GM_MSG_TS_FILE = "msg_ts.json"
 # 本 bot 自己发出去的那条（#撤回自己 用）：平台发的消息没有 msg_idx，只有 id，
 # 所以借同一张表存一行 sent:<群 gid> —— 重启后 #撤回自己 仍然撤得掉。
 _GM_MSG_IDX_SENT = "sent:"
@@ -7747,6 +7773,7 @@ _gm_mem = {}              # 计数内存兜底（文件写不进去时）
 _gm_msg_idx = {}          # msg_idx.json 路径 -> OrderedDict{ref idx: message id}
 _gm_msg_idx_lock = threading.RLock()
 _gm_msg_idx_ts = {}       # 同一路径 -> 上次落盘时间（合并窗口用）
+_gm_msg_ts = {}           # 同一路径 -> OrderedDict{message id: 收到 / 发出的 epoch 秒}
 _gm_msg_idx_miss = set()  # 没有 msg_idx 的 payload 提示过哪些表（每 bot 只提示一次）
 _gm_welcome_mem = {}      # (appid, gid, member) -> ts：事件的 5 分钟去重
 
@@ -8471,6 +8498,8 @@ def _gm_recall_reason(info, mine, from_idx=False):
     另一个信号是引用从本地表解析出了 id、它却不在已发集合里 —— 本地表只记收到的
     消息，能对上号的就不是本 bot 发的。
     """
+    if str((info or {}).get("code") or "") == "40062003":
+        return "no_admin"          # 真机取证：id 有效、群也对，缺的是「机器人是群管理员」
     if mine:
         return "denied"
     if _GM_NOT_MINE_MSG in str((info or {}).get("msg") or ""):
@@ -8479,17 +8508,23 @@ def _gm_recall_reason(info, mine, from_idx=False):
 
 
 def _gm_recall_fail_text(info, mine=None):
-    """撤回失败的回复：先分「是不是我发的」，再看平台给的 code / msg。
+    """撤回失败的回复：码表 > 「本地判超时」> 分「是不是我发的」> 平台原话。
 
+    码表优先：真机 2026-11-20 那次，id 有效、群也对，卡住的是「这只 bot 不是群管理员」，
+    平台回的 40062003 比我们本地猜的「这条是不是我发的」确定得多。
     mine=True → 我发的还失败：平台拒绝（有 code 给 code，没 code 用平台原话）；
     mine=False（或 info 里已有 reason=not_mine）→ 这条不是我发的；
     mine=None（老调用方 / 单测直接算文案）→ 维持原来的通用话。
     """
     info = info or {}
     reason = str(info.get("reason") or "")
+    code = str(info.get("code") or "")
+    if code in _GM_RECALL_CODES:
+        return _GM_RECALL_CODES[code]
+    if reason == "expired":
+        return _GM_RECALL_EXPIRED
     if reason == "not_mine" or (not reason and mine is False):
         return _GM_RECALL_NOT_MINE
-    code = str(info.get("code") or "")
     if code:
         return "撤回失败：平台拒绝（code %s）" % code
     msg = str(info.get("msg") or "").strip()
@@ -8532,6 +8567,13 @@ async def _gm_recall(api, appid, gid, mid, botdir="", from_idx=False):
         log("群管理：撤回缺少 group_openid / message_id → 跳过", appid, cat="错误")
         return False, {"code": "", "msg": "缺少 group_openid / message_id", "http": "",
                        "mine": False, "reason": "denied"}
+    age = _gm_recall_expired(botdir, mid)
+    if age is not None:
+        log("群管理：撤回跳过（本地记的接收时刻已过 %.0f 秒，官方上限 %d 秒）"
+            "｜group=%s｜target=%s → 不打平台"
+            % (age, int(_GM_RECALL_WINDOW), str(gid)[:8], str(mid)[:12]), appid, cat="错误")
+        return False, {"code": "", "msg": "本地判定已超过 2 分钟", "http": "",
+                       "mine": _gm_own_sent(appid, botdir, gid, mid), "reason": "expired"}
     ok, data, denied, info = await _gm_call(
         api, "DELETE", "/v2/groups/{group_openid}/messages/{message_id}",
         group_openid=str(gid), message_id=str(mid))
@@ -8541,47 +8583,129 @@ async def _gm_recall(api, appid, gid, mid, botdir="", from_idx=False):
     info = dict(info or {})
     info["mine"] = mine
     info["reason"] = _gm_recall_reason(info, mine, from_idx)
-    log("群管理：撤回失败 code=%s msg=%s｜group=%s｜target=%s｜http=%s｜reason=%s%s"
+    hint = _GM_RECALL_CODES.get(str(info.get("code") or ""), "")
+    log("群管理：撤回失败 code=%s msg=%s｜group=%s｜target=%s｜http=%s｜reason=%s%s%s"
         % (info.get("code") or "无", info.get("msg") or "无", str(gid or "")[:8],
            str(mid)[:12], info.get("http") or "无", info["reason"],
-           "｜没有群管理权限 → 继续后面几步" if denied else ""), appid, cat="错误")
+           "｜没有群管理权限 → 继续后面几步" if denied else "",
+           ("｜人话=%s" % hint) if hint else ""), appid, cat="错误")
     return False, info
 
 
+def _gm_rfc3339(ts):
+    """epoch 秒 → RFC3339 本地时区（秒级、偏移带冒号）：2026-08-05T11:23:05+08:00。
+
+    平台的字段类型是 string，传整数会被拒；偏移必须是 +08:00 而不是 +0800，所以走
+    isoformat 而不是 strftime("%z")。fromtimestamp 给的是本地时间，astimezone() 按
+    那个时刻的实际偏移补时区 —— 到期时刻跨夏令时切换时也是对的。
+    """
+    local = datetime.datetime.fromtimestamp(float(ts)).astimezone()
+    return local.replace(microsecond=0).isoformat(timespec="seconds")
+
+
 def _gm_restrict_body(member_oid, minutes, now=None):
-    """禁言 / 解禁的请求体：minutes > 0 → op=add + mute_expire_at；<= 0 → op=del。"""
+    """禁言 / 解禁的请求体（字段名与官方文档一致）。
+
+    minutes > 0 → op=add + mute_expire_at（RFC3339 字符串，到期时刻 = int(now)+m*60）；
+    minutes <= 0 → op=del，不带 mute_expire_at：文档里该字段「必填=否」，del 时也能传
+    空串；这里选「不带」—— 空串交给 RFC3339 解析是个没必要的赌注，字段本身可不填。
+    文档上限 30 天，超过就钳到 30 天（日志留一行）。
+    """
     now = time.time() if now is None else now
     m = int(minutes or 0)
     if m > 0:
+        if m > _GM_MUTE_MAX_MIN:
+            m = _GM_MUTE_MAX_MIN
+            log("禁言时长钳到 30 天")
         return {"members": [{"op": "add", "member_openid": str(member_oid),
-                             "mute_expire_at": int(now) + m * 60}]}
+                             "mute_expire_at": _gm_rfc3339(int(now) + m * 60)}]}
     return {"members": [{"op": "del", "member_openid": str(member_oid)}]}
 
 
-async def _gm_mute(api, appid, gid, member_oid, minutes, now=None):
-    """禁言 / 解禁（minutes<=0 = 解禁）→ 成功?。"""
+def _gm_mute_reason(info, denied=False):
+    """禁言失败归因 → "not_admin"（没群管理员身份）/ "denied"（平台拒了别的原因）。
+
+    归一化平台原话（无操作权限 / not admin / 非管理员）：这三句都是「机器人不是群管理员」
+    的同一件事，统计和回复文案按 reason 走，不用逐字比对原话。
+    """
+    s = str((info or {}).get("msg") or "")
+    low = s.lower()
+    if any(w.lower() in low for w in _GM_NOT_ADMIN_WORDS):
+        return "not_admin"
+    return "not_admin" if denied else "denied"
+
+
+def _gm_mute_fail_text(info, verb="禁言"):
+    """禁言 / 解禁失败的回复：归一化原因 → 人话（文档同样要求群管理员身份）。
+
+    平台对禁言的原话（无操作权限 / not admin / 非管理员 / 没有群管理权限）都指向同一件
+    事：这只 bot 不是群主或管理员。认不出来的失败才退回平台原话，不硬套身份话。
+    """
+    info = info or {}
+    if str(info.get("reason") or "") == "not_admin":
+        return _GM_MUTE_NOT_ADMIN % verb
+    msg = str(info.get("msg") or "").strip()
+    if msg:
+        return "%s失败：平台拒绝（%s）" % (verb, msg)
+    return "%s失败（可能没有群管理权限）" % verb
+
+
+async def _gm_mute_ex(api, appid, gid, member_oid, minutes, now=None):
+    """禁言 / 解禁（minutes<=0 = 解禁）→ (成功?, {"code","msg","http","reason"})，绝不抛。"""
+    verb = "禁言" if int(minutes or 0) > 0 else "解禁"
     if not (str(gid or "") and str(member_oid or "")):
         log("群管理：禁言缺少 group_openid / member_openid → 跳过", appid, cat="错误")
-        return False
-    ok, data, denied, _info = await _gm_call(
+        return False, {"code": "", "msg": "缺少 group_openid / member_openid", "http": "",
+                       "reason": "denied"}
+    body = _gm_restrict_body(member_oid, minutes, now)
+    ok, data, denied, info = await _gm_call(
         api, "POST", "/v2/groups/{group_openid}/restrict_chat_setting",
-        body=_gm_restrict_body(member_oid, minutes, now), group_openid=str(gid))
+        body=body, group_openid=str(gid))
     if ok:
-        return True
-    log("群管理：%s失败（%s）%s"
-        % ("禁言" if int(minutes or 0) > 0 else "解禁", data,
+        return True, {}
+    info = dict(info or {})
+    info["reason"] = _gm_mute_reason(info, denied)
+    log("群管理：%s失败 code=%s msg=%s｜http=%s｜reason=%s｜body=%s%s"
+        % (verb, info.get("code") or "无", info.get("msg") or "无", info.get("http") or "无",
+           info["reason"], json.dumps(body, ensure_ascii=False)[:120],
            "｜没有群管理权限 → 已优雅降级" if denied else ""), appid, cat="错误")
-    return False
+    return False, info
+
+
+async def _gm_mute(api, appid, gid, member_oid, minutes, now=None):
+    """禁言 / 解禁 → 成功?（老签名：只要一个布尔值；要失败原因用 _gm_mute_ex）。"""
+    ok, _info = await _gm_mute_ex(api, appid, gid, member_oid, minutes, now)
+    return ok
+
+
+def _gm_restrict_summary(data):
+    """GET 返回体 → (全员禁言模式, 成员级禁言列表)，字段名照官方文档「查询群禁言状态」。
+
+    返回体是 {"global_rule": GlobalMuteRule, "members": [MemberMuteState]}：
+    global_rule.mode ∈ none/always/schedule（另有 schedule_rules / recurring_rules），
+    members[] 每项是 {member_openid, mute_expire_at, username, union_openid}，只含仍在
+    禁言中的成员。老写法不解析任何字段，这里按文档取，不猜键名。
+    """
+    if not isinstance(data, dict):
+        return "", []
+    rule = data.get("global_rule") if isinstance(data.get("global_rule"), dict) else {}
+    members = data.get("members") if isinstance(data.get("members"), list) else []
+    return (str(rule.get("mode") or ""),
+            [m for m in members if isinstance(m, dict)])
 
 
 async def _gm_restrict_state(api, appid, gid):
-    """查询群禁言状态 → (成功?, 返回体)。"""
+    """查询群禁言状态 → (成功?, 返回体)；成功时日志带 mode 与成员级禁言人数。"""
     ok, data, denied, _info = await _gm_call(
         api, "GET", "/v2/groups/{group_openid}/restrict_chat_setting",
         group_openid=str(gid))
     if not ok:
         log("群管理：查询禁言状态失败（%s）%s" % (data, "｜没有群管理权限" if denied else ""),
             appid, cat="错误")
+        return ok, data
+    mode, members = _gm_restrict_summary(data)
+    log("群管理：禁言状态 mode=%s｜成员级禁言 %d 人"
+        % (mode or "无", len(members)), appid, cat="系统")
     return ok, data
 
 
@@ -8930,16 +9054,105 @@ def _msg_idx_put(botdir, idx, mid, appid="", force=False):
         t[idx] = mid
         while len(t) > _GM_MSG_IDX_LIMIT:
             t.popitem(last=False)
+        # 顺手记「这条 id 是什么时候收到 / 发出的」：「超 2 分钟撤不了」的本地预判只靠它
+        _msg_ts_put(botdir, mid, now)
         due = force or (now - float(_gm_msg_idx_ts.get(path) or 0)) >= _GM_MSG_IDX_FLUSH
         ok = _save_json(path, dict(t)) if due else True
         if due:
             _gm_msg_idx_ts[path] = now
+            _msg_ts_flush(botdir)
         size = len(t)
     if due:
         log("群管理：记 msg_idx=%s → id=%s（本地表 %d 条｜落盘%s）"
             % (idx[:16], mid[:12], size, "成功" if ok else "失败"),
             appid, cat="判定", lv="detail")
     return ok
+
+
+def _gm_msg_ts_path(botdir):
+    return os.path.join(_bot_root(botdir), _GM_MSG_TS_FILE)
+
+
+def _gm_msg_ts_table(botdir):
+    """<botdir>/msg_ts.json 的内存视图：OrderedDict{message id: 收到 / 发出的 epoch 秒}。
+
+    和 msg_idx.json 分成两个文件：那张表的值是字符串（序号 → id），混进浮点就把所有
+    读它的人拖下水。这张表坏了（读不动 / 值不是正数）就当没有 —— 预判只是省一次平台
+    调用，平台仍是唯一裁决方。
+    """
+    import collections
+
+    path = _gm_msg_ts_path(botdir)
+    t = _gm_msg_ts.get(path)
+    if not isinstance(t, collections.OrderedDict):
+        t = collections.OrderedDict()
+        raw = _load_json(path, {})
+        if isinstance(raw, dict):
+            for k, v in raw.items():
+                k = str(k or "").strip()
+                try:
+                    ts = float(v)
+                except (TypeError, ValueError):
+                    continue
+                if k and ts > 0:
+                    t[k] = ts
+        _gm_msg_ts[path] = t
+    return t
+
+
+def _msg_ts_put(botdir, mid, ts=None):
+    """记一条「message id → 收到 / 发出的时刻」→ 记上了?（LRU 上限同 msg_idx）。"""
+    import collections
+
+    mid, botdir = str(mid or "").strip(), str(botdir or "").strip()
+    if not (mid and botdir):
+        return False
+    ts = time.time() if ts is None else float(ts)
+    path = _gm_msg_ts_path(botdir)
+    with _gm_msg_idx_lock:
+        t = _gm_msg_ts_table(botdir)
+        if not isinstance(t, collections.OrderedDict):
+            t = collections.OrderedDict(t)
+            _gm_msg_ts[path] = t
+        t.pop(mid, None)
+        t[mid] = ts
+        while len(t) > _GM_MSG_IDX_LIMIT:
+            t.popitem(last=False)
+    return True
+
+
+def _msg_ts_flush(botdir):
+    """把时刻表落盘（与 msg_idx.json 同一个合并窗口，由 _msg_idx_put 触发）→ 写成了?"""
+    botdir = str(botdir or "").strip()
+    if not botdir:
+        return False
+    with _gm_msg_idx_lock:
+        return _save_json(_gm_msg_ts_path(botdir), dict(_gm_msg_ts_table(botdir)))
+
+
+def _msg_ts_age(botdir, mid, now=None):
+    """这条消息本地记的接收时刻 → 过去了多少秒；没记录 / 记录坏了 → None。"""
+    mid = str(mid or "").strip()
+    if not (mid and str(botdir or "").strip()):
+        return None
+    with _gm_msg_idx_lock:
+        ts = _gm_msg_ts_table(botdir).get(mid)
+    if ts is None:
+        return None
+    now = time.time() if now is None else float(now)
+    return max(0.0, now - float(ts))
+
+
+def _gm_recall_expired(botdir, mid, now=None):
+    """本地能判出接收时刻、且已过 2 分钟 → 那个秒数；判不出 → None。
+
+    官方「发送超过 2 分钟的消息不可撤回」。本地记的是「收到」的时刻，比真实发送晚一
+    点点 —— 预判只会比平台宽松：早过 2 分钟的一定撤不了，刚收到的照常打平台。
+    """
+    age = _msg_ts_age(botdir, mid, now)
+    if age is None or age <= _GM_RECALL_WINDOW:
+        return None
+    return age
 
 
 def _msg_idx_note(appid, botdir, message, mid):
