@@ -7711,12 +7711,10 @@ _GM_WELCOME_GENERIC = "（抬眼）来了？随便坐，别拘束。"
 _GM_WARN_FALLBACK = "这条内容涉及外挂/脚本，请不要在本群发布。"
 _GM_NO_PERM = "没有群管理权限"
 _GM_RECALL_ASK = "要撤哪条？回复它再说 #撤回"   # 没有引用时的引导语（绝不撤自己的）
-# 有 ref_msg_idx 但本地表里没有：那条是在 msg_idx.json 开始记录之前（或换包重启之前）收到的。
-# 平台只允许撤「本 bot 自己发的」消息（306004 no permission to delete message /
-# 306008 同类拒绝），所以出路只有一条 —— 让我先说一句再 #撤回自己，
-# 绝不暗示能撤别人的消息，也绝不拿本 bot 的上一条顶替。
-_GM_RECALL_EARLY = ("那条太早了，我现在撤不了（只记得最近收到的一批）。"
-                    "要撤就让我先说一句，再发 #撤回自己 —— 平台只允许我撤自己发的消息。")
+# 有 ref_msg_idx 但本地表里没有：这不是「太早」，是本进程没收到过 —— msg_idx.json 只记
+# 启动后收到的消息，启动前发出的那条既没有事件、也拿不到 id。2 分钟窗口是平台的事，
+# 跟这张表无关，所以文案只说「没收到过」，不说「太早」。
+_GM_RECALL_EARLY = "这条我没收到过（我启动前的消息拿不到 id），撤不了"
 # 平台只允许撤「本 bot 自己发的」消息（真机 19:44:15：撤被回复的那条 → code=无
 # msg=无操作权限 http=500，而 18:47:34 撤本 bot 上一条是成功）。所以失败文案要先分
 # 「是不是我发的」：不是我发的说清楚原因，是我发的才叫「平台拒绝」。
@@ -7736,6 +7734,12 @@ _GM_RECALL_CODES = {
     "40061001": "消息 id 或群不匹配（多半是群/消息对不上）",
     "50065001": "平台侧撤回失败，稍后重试",
 }
+# 实测（2026-11-20 真机 + 官方 2 分钟上限）：撤回超时的消息，平台回的也常是 40062003
+# 「无操作权限」，不是码表里的 40064004。所以拿到这个码要先问 bot_state：
+#   admin/owner → 权限没问题，那就是超时（reason=too_old）
+#   member      → 确实不是群管理员（reason=no_admin）
+#   查不到      → 维持码表文案，日志记 bot_state=unknown（不猜）
+_GM_NO_PERM_CODE = "40062003"
 _GM_MUTE_NOT_ADMIN = "没有%s权限：这只 bot 不是群管理员"   # 禁言 / 解禁（文档同样要求群管理员）
 _GM_RECALL_WINDOW = 120.0        # 官方：发送超过 2 分钟的消息不可撤回（秒）
 _GM_RECALL_EXPIRED = _GM_RECALL_CODES["40064004"]
@@ -7755,6 +7759,8 @@ _GM_MSG_IDX_LIMIT = 2000            # LRU 上限（条）
 _GM_MSG_IDX_FLUSH = 5.0             # 落盘合并窗口（秒）：每来一条消息都重写 2000 条太费闪存
 # 同一批消息的「时刻」另存一张表：msg_idx.json 的值是字符串（序号 → id），塞进时间戳就得
 # 改所有读它的人。「超 2 分钟撤不了」的预判只认 <botdir>/msg_ts.json（message id → epoch 秒）。
+# 记的是「本进程收到这条消息的时刻」：只覆盖启动后收到的事件。所以没有记录 ≠ 太早
+# （那条可能是我启动前发出的），没有记录就照常打平台，由平台裁决。
 _GM_MSG_TS_FILE = "msg_ts.json"
 # 本 bot 自己发出去的那条（#撤回自己 用）：平台发的消息没有 msg_idx，只有 id，
 # 所以借同一张表存一行 sent:<群 gid> —— 重启后 #撤回自己 仍然撤得掉。
@@ -8497,9 +8503,11 @@ def _gm_recall_reason(info, mine, from_idx=False):
     code=无 / msg=无操作权限 / http=500），这是「不是我发的」最可靠的信号。
     另一个信号是引用从本地表解析出了 id、它却不在已发集合里 —— 本地表只记收到的
     消息，能对上号的就不是本 bot 发的。
+    40062003 先按 no_admin 归（真机取证：id 有效、群也对，缺的是「机器人是群管理员」）；
+    bot_state 是 admin/owner 的才升级成 too_old —— 那一步要异步查，放在 _gm_recall 里做。
     """
-    if str((info or {}).get("code") or "") == "40062003":
-        return "no_admin"          # 真机取证：id 有效、群也对，缺的是「机器人是群管理员」
+    if str((info or {}).get("code") or "") == _GM_NO_PERM_CODE:
+        return "no_admin"
     if mine:
         return "denied"
     if _GM_NOT_MINE_MSG in str((info or {}).get("msg") or ""):
@@ -8508,9 +8516,10 @@ def _gm_recall_reason(info, mine, from_idx=False):
 
 
 def _gm_recall_fail_text(info, mine=None):
-    """撤回失败的回复：码表 > 「本地判超时」> 分「是不是我发的」> 平台原话。
+    """撤回失败的回复：bot_state 判超时 > 码表 > 「本地判超时」> 分「是不是我发的」> 平台原话。
 
-    码表优先：真机 2026-11-20 那次，id 有效、群也对，卡住的是「这只 bot 不是群管理员」，
+    reason=too_old 排最前：40062003 + bot_state=admin/owner 时平台码表那句话（「不是群管理员」）
+    是错的，真实原因是 2 分钟时限。码表其余码照旧：真机 2026-11-20 那次，id 有效、群也对，
     平台回的 40062003 比我们本地猜的「这条是不是我发的」确定得多。
     mine=True → 我发的还失败：平台拒绝（有 code 给 code，没 code 用平台原话）；
     mine=False（或 info 里已有 reason=not_mine）→ 这条不是我发的；
@@ -8519,6 +8528,8 @@ def _gm_recall_fail_text(info, mine=None):
     info = info or {}
     reason = str(info.get("reason") or "")
     code = str(info.get("code") or "")
+    if reason == "too_old":
+        return _GM_RECALL_EXPIRED
     if code in _GM_RECALL_CODES:
         return _GM_RECALL_CODES[code]
     if reason == "expired":
@@ -8556,12 +8567,18 @@ async def _gm_call(api, method, path, body=None, **params):
 
 
 async def _gm_recall(api, appid, gid, mid, botdir="", from_idx=False):
-    """撤回群消息 → (成功?, {"code","msg","http","mine","reason"})。
+    """撤回群消息 → (成功?, {"code","msg","http","mine","reason"[,"role"]})。
 
     失败绝不抛（不能影响后面的禁言 / 警告），但失败原因必须原样带回去：调用方要把它
     回给用户。官方文档（v2 群聊撤回）只允许撤回「机器人自己发送在当前群」的消息，
     所以撤别人的消息失败时，原因（306004 no permission to delete message / 无操作权限）
     是唯一线索；reason=not_mine 就是「这条不是我发的」的归一化写法，便于统计。
+
+    判定顺序（2.0.1 真机 20:02 那次「无操作权限」逼出来的）：
+      ① 本地有接收时刻且已过 120 秒 → reason=expired，不打平台；
+      ② 平台回 40062003 → 查 bot_state：admin/owner 归 too_old（实测超时也回这个码）、
+         member 归 no_admin、查不到则维持码表文案（日志记 bot_state=unknown）；
+      ③ 其余照旧：mine / 平台原话 / 本地表解析 → denied / not_mine。
     """
     if not (str(gid or "") and str(mid or "")):
         log("群管理：撤回缺少 group_openid / message_id → 跳过", appid, cat="错误")
@@ -8583,11 +8600,22 @@ async def _gm_recall(api, appid, gid, mid, botdir="", from_idx=False):
     info = dict(info or {})
     info["mine"] = mine
     info["reason"] = _gm_recall_reason(info, mine, from_idx)
-    hint = _GM_RECALL_CODES.get(str(info.get("code") or ""), "")
-    log("群管理：撤回失败 code=%s msg=%s｜group=%s｜target=%s｜http=%s｜reason=%s%s%s"
+    if str(info.get("code") or "") == _GM_NO_PERM_CODE:
+        # 「无操作权限」不能直接当「不是管理员」：实测超时的消息平台也回这个码。
+        # bot_state 才分得开 —— 管理员/群主 → 权限没问题，就是超过 2 分钟。
+        state_ok, st = await _gm_bot_state(api, appid, gid)
+        role = str((st or {}).get("role") or "") if state_ok else ""
+        info["role"] = role          # "" = 查不到（日志写 bot_state=unknown）
+        if role in ("admin", "owner"):
+            info["reason"] = "too_old"
+    hint = (_gm_recall_fail_text(info, mine)
+            if str(info.get("code") or "") in _GM_RECALL_CODES else "")
+    state = ("｜bot_state=%s" % (info["role"] or "unknown")) if "role" in info else ""
+    log("群管理：撤回失败 code=%s msg=%s｜group=%s｜target=%s｜http=%s｜reason=%s%s%s%s"
         % (info.get("code") or "无", info.get("msg") or "无", str(gid or "")[:8],
-           str(mid)[:12], info.get("http") or "无", info["reason"],
-           "｜没有群管理权限 → 继续后面几步" if denied else "",
+           str(mid)[:12], info.get("http") or "无", info["reason"], state,
+           "｜没有群管理权限 → 继续后面几步"
+           if denied and info["reason"] != "too_old" else "",
            ("｜人话=%s" % hint) if hint else ""), appid, cat="错误")
     return False, info
 
@@ -8627,7 +8655,11 @@ def _gm_mute_reason(info, denied=False):
 
     归一化平台原话（无操作权限 / not admin / 非管理员）：这三句都是「机器人不是群管理员」
     的同一件事，统计和回复文案按 reason 走，不用逐字比对原话。
+    40062003 单独先认：禁言没有「2 分钟」这条限制，撤回那边它可能是超时，这里只可能是
+    「不是群管理员」—— 不管平台正文写了什么，都归 not_admin。
     """
+    if str((info or {}).get("code") or "") == _GM_NO_PERM_CODE:
+        return "not_admin"
     s = str((info or {}).get("msg") or "")
     low = s.lower()
     if any(w.lower() in low for w in _GM_NOT_ADMIN_WORDS):
@@ -8665,9 +8697,14 @@ async def _gm_mute_ex(api, appid, gid, member_oid, minutes, now=None):
         return True, {}
     info = dict(info or {})
     info["reason"] = _gm_mute_reason(info, denied)
-    log("群管理：%s失败 code=%s msg=%s｜http=%s｜reason=%s｜body=%s%s"
+    if str(info.get("code") or "") == _GM_NO_PERM_CODE:
+        # 归因已经是 not_admin，仍查一次群内身份落进日志：区分「真没给管理员」和「给了还被拒」
+        state_ok, st = await _gm_bot_state(api, appid, gid)
+        info["role"] = str((st or {}).get("role") or "") if state_ok else ""
+    state = ("｜bot_state=%s" % (info["role"] or "unknown")) if "role" in info else ""
+    log("群管理：%s失败 code=%s msg=%s｜http=%s｜reason=%s%s｜body=%s%s"
         % (verb, info.get("code") or "无", info.get("msg") or "无", info.get("http") or "无",
-           info["reason"], json.dumps(body, ensure_ascii=False)[:120],
+           info["reason"], state, json.dumps(body, ensure_ascii=False)[:120],
            "｜没有群管理权限 → 已优雅降级" if denied else ""), appid, cat="错误")
     return False, info
 
@@ -8746,13 +8783,22 @@ async def _gm_bot_state(api, appid, gid):
     return True, {"role": role.strip().lower(), "role_text": text}
 
 
-async def _gm_deny_reply(api, appid, gid, base):
-    """失败回复 + 群内身份那一句：拿得到身份才加，拿不到就原样返回（绝不编）。"""
-    ok, st = await _gm_bot_state(api, appid, gid)
-    if not ok:
+async def _gm_deny_reply(api, appid, gid, base, role=None):
+    """失败回复 + 群内身份那一句：拿得到身份才加，拿不到就原样返回（绝不编）。
+
+    role：调用方已经查过 bot_state 就传（"" = 查过但拿不到）；None = 这里现查一次。
+    「超过 2 分钟」已经有了确定答案，不再追加身份提示（那句会把用户引去授权）。
+    """
+    if base == _GM_RECALL_EXPIRED:
         return base
-    text = str(st.get("role_text") or "")
-    if str(st.get("role") or "") in ("admin", "owner"):
+    if role is None:
+        ok, st = await _gm_bot_state(api, appid, gid)
+        role = (str((st or {}).get("role") or "") if ok else "")
+    role = str(role or "").strip().lower()
+    text = _gm_role_text(role)
+    if not text:
+        return base
+    if role in ("admin", "owner"):
         return "%s（群内身份=%s：权限已具备，可能是别的原因）" % (base, text)
     return "%s（群内身份=%s：请把这只 bot 设为群管理员）" % (base, text)
 
@@ -9195,10 +9241,13 @@ def _msg_ts_age(botdir, mid, now=None):
 
 
 def _gm_recall_expired(botdir, mid, now=None):
-    """本地能判出接收时刻、且已过 2 分钟 → 那个秒数；判不出 → None。
+    """本地有接收时刻、且已过 2 分钟 → 过去多少秒；判不出 → None（照常打平台）。
 
-    官方「发送超过 2 分钟的消息不可撤回」。本地记的是「收到」的时刻，比真实发送晚一
-    点点 —— 预判只会比平台宽松：早过 2 分钟的一定撤不了，刚收到的照常打平台。
+    官方「发送超过 2 分钟的消息不可撤回」。msg_ts.json 记的是**本进程收到**这条消息的
+    时刻，所以只有「启动后收到过」的 id 才有记录：
+      · 有记录且 now-ts>120 → 真实发送只会更早，一定撤不了 → 直接判超时，不打平台；
+      · 无记录 → 不代表太早（可能是我启动前就发出的，收不到事件就没有记录），
+        不做任何预判，交给平台用结果说话。
     """
     age = _msg_ts_age(botdir, mid, now)
     if age is None or age <= _GM_RECALL_WINDOW:
@@ -9530,10 +9579,13 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
         if ok:
             await _gm_say(api, appid, gid, mid, "已撤回")
         else:
-            # 失败才做一次群内身份自检：用户要知道的是「该去授权」还是「别的原因」
+            # 40062003 时 _gm_recall 已经查过 bot_state（role 在 info 里）→ 复用，别再打一次；
+            # 其余失败才在这里补一次自检：用户要知道的是「该去授权」还是「别的原因」。
+            info = info or {}
             await _gm_say(api, appid, gid, mid,
                           await _gm_deny_reply(api, appid, gid,
-                                               _gm_recall_fail_text(info, (info or {}).get("mine"))))
+                                               _gm_recall_fail_text(info, info.get("mine")),
+                                               info.get("role")))
         return True
     minutes = _gm_int(arg, 1, 30 * 24 * 60, 10) if arg else 10
     oid = _gm_target_oid(message, appid, botdir)
@@ -9551,7 +9603,8 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
                "成功" if state_ok else "失败"), appid, cat="判定")
         if not ok:
             await _gm_say(api, appid, gid, mid,
-                          await _gm_deny_reply(api, appid, gid, _gm_mute_fail_text(minfo)))
+                          await _gm_deny_reply(api, appid, gid, _gm_mute_fail_text(minfo),
+                                               (minfo or {}).get("role")))
         return True
     ok, minfo = await _gm_mute_ex(api, appid, gid, oid, 0)
     log("群管理：#解禁（对象=%s）→ %s" % (_oid8(oid), "成功" if ok else "失败"),
@@ -9559,7 +9612,8 @@ async def group_admin_cmd(appid, botdir, message, gid, text, mid="", trusted_at=
     if not ok:
         await _gm_say(api, appid, gid, mid,
                       await _gm_deny_reply(api, appid, gid,
-                                           _gm_mute_fail_text(minfo, "解禁")))
+                                           _gm_mute_fail_text(minfo, "解禁"),
+                                           (minfo or {}).get("role")))
     return True
 
 

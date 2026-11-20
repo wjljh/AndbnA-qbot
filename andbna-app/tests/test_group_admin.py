@@ -1072,10 +1072,11 @@ def case_gate_and_ref():
         asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
         recs = [p for (meth, p, _a, _b) in API.http.calls if meth == "DELETE" and "/messages/" in p]
         said = str(API.sent[0].get("content") or "") if API.sent else ""
-        check("N5 ref_idx 不在本地表 → 不撤本 bot 上一条（不退化），回「太早了」+ #撤回自己",
+        check("N5 ref_idx 不在本地表 → 不撤本 bot 上一条（不退化），回「没收到过」而不是「太早」",
               not recs and len(API.sent) == 1 and "已撤回" not in said
               and said == br._GM_RECALL_EARLY
-              and "太早了" in said and "#撤回自己" in said and "解析不到" not in said
+              and "没收到过" in said and "启动前" in said and "太早了" not in said
+              and "解析不到" not in said
               and has("引用解析失败：ref_idx 不在本地表") and has("→ 不退化")
               and has("有引用但没有可撤的 id"),
               "recalls=%s said=%r" % (recs, said))
@@ -1197,19 +1198,19 @@ def case_recall_texts():
               said["hit"] == "已撤回" and len(recs) == 1 and "t1" in recs[0],
               "said=%r recalls=%s" % (said["hit"], recs))
 
-        # ② 未命中：表里没有那条 → 「太早了」+ 一条能用的出路（不是「解析不到」）
+        # ② 未命中：表里没有那条 → 「没收到过」+ 说明是启动前的消息（不是「太早了」）
         reset()
         write_owner(d)
         write_admin(d, GID_A)
         said["early"] = cmd("p2", scene_raw(ref_idx="REFIDX_HTsaCK+NxS1ha"))
-        check("P2 ref_idx 未命中 → 「太早了，我现在撤不了（只记得最近收到的一批）」+ #撤回自己",
+        check("P2 ref_idx 未命中 → 「这条我没收到过（我启动前的消息拿不到 id），撤不了」",
               said["early"] == br._GM_RECALL_EARLY
-              and "太早了" in said["early"] and "只记得最近收到的一批" in said["early"]
-              and "#撤回自己" in said["early"] and "解析不到" not in said["early"]
+              and "没收到过" in said["early"] and "启动前" in said["early"]
+              and "太早了" not in said["early"] and "解析不到" not in said["early"]
               and not [c for c in API.http.calls if c[0] == "DELETE"],
               "said=%r" % (said["early"],))
-        check("P2b 文案不暗示「能撤别人的」：写明平台只允许撤本 bot 自己发的",
-              "平台只允许我撤自己发的消息" in said["early"]
+        check("P2b 不再把「没记录」说成「太早」：2 分钟窗口由平台裁决",
+              "太早" not in said["early"] and "2 分钟" not in said["early"]
               and "别人的" not in said["early"], "said=%r" % (said["early"],))
 
         # ③ 没有引用 → 维持原来的引导
@@ -1312,10 +1313,10 @@ def case_recall_own_split():
               "said=%r" % (said,))
 
         # R2c 三种文案互不混淆：太早 / 不是我发的 / 没有引用 两两不同
-        check("R2c 「不是我发的」与「太早了」「要撤哪条」三句两两不同",
+        check("R2c 「不是我发的」与「没收到过」「要撤哪条」三句两两不同",
               len(set([br._GM_RECALL_NOT_MINE, br._GM_RECALL_EARLY, br._GM_RECALL_ASK])) == 3
-              and "太早了" not in br._GM_RECALL_NOT_MINE
-              and "只记得最近收到的一批" not in br._GM_RECALL_NOT_MINE,
+              and "没收到过" not in br._GM_RECALL_NOT_MINE
+              and "太早了" not in br._GM_RECALL_EARLY,
               br._GM_RECALL_NOT_MINE)
 
         # R3 归一化函数：mine / 平台原话 / 本地表解析三条判据各自成立
@@ -1737,8 +1738,106 @@ def case_perm_map():
         m.message_reference = _RefObj("MEMBER_MSG_3")
         asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
         said = str(API.sent[-1].get("content") or "") if API.sent else ""
-        check("PM7 群内身份=管理员还失败 → 不回「去设为管理员」，说「可能是别的原因」",
-              "群内身份=管理员" in said and "设为群管理员" not in said, "said=%r" % (said,))
+        check("PM7 40062003 + 群内身份=管理员 → 权限没问题，判超时「超过 2 分钟，撤不了」",
+              said == "超过 2 分钟，撤不了" and has("reason=too_old")
+              and has("bot_state=admin") and "设为群管理员" not in said, "said=%r" % (said,))
+    finally:
+        br._reply = real_reply
+
+
+def case_recall_timeout_split():
+    """40062003 的二义性：bot_state 才分得开「超时」和「不是管理员」（真机 20:02 那次）。"""
+    real_reply = br._reply
+    try:
+        d = botdir(BOT_A)
+        br._reply = stub_reply()
+
+        def one(mid, ref):
+            m = FakeMsg(mid, "#撤回", FakeAuthor(MASTER, "主人"), GID_A,
+                        mentions=[{"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+            m.message_reference = _RefObj(ref)
+            asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+            return str(API.sent[-1].get("content") or "") if API.sent else ""
+
+        # ① 40062003 + bot_state=admin → 权限没问题，是超时
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        API.http.fail = {"/messages/": ForbiddenError("无操作权限", 40062003)}
+        API.http.bot_state = {"member_role": "admin"}
+        said = one("ts1", "MEMBER_MSG_TS1")
+        check("TS1 40062003 + bot_state=admin → 「超过 2 分钟，撤不了」、日志 reason=too_old/bot_state=admin",
+              said == "超过 2 分钟，撤不了"
+              and has("reason=too_old") and has("bot_state=admin")
+              and "不是群管理员" not in said, "said=%r" % (said,))
+
+        # ② 40062003 + bot_state=member → 真没权限（码表那句）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        API.http.fail = {"/messages/": ForbiddenError("无操作权限", 40062003)}
+        API.http.bot_state = {"member_role": "member"}
+        said = one("ts2", "MEMBER_MSG_TS2")
+        check("TS2 40062003 + bot_state=member → 「没有撤回权限：这只 bot 不是群管理员」、reason=no_admin",
+              said.startswith("没有撤回权限：这只 bot 不是群管理员")
+              and has("reason=no_admin") and has("bot_state=member"), "said=%r" % (said,))
+
+        # ③ 查不到 bot_state → 老文案不变，日志写清 bot_state=unknown
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        API.http.fail = {"/messages/": ForbiddenError("无操作权限", 40062003),
+                         "bot_state": ForbiddenError("应用无接口访问权限", 11253)}
+        said = one("ts3", "MEMBER_MSG_TS3")
+        check("TS3 bot_state 查不到 → 维持「没有撤回权限」文案，日志 bot_state=unknown",
+              said == "没有撤回权限：这只 bot 不是群管理员" and has("bot_state=unknown"),
+              "said=%r" % (said,))
+
+        # ④ 群主同样算超时
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        API.http.fail = {"/messages/": ForbiddenError("无操作权限", 40062003)}
+        API.http.bot_state = {"member_role": "owner"}
+        said = one("ts4", "MEMBER_MSG_TS4")
+        check("TS4 40062003 + bot_state=owner → 同样「超过 2 分钟，撤不了」",
+              said == "超过 2 分钟，撤不了" and has("bot_state=owner"), "said=%r" % (said,))
+
+        # ⑤ #禁言 没有 2 分钟这一说：40062003 只可能是 no_admin（正文不带「无操作权限」也一样）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        API.http.fail = {"restrict_chat_setting": ForbiddenError("请求被拒绝", 40062003)}
+        API.http.bot_state = {"member_role": "member"}
+        m = FakeMsg("ts5", "#禁言 10", FakeAuthor(MASTER, "主人"), GID_A,
+                    mentions=[{"member_openid": TARGET, "id": TARGET},
+                              {"id": SELF_OID, "member_openid": SELF_OID, "is_you": True}])
+        asyncio.run(br.group_admin_cmd(BOT_A, d, m, GID_A, m.content, m.id))
+        said = str(API.sent[-1].get("content") or "") if API.sent else ""
+        check("TS5 #禁言 40062003（正文不是「无操作权限」）→ 仍是 no_admin，日志 bot_state=member",
+              said.startswith("没有禁言权限：这只 bot 不是群管理员")
+              and has("reason=not_admin") and has("bot_state=member"), "said=%r" % (said,))
+
+        # ⑥ 120 秒预判只认「本进程收到过」的记录：没有记录 → 照常打平台（不提前拒绝）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        ok, info = asyncio.run(br._gm_recall(API, BOT_A, GID_A, "NO_RECORD_X", d))
+        check("TS6 无 msg_ts 记录 → 不预判，照常打平台（平台成功就是成功）",
+              ok is True and len([c for c in API.http.calls if c[0] == "DELETE"]) == 1
+              and (info or {}).get("reason") is None,
+              "ok=%s info=%s calls=%s" % (ok, info, [c[0] for c in API.http.calls]))
+
+        # ⑦ 有记录且过期 → 提前拒（一个 DELETE 都不发）
+        reset()
+        write_owner(d)
+        write_admin(d, GID_A)
+        br._msg_ts_put(d, "OLD_RECORD_X", time.time() - 121)
+        ok, info = asyncio.run(br._gm_recall(API, BOT_A, GID_A, "OLD_RECORD_X", d))
+        check("TS7 有记录且 121 秒 → 提前拒（一个 DELETE 都不发）、reason=expired",
+              ok is False and (info or {}).get("reason") == "expired"
+              and not [c for c in API.http.calls if c[0] == "DELETE"],
+              "ok=%s info=%s" % (ok, info))
     finally:
         br._reply = real_reply
 
@@ -1783,6 +1882,8 @@ def main():
     case_multi_at_denied()
     reset()
     case_perm_map()
+    reset()
+    case_recall_timeout_split()
     reset()
     case_wired()
     shutil.rmtree(BASE, ignore_errors=True)
